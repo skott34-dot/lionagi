@@ -57,8 +57,8 @@ def _remote_probe_sync(request: RemoteApiDiagnosticRequest) -> dict:
         command,
         False,
         request.timeout / 1000,
-        request.timeout,
         None,
+        timeout_ms=request.timeout,
     )
     response = {
         "success": result["returncode"] == 0,
