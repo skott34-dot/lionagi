@@ -1,0 +1,69 @@
+# LionAGI 0.28 documentation map
+
+> LionAGI is a governed multi-agent orchestration framework. It runs CLI-backed
+> coding agents and API models through the same orchestration system, with typed
+> Python state, dependency-aware flows, durable run records, permissions, and
+> operational control through the CLI or Lion Studio.
+
+## Choose the right surface
+
+- One task or one continuing conversation: `li agent`
+- Independent parallel workers: `li o fanout`
+- Dependent or reactive work planned as a DAG: `li o flow`
+- A repeatable, version-controlled workflow: `li play`
+- A typed application or custom DAG: `Branch`, `Builder`, and `Session` in Python
+- Durable inspection, control, schedules, and UI: `li monitor`, `li wait`,
+  `li o ctl`, `li schedule`, and `li studio`
+
+## Python contract
+
+- `Branch.communicate(...)` records a normal conversation turn. It does not
+  execute tools.
+- `Branch.operate(instruction=..., response_format=..., tools=...,
+  actions=True)` is the primary structured, tool-aware operation.
+- `Branch.chat(...)` is a lower-level model call and returns text by default;
+  pass `return_ins_res_message=True` only when instruction/response messages are
+  needed.
+- `Branch.ReAct(...)` runs iterative reasoning and action loops.
+- `Branch.run(...)` streams a CLI-backed agent endpoint.
+- `Builder` is the public alias for `OperationGraphBuilder`; `Session.flow(...)`
+  executes its dependency graph and returns a wrapper dictionary containing
+  operation results and final context.
+- The curated top-level exports live in `lionagi/__init__.py`. Agent
+  configuration (`AgentSpec`, `PermissionPolicy`, `create_agent`) lives under
+  `lionagi.agent`.
+
+## Start
+
+- [Overview](https://ohdearquant.github.io/lionagi/)
+- [Install and authenticate](https://ohdearquant.github.io/lionagi/getting-started/install/)
+- [First agent and flow](https://ohdearquant.github.io/lionagi/getting-started/first-flow/)
+- [Python quickstart](https://ohdearquant.github.io/lionagi/getting-started/python/)
+- [Choose a surface](https://ohdearquant.github.io/lionagi/choosing-a-surface/)
+
+## Build and orchestrate
+
+- [Orchestration guide](https://ohdearquant.github.io/lionagi/guides/orchestration/)
+- [Core concepts](https://ohdearquant.github.io/lionagi/concepts/)
+- [Branch](https://ohdearquant.github.io/lionagi/api/branch/)
+- [Session](https://ohdearquant.github.io/lionagi/api/session/)
+- [DAG workflows](https://ohdearquant.github.io/lionagi/api/flow/)
+- [Agent configuration and permissions](https://ohdearquant.github.io/lionagi/api/agent-config/)
+- [Models and providers](https://ohdearquant.github.io/lionagi/reference/providers/)
+
+## Operate
+
+- [Durable operations](https://ohdearquant.github.io/lionagi/guides/durable-operations/)
+- [Studio and schedules](https://ohdearquant.github.io/lionagi/guides/studio/)
+- [CLI reference](https://ohdearquant.github.io/lionagi/cli-reference/)
+- [Troubleshooting](https://ohdearquant.github.io/lionagi/reference/troubleshooting/)
+
+## Architecture and source
+
+- [Reference map](https://ohdearquant.github.io/lionagi/reference/)
+- [ADR index](https://ohdearquant.github.io/lionagi/adr/)
+- [Contributing](https://ohdearquant.github.io/lionagi/contributing/)
+- [GitHub repository](https://github.com/ohdearquant/lionagi)
+
+Treat live code, tests, `li ... --help`, and accepted ADRs as authoritative.
+Proposed ADRs describe direction and must not be used as shipped CLI syntax.
