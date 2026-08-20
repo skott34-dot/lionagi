@@ -5,11 +5,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
+
 import pytest
 
 from lionagi.hooks import HookBus, HookPoint, StopHook, hook
-
-# ── Basic dispatch ────────────────────────────────────────────────────────────
 
 
 async def test_emit_calls_registered_handlers_in_order():
@@ -58,9 +59,6 @@ async def test_off_unregistered_handler_is_noop():
     bus.off(HookPoint.MESSAGE_ADD, h)
 
 
-# ── Sync handlers accepted ────────────────────────────────────────────────────
-
-
 async def test_sync_handler_runs_without_await():
     bus = HookBus()
     calls: list[int] = []
@@ -73,10 +71,54 @@ async def test_sync_handler_runs_without_await():
     assert calls == [1]
 
 
-# ── Isolation: handler errors do NOT abort ───────────────────────────────────
+@pytest.mark.parametrize(
+    "point",
+    (HookPoint.SESSION_START, HookPoint.TOOL_PRE),
+)
+async def test_sync_handler_custom_awaitable_is_awaited_for_both_profiles(point):
+    bus = HookBus()
+
+    class TrackingAwaitable:
+        def __init__(self):
+            self.awaited = False
+
+        def __await__(self):
+            self.awaited = True
+            if False:  # pragma: no cover - makes this a generator-based awaitable
+                yield None
+            return None
+
+    returned = TrackingAwaitable()
+    bus.on(point, lambda **_kwargs: returned)
+
+    await bus.emit(point)
+
+    assert returned.awaited is True
 
 
-async def test_handler_exception_is_logged_and_swallowed():
+@pytest.mark.parametrize(
+    "point",
+    (HookPoint.TOOL_PRE, HookPoint.USER_PROMPT_SUBMIT),
+)
+async def test_blocking_profile_raises_first_failure_without_draining_later_handlers(point):
+    bus = HookBus()
+    later_calls: list[str] = []
+
+    async def deny(**_kwargs):
+        raise PermissionError("denied")
+
+    async def later(**_kwargs):
+        later_calls.append("later")
+
+    bus.on(point, deny)
+    bus.on(point, later)
+
+    with pytest.raises(PermissionError, match="denied"):
+        await bus.emit(point)
+    assert later_calls == []
+
+
+async def test_handler_exception_is_logged_and_swallowed(caplog):
     bus = HookBus()
     fired_after: list[str] = []
 
@@ -89,12 +131,16 @@ async def test_handler_exception_is_logged_and_swallowed():
     bus.on(HookPoint.MESSAGE_ADD, boom)
     bus.on(HookPoint.MESSAGE_ADD, after)
     # No exception should propagate.
-    await bus.emit(HookPoint.MESSAGE_ADD, message={}, session_id="s")
+    with caplog.at_level(logging.ERROR, logger="lionagi.hooks"):
+        await bus.emit(HookPoint.MESSAGE_ADD, message={}, session_id="s")
     # Subsequent handlers still ran.
     assert fired_after == ["after"]
+    record = next(item for item in caplog.records if item.name == "lionagi.hooks")
+    assert record.getMessage() == "Hook failed: message.add"
+    assert record.exc_info is not None
 
 
-async def test_sync_handler_exception_is_also_swallowed():
+async def test_sync_handler_exception_is_logged_and_swallowed(caplog):
     bus = HookBus()
     fired_after: list[str] = []
 
@@ -106,11 +152,12 @@ async def test_sync_handler_exception_is_also_swallowed():
 
     bus.on(HookPoint.MESSAGE_ADD, boom)
     bus.on(HookPoint.MESSAGE_ADD, after)
-    await bus.emit(HookPoint.MESSAGE_ADD, message={}, session_id="s")
+    with caplog.at_level(logging.ERROR, logger="lionagi.hooks"):
+        await bus.emit(HookPoint.MESSAGE_ADD, message={}, session_id="s")
     assert fired_after == ["after"]
-
-
-# ── StopHook short-circuits remaining handlers ───────────────────────────────
+    record = next(item for item in caplog.records if item.name == "lionagi.hooks")
+    assert record.getMessage() == "Hook failed: message.add"
+    assert record.exc_info is not None
 
 
 async def test_stop_hook_aborts_siblings_but_not_operation():
@@ -130,9 +177,6 @@ async def test_stop_hook_aborts_siblings_but_not_operation():
     assert calls == ["stopper"]
 
 
-# ── Read introspection ──────────────────────────────────────────────────────
-
-
 async def test_handlers_for_returns_copy_not_internal_list():
     bus = HookBus()
 
@@ -144,9 +188,6 @@ async def test_handlers_for_returns_copy_not_internal_list():
     snapshot.clear()  # Should not affect the bus.
 
     assert bus.handlers_for(HookPoint.SESSION_START) == [h]
-
-
-# ── @hook decorator ──────────────────────────────────────────────────────────
 
 
 def test_hook_decorator_tags_function_with_point():
@@ -173,9 +214,6 @@ def test_hook_decorator_rejects_unknown_point():
             pass
 
 
-# ── HookPoint vocabulary pinned ──────────────────────────────────────────────
-
-
 def test_hook_point_vocabulary():
     """Pin the 12-event vocabulary so a removal is visible in this test."""
     values = {p.value for p in HookPoint}
@@ -194,9 +232,6 @@ def test_hook_point_vocabulary():
         "artifact.created",
         "prompt.submit",
     }
-
-
-# ── FIX 1: on() validates HookPoint ─────────────────────────────────────────
 
 
 def test_on_string_valid_point_registers():
@@ -237,9 +272,6 @@ def test_handlers_for_invalid_string_raises_value_error():
         bus.handlers_for("session.starts")
 
 
-# ── Dormant-point registration warns (issue #1965) ───────────────────────────
-
-
 def test_registering_on_dormant_point_warns():
     """ARTIFACT_CREATED has no production emit site — registering a handler on
     it must not be silently accepted; the caller learns about it via warning,
@@ -275,9 +307,9 @@ def test_registering_on_dormant_point_by_string_value_warns():
     ],
 )
 def test_registering_on_now_wired_api_points_does_not_warn(recwarn, point):
-    """Regression guard for issue #1965: these three used to be dormant.
-    Now that they have production emit sites (operations/_api_hooks.py),
-    registering a handler on them must NOT trigger the dormant-point warning."""
+    """These three points used to be dormant. Now that they have production
+    emit sites (operations/_api_hooks.py), registering a handler on them
+    must NOT trigger the dormant-point warning."""
     bus = HookBus()
 
     async def h(**kw):
@@ -285,9 +317,6 @@ def test_registering_on_now_wired_api_points_does_not_warn(recwarn, point):
 
     bus.on(point, h)
     assert not any(issubclass(w.category, UserWarning) for w in recwarn.list)
-
-
-# ── FIX 2: blocking_emit propagates exceptions for TOOL_PRE ──────────────────
 
 
 async def test_blocking_emit_propagates_exception():
@@ -333,10 +362,7 @@ async def test_blocking_emit_stop_hook_short_circuits_without_error():
     assert calls == ["stopper"]
 
 
-# ── FIX 3: handlers snapshotted before dispatch ───────────────────────────────
-
-
-# ── USER_PROMPT_SUBMIT is the second blocking point (ADR-0048 D2) ───────────
+# USER_PROMPT_SUBMIT is the second blocking point (ADR-0048 D2)
 
 
 async def test_blocking_emit_propagates_exception_for_user_prompt_submit():
@@ -403,3 +429,56 @@ async def test_emit_handler_registered_during_emit_does_not_fire():
     # On the NEXT emit, "late" should fire.
     await bus.emit(HookPoint.SESSION_START, session_id="s")
     assert "late" in calls
+
+
+@pytest.mark.parametrize(
+    "point",
+    (HookPoint.SESSION_START, HookPoint.TOOL_PRE),
+)
+async def test_emitter_cancellation_propagates_for_both_hook_profiles(point):
+    bus = HookBus()
+    started = asyncio.Event()
+    later_calls: list[str] = []
+
+    async def slow(**_kwargs):
+        started.set()
+        await asyncio.Event().wait()
+
+    async def later(**_kwargs):  # pragma: no cover - cancellation stops the chain
+        later_calls.append("later")
+
+    bus.on(point, slow)
+    bus.on(point, later)
+    task = asyncio.create_task(bus.emit(point))
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert later_calls == []
+
+
+@pytest.mark.parametrize(
+    "point",
+    (HookPoint.SESSION_START, HookPoint.TOOL_PRE),
+)
+async def test_handler_cancellation_is_not_misclassified_as_an_ordinary_failure(point):
+    bus = HookBus()
+    later_calls: list[str] = []
+
+    async def cancel(**_kwargs):
+        raise asyncio.CancelledError("handler cancelled")
+
+    async def later(**_kwargs):  # pragma: no cover - cancellation stops the chain
+        later_calls.append("later")
+
+    bus.on(point, cancel)
+    bus.on(point, later)
+
+    try:
+        await bus.emit(point)
+    except asyncio.CancelledError as exc:
+        assert str(exc) == "handler cancelled"
+    else:  # pragma: no cover - the profile must propagate handler cancellation
+        pytest.fail("HookBus swallowed handler cancellation")
+    assert later_calls == []

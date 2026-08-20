@@ -19,10 +19,6 @@ from lionagi.service.hooks import hooked_event
 from lionagi.service.hooks._types import StreamTerminalState
 from lionagi.service.hooks.hooked_event import HookedEvent
 
-# ---------------------------------------------------------------------------
-# Minimal concrete HookedEvent subclasses for testing
-# ---------------------------------------------------------------------------
-
 
 class SimpleHooked(HookedEvent):
     async def _core_invoke(self):
@@ -42,11 +38,6 @@ class FailingHooked(HookedEvent):
         yield  # make it an async generator
 
 
-# ---------------------------------------------------------------------------
-# Minimal fake HookEvent — avoids setting up a real HookRegistry
-# ---------------------------------------------------------------------------
-
-
 def _fake_hook(
     status: EventStatus = EventStatus.COMPLETED,
     should_exit: bool = False,
@@ -62,11 +53,6 @@ def _fake_hook(
             pass
 
     return _FakeHookEvent()
-
-
-# ---------------------------------------------------------------------------
-# HookedEvent._invoke() — no hooks
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -85,9 +71,82 @@ async def test_invoke_no_hooks_core_error_propagates():
         await h._invoke()
 
 
-# ---------------------------------------------------------------------------
-# HookedEvent._invoke() — pre-invoke hook paths (lines 80-90)
-# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_public_invoke_signals_precreated_completion_event_on_success():
+    event = SimpleHooked()
+    done = event.completion_event
+
+    await event.invoke()
+
+    assert event.status is EventStatus.COMPLETED
+    assert done.is_set()
+
+
+@pytest.mark.asyncio
+async def test_public_invoke_late_completion_event_access_is_already_signalled():
+    event = SimpleHooked()
+
+    await event.invoke()
+
+    assert event.status is EventStatus.COMPLETED
+    assert event.completion_event.is_set()
+
+
+@pytest.mark.parametrize(
+    ("status", "signals_completion"),
+    (
+        (EventStatus.PENDING, False),
+        (EventStatus.PROCESSING, False),
+        (EventStatus.COMPLETED, True),
+        (EventStatus.FAILED, True),
+        (EventStatus.SKIPPED, True),
+        (EventStatus.CANCELLED, True),
+        (EventStatus.ABORTED, True),
+    ),
+)
+def test_completion_event_terminal_status_vocabulary_is_exact(status, signals_completion):
+    event = SimpleHooked()
+    done = event.completion_event
+
+    event.status = status
+
+    assert done.is_set() is signals_completion
+
+
+@pytest.mark.asyncio
+async def test_public_invoke_signals_precreated_completion_event_on_failure():
+    event = FailingHooked()
+    done = event.completion_event
+
+    await event.invoke()
+
+    assert event.status is EventStatus.FAILED
+    assert done.is_set()
+
+
+@pytest.mark.asyncio
+async def test_exhausted_public_stream_signals_precreated_completion_event():
+    event = SimpleHooked()
+    done = event.completion_event
+
+    chunks = [chunk async for chunk in event.stream()]
+
+    assert chunks == ["chunk1", "chunk2"]
+    assert event.status is EventStatus.COMPLETED
+    assert done.is_set()
+
+
+@pytest.mark.asyncio
+async def test_closed_public_stream_signals_precreated_completion_event():
+    event = SlowStream()
+    done = event.completion_event
+    stream = event.stream()
+
+    assert await anext(stream) == "chunk1"
+    await stream.aclose()
+
+    assert event.status is EventStatus.CANCELLED
+    assert done.is_set()
 
 
 @pytest.mark.asyncio
@@ -137,11 +196,6 @@ async def test_invoke_pre_hook_should_exit_no_cause_raises_generic():
     h._pre_invoke_hook_event = _fake_hook(EventStatus.COMPLETED, should_exit=True, exit_cause=None)
     with pytest.raises(RuntimeError, match="requested exit"):
         await h._invoke()
-
-
-# ---------------------------------------------------------------------------
-# HookedEvent._invoke() — post-invoke hook paths (lines 101-122)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -199,11 +253,6 @@ async def test_invoke_post_hook_should_exit_silenced_when_core_failed():
         await h._invoke()
 
 
-# ---------------------------------------------------------------------------
-# HookedEvent._stream() — pre-hook paths (lines 145-155)
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_stream_no_hooks_yields_chunks():
     """_stream() with no hooks yields all _core_stream chunks."""
@@ -245,11 +294,6 @@ async def test_stream_pre_hook_should_exit_raises():
             pass
 
 
-# ---------------------------------------------------------------------------
-# HookedEvent._stream() — post-hook (lines 163-168)
-# ---------------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_stream_post_hook_does_not_affect_chunks():
     """Post-hook runs after stream; chunks are not affected (lines 163-168)."""
@@ -273,7 +317,7 @@ async def test_stream_post_hook_failure_silenced():
             raise RuntimeError("post hook explodes after stream")
 
     h._post_invoke_hook_event = ExplodingPostHook()
-    # Should NOT raise — stream data already sent
+    # Must not raise: the stream data was already sent before the post-hook ran.
     chunks = [c async for c in h._stream()]
     assert chunks == ["chunk1", "chunk2"]
 
@@ -293,11 +337,6 @@ async def test_stream_post_hook_aborted_status_logs_warning(caplog):
 
     assert chunks == ["chunk1", "chunk2"]
     assert any("Post-stream hook failed" in r.message for r in caplog.records)
-
-
-# ---------------------------------------------------------------------------
-# HookedEvent._stream() — teardown on every way a stream can end
-# ---------------------------------------------------------------------------
 
 
 class SlowStream(HookedEvent):
@@ -606,10 +645,8 @@ async def test_bare_break_defers_teardown_to_generator_finalization():
     assert seen == [StreamTerminalState.Closed]
 
 
-# ---------------------------------------------------------------------------
 # HookedEvent._stream() — a failing teardown must not replace the ending it
 # was there to record
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(

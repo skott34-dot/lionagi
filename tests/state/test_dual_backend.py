@@ -19,11 +19,12 @@ import time
 import uuid
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 from lionagi.state.db import SCHEMA_VERSION, StateDB
 from lionagi.state.reasons import RunReasons
 
-# ── Shared helpers ────────────────────────────────────────────────────────────
+# Shared helpers
 
 
 def _uid() -> str:
@@ -240,7 +241,7 @@ async def _run_parity_suite(db: StateDB) -> None:
     assert empties[0]["project"] is None, f"zero-session project must be None: {empties[0]!r}"
 
 
-# ── SQLite leg (always runs) ──────────────────────────────────────────────────
+# SQLite leg (always runs)
 
 
 @pytest.fixture
@@ -257,7 +258,7 @@ async def test_sqlite_parity(sqlite_db: StateDB):
     await _run_parity_suite(sqlite_db)
 
 
-# ── SQLite regression: singleton keying by URL ─────────────────────────────────
+# SQLite regression: singleton keying by URL
 
 
 async def test_sqlite_singleton_keyed_by_url(tmp_path):
@@ -276,7 +277,7 @@ async def test_sqlite_singleton_keyed_by_url(tmp_path):
         await db.close()
 
 
-# ── SQLite regression: multiple concurrent writes (WAL) ───────────────────────
+# SQLite regression: multiple concurrent writes (WAL)
 
 
 async def test_sqlite_concurrent_writes(tmp_path):
@@ -315,7 +316,7 @@ async def test_sqlite_concurrent_writes(tmp_path):
         await db.close()
 
 
-# ── Postgres leg (pg_url fixture: testcontainers, or LIONAGI_TEST_PG_URL) ─────
+# Postgres leg (pg_url fixture: testcontainers, or LIONAGI_TEST_PG_URL)
 
 
 async def test_postgres_parity(pg_url):
@@ -356,7 +357,148 @@ async def test_postgres_schema_creates_all_tables(pg_url):
         await db.close()
 
 
-# ── Dialect SQL correctness (static — no live connection, always runs) ─────────
+async def test_postgres_open_widens_a_sessions_check_that_predates_a_value(pg_url):
+    """An existing Postgres store keeps whatever CHECK its sessions table was
+    created with, because ``create_all`` only creates missing tables. SQLite
+    gets the widening by rebuilding the table, and that path returns early on
+    every other dialect, so a value added to the declared vocabulary was
+    rejected by exactly the store that had been running longest.
+
+    The narrow definition is written back here rather than assumed, so the
+    test starts from the state it is about, and the rows and the constraint
+    are put back on the way out: ``pg_url`` is session-scoped, so anything
+    left behind here is the next test's starting state.
+
+    Every arm matters. ``agent`` says the widened constraint did not lose the
+    values the store already had, and ``not-a-kind`` says it is still a
+    constraint rather than a vacuous one that would pass by accepting
+    everything.
+    """
+    from sqlalchemy import text
+
+    narrow = (
+        "invocation_kind IS NULL OR invocation_kind IN ('agent','play','flow','fanout','show-play')"
+    )
+    written: list[str] = []
+
+    async def insert(db: StateDB, kind: str | None) -> bool:
+        """INSERT below create_session, whose own validation would answer first."""
+        prog_id, session_id = _uid(), _uid()
+        await db.create_progression(prog_id)
+        try:
+            async with db._engine.begin() as conn:
+                await conn.execute(
+                    text(
+                        "INSERT INTO sessions "
+                        "(id, progression_id, created_at, updated_at, invocation_kind) "
+                        "VALUES (:i, :p, 1.0, 1.0, :k)"
+                    ),
+                    {"i": session_id, "p": prog_id, "k": kind},
+                )
+        except IntegrityError:
+            return False
+        written.append(session_id)
+        return True
+
+    async def set_constraint(db: StateDB, body: str) -> None:
+        async with db._engine.begin() as conn:
+            await conn.execute(
+                text("ALTER TABLE sessions DROP CONSTRAINT IF EXISTS ck_sessions_invocation_kind")
+            )
+            await conn.execute(
+                text(
+                    "ALTER TABLE sessions ADD CONSTRAINT ck_sessions_invocation_kind "
+                    f"CHECK ({body})"
+                )
+            )
+
+    db = StateDB(url=pg_url)
+    await db.open()
+    try:
+        async with db._read() as conn:
+            declared = (
+                await conn.execute(
+                    text(
+                        "SELECT pg_get_constraintdef(c.oid) FROM pg_constraint c "
+                        "JOIN pg_class t ON t.oid = c.conrelid "
+                        "WHERE t.relname = 'sessions' "
+                        "AND c.conname = 'ck_sessions_invocation_kind'"
+                    )
+                )
+            ).scalar()
+        assert declared and "engine" in declared, f"store did not start widened: {declared!r}"
+        await set_constraint(db, narrow)
+        assert not await insert(db, "engine"), "the narrow constraint was not in place"
+    finally:
+        await db.close()
+
+    db = StateDB(url=pg_url)
+    await db.open()
+    try:
+        assert await insert(db, "engine"), "open() did not widen the constraint"
+        assert await insert(db, "agent"), "widening dropped a value the store already had"
+        assert await insert(db, None), "widening stopped admitting NULL"
+        assert not await insert(db, "not-a-kind"), "the replacement constraint is vacuous"
+    finally:
+        # Rows first: a row the narrow constraint rejects blocks re-narrowing,
+        # which is what a later run of this same test starts by doing.
+        if written:
+            async with db._engine.begin() as conn:
+                await conn.execute(
+                    text("DELETE FROM sessions WHERE id = ANY(:ids)"), {"ids": written}
+                )
+        await db.close()
+
+
+async def test_postgres_open_does_not_add_a_sessions_check_that_was_absent(pg_url):
+    """A column with no CHECK already accepts every value, so there is nothing
+    to widen and a store that dropped one deliberately does not get it back.
+    Same reading the SQLite rebuild applies."""
+    from sqlalchemy import text
+
+    async def constraint_def(db: StateDB) -> str | None:
+        async with db._read() as conn:
+            return (
+                await conn.execute(
+                    text(
+                        "SELECT pg_get_constraintdef(c.oid) FROM pg_constraint c "
+                        "JOIN pg_class t ON t.oid = c.conrelid "
+                        "WHERE t.relname = 'sessions' "
+                        "AND c.conname = 'ck_sessions_invocation_kind'"
+                    )
+                )
+            ).scalar()
+
+    db = StateDB(url=pg_url)
+    await db.open()
+    declared = await constraint_def(db)
+    try:
+        assert declared is not None, "nothing to drop; test is inert"
+        async with db._engine.begin() as conn:
+            await conn.execute(
+                text("ALTER TABLE sessions DROP CONSTRAINT ck_sessions_invocation_kind")
+            )
+    finally:
+        await db.close()
+
+    db = StateDB(url=pg_url)
+    await db.open()
+    try:
+        assert await constraint_def(db) is None
+    finally:
+        async with db._engine.begin() as conn:
+            await conn.execute(
+                text("ALTER TABLE sessions DROP CONSTRAINT IF EXISTS ck_sessions_invocation_kind")
+            )
+            await conn.execute(
+                text(f"ALTER TABLE sessions ADD CONSTRAINT ck_sessions_invocation_kind {declared}")
+            )
+        await db.close()
+
+
+# Dialect SQL correctness (static — no live connection, always runs)
+
+
 # Guards the Postgres-breaking SQL forms that the gated live leg above would only
 # catch when LIONAGI_TEST_PG_URL is set.
 
@@ -486,7 +628,7 @@ async def test_postgres_capability_claim(pg_url):
         await db.close()
 
 
-# ── merge_session_node_metadata: dialect-parity table ─────────────────────────
+# merge_session_node_metadata: dialect-parity table
 # Postgres's jsonb_strip_nulls, applied to the *entire* merged document,
 # deletes nulls that predate the patch and were never touched by it --
 # SQLite's json_patch never removes them. A real NodeStarted flow segment
@@ -738,7 +880,7 @@ async def test_postgres_json_column_rejects_non_json_text(pg_url):
         await db.close()
 
 
-# ── Postgres leg: lifecycle service load-bearing contract (ADR-0058 Phase 2) ──
+# Postgres leg: lifecycle service load-bearing contract (ADR-0058 Phase 2)
 # The applied/conflict/rejected/rollback/parity cases pinned against SQLite in
 # tests/state/lifecycle/test_service.py and test_wrapper_parity.py must hold
 # identically on PostgreSQL (FOR UPDATE locking, JSON binding, transaction
@@ -979,7 +1121,7 @@ async def test_postgres_wrapper_parity_cas_conflict_and_same_status_append(pg_ur
         await db.close()
 
 
-# ── session-control admission takes the session row lock on PostgreSQL ───────
+# session-control admission takes the session row lock on PostgreSQL
 #
 # SQLite serialises writers, so evaluating the running-session condition inside
 # the insert statement is decisive there. PostgreSQL runs two clients at once
@@ -1073,7 +1215,7 @@ async def test_postgres_control_admission_waits_on_a_locked_session_row(pg_url):
         assert after is not None
 
 
-# ── a hand resolution that loses its race reports nothing ────────────────
+# a hand resolution that loses its race reports nothing
 #
 # `resolve_claimed_session_control` reads the current claim, decides from it,
 # then writes under a compare-and-set. On PostgreSQL the claimant can commit its
@@ -1181,7 +1323,7 @@ async def test_postgres_resolve_reports_nothing_when_its_write_lost_the_race(pg_
         )
 
 
-# ── Postgres leg: the delete/writer race on delete_imported_session ───────────
+# Postgres leg: the delete/writer race on delete_imported_session
 # Lives in this module for the reason stated above: it needs the session-scoped
 # `pg_url` fixture, and a second module requesting it in the same run breaks
 # asyncpg's loop-bound connections.
@@ -1558,31 +1700,16 @@ async def test_postgres_teardown_gives_up_rather_than_deadlocking_after_it_holds
         await db.close()
 
 
-# ── Postgres leg: attach_session_invocation's prior-invocation read races ────
-# a concurrent repoint (round-2 review of PR #2884). SQLite serializes this
-# through its own write lock plus BEGIN IMMEDIATE; PostgreSQL at READ
-# COMMITTED does not, so the prior-invocation SELECT takes FOR UPDATE there.
+# Postgres leg: attach_session_invocation's prior-invocation read can race
+# a concurrent repoint. SQLite serializes this through its own write lock
+# plus BEGIN IMMEDIATE; PostgreSQL at READ COMMITTED does not, so the
+# prior-invocation SELECT takes FOR UPDATE there.
 
 
 async def test_postgres_attach_session_invocation_decrements_off_the_value_a_concurrent_repoint_left(
     pg_url,
 ):
-    """A concurrent attach must decrement the invocation another attach's
-    still-open transaction actually left the session on, not the value it
-    read before that transaction committed.
-
-    A holder connection takes the session row's lock and repoints it
-    old -> mid — the same statements ``attach_session_invocation`` runs —
-    without committing, standing in for a first attach still in flight. A
-    concurrent ``attach_session_invocation(sid, new)`` call must block on
-    that lock (proving the fix takes it at all) rather than reading old's
-    invocation_id straight through; once the holder commits, it must resolve
-    against mid. Without the ``FOR UPDATE`` fix, the unlocked SELECT would
-    read old immediately (the holder hasn't committed yet), block later on
-    the UPDATE's implicit row lock instead, and decrement old after its own
-    WHERE clause re-evaluates against the post-commit row — leaving mid's
-    count stale at 1, exactly the round-2 finding.
-    """
+    """A concurrent attach decrements the invocation another attach left the session on, not the value it read before that transaction committed."""
     import asyncio
 
     from sqlalchemy import text as _text

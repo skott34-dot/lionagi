@@ -191,19 +191,18 @@ def test_mcp_transport_delivers_when_the_calling_process_denies_direct_filesyste
 ):
     """The sandbox failure this MCP transport exists to fix, reproduced directly.
 
-    `denied_home` stands in for a sandboxed worker's own restricted view of
+    `denied_home` stands in for a sandboxed worker's restricted view of
     `~/.lionagi`: a `workspace-write`-style sandbox denies a process direct
-    filesystem access to a path outside its grant, which `chmod` reproduces
-    here — a subprocess pointed at `denied_home` cannot even create the
-    `teams/` directory. That subprocess is the same command a sandboxed
-    worker would shell out to directly (the original bug).
+    filesystem access outside its grant, which `chmod` reproduces here -- a
+    subprocess pointed at `denied_home` can't even create `teams/`. That's
+    the same command a sandboxed worker would shell out to directly (the
+    original bug).
 
-    The MCP dispatcher path below never touches `denied_home` at all:
-    `dispatch.request()` runs in this test process, using the `home`
-    fixture's own `LIONAGI_HOME` — exactly as the real MCP server does, since
-    it is a separate, unsandboxed process from the worker and never inherits
-    the worker's sandbox. That process separation, not a shared filesystem
-    grant, is what lets the message through.
+    The MCP dispatcher path below never touches `denied_home`: it runs in
+    this test process using the `home` fixture's own `LIONAGI_HOME`, exactly
+    as the real MCP server does, since it's a separate, unsandboxed process
+    that never inherits the worker's sandbox. Process separation, not a
+    shared filesystem grant, is what lets the message through.
     """
     denied_home = tmp_path / "denied-home"
     denied_home.mkdir()
@@ -345,7 +344,9 @@ def test_a_window_that_cannot_be_parsed_is_refused_inside_the_envelope(home):
 def test_the_plugin_listing_is_named_and_refused_with_why(home):
     entry = next(e for e in call(help=True)["verbs"] if e["verb"] == "plugin.list")
     assert entry["available"] is False
-    assert "trust" in entry["reason"]
+    assert entry["cli_path"]
+    # the why is one targeted call away rather than in every catalog read
+    assert "trust" in call(help="plugin.list")["reason"]
     op = run_op("plugin.list")
     assert op["ok"] is False
     assert op["error"]["kind"] == "unavailable"

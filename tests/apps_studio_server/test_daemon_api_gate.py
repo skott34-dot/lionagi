@@ -2,32 +2,26 @@
 # SPDX-License-Identifier: Apache-2.0
 """Studio daemon API contract gate.
 
-Regression class this guards, in plain terms: CLI/daemon contract drift that
-was discovered live rather than caught by CI. Two known instances of this
-class: a URL-prefix bug where a client (mis-)configured base URL caused every
-request to double up the "/api" prefix (".../api/api/..."), and a CWD bug
-where a spawned subprocess inherited the daemon's working directory instead
-of resolving one explicitly, so behavior depended on how the daemon itself
-happened to be launched. Neither was caught by a test; both were found by an
-operator hitting a broken request in practice.
+Guards against CLI/daemon contract drift that was previously discovered
+live rather than by CI: a URL-prefix bug where a misconfigured client base
+URL doubled up the "/api" prefix (".../api/api/..."), and a CWD bug where a
+spawned subprocess inherited the daemon's working directory instead of
+resolving one explicitly, so behavior depended on how the daemon happened
+to be launched.
 
-This suite pins the daemon's actual, observed contract:
+Pins the daemon's actual, observed contract: (1) the full sorted
+(method, path) route table, excluding FastAPI's auto-generated docs/schema
+routes, as a golden list so adding/renaming/removing an endpoint forces a
+deliberate edit here; (2) that `/api` appears exactly once in every mounted
+route path; (3) per-endpoint success/404/422/400 response shape (status
+code + sorted top-level JSON keys, not full payloads) for the admin,
+session, and schedule endpoint families.
 
-  1. The full sorted (method, path) route table (excluding FastAPI's
-     auto-generated docs/schema routes) as a golden list. Adding, renaming,
-     or removing an endpoint forces a deliberate edit here instead of
-     silently drifting.
-  2. The `/api` prefix contract: it appears exactly once in every mounted
-     API route path (the shape of the double-prefix regression class).
-  3. Per-endpoint success/404/422/400 response shape (status code + sorted
-     top-level JSON object keys, not full payloads) for the admin, session,
-     and schedule endpoint families -- the areas gate 5 was scoped to.
-
-Everything here is read empirically from the routers themselves
+Everything is read empirically from the routers themselves
 (lionagi/studio/services/admin.py, sessions.py, schedules.py) and from
-running the live app against a temp SQLite DB, per the existing suite's
-`_patch_db` / `monkeypatch.setattr(..., DEFAULT_DB_PATH, ...)` pattern (see
-test_admin.py, test_schedule_runs_route.py) -- never against ~/.lionagi.
+running the live app against a temp SQLite DB, following the existing
+suite's `_patch_db` / `monkeypatch.setattr(..., DEFAULT_DB_PATH, ...)`
+pattern -- never against ~/.lionagi.
 """
 
 from __future__ import annotations
@@ -47,9 +41,7 @@ from lionagi.state.db import StateDB  # noqa: E402
 
 from ._helpers import run_async  # noqa: E402
 
-# ---------------------------------------------------------------------------
 # 1. Golden route table -- excludes FastAPI's auto-generated docs/schema routes.
-# ---------------------------------------------------------------------------
 
 _DOCS_PATHS = frozenset({"/openapi.json", "/docs", "/redoc", "/docs/oauth2-redirect"})
 
@@ -62,6 +54,7 @@ _GOLDEN_ROUTES: tuple[tuple[str, str], ...] = (
     ("DELETE", "/api/agents/{name}"),
     ("DELETE", "/api/attention/dispositions/{item_id}"),
     ("DELETE", "/api/engine-defs/{def_id}"),
+    ("DELETE", "/api/hooks/library/{name}"),
     ("DELETE", "/api/mcp/servers/{name}"),
     ("DELETE", "/api/operator/conversations/{conversation_id}"),
     ("DELETE", "/api/playbooks/{name}"),
@@ -89,6 +82,8 @@ _GOLDEN_ROUTES: tuple[tuple[str, str], ...] = (
     ("GET", "/api/engine-defs/{def_id}"),
     ("GET", "/api/engine-runs/"),
     ("GET", "/api/engine-runs/{run_id}"),
+    ("GET", "/api/hooks/library"),
+    ("GET", "/api/identity"),
     ("GET", "/api/invocations/"),
     ("GET", "/api/invocations/{invocation_id}"),
     ("GET", "/api/mcp/servers/"),
@@ -96,6 +91,7 @@ _GOLDEN_ROUTES: tuple[tuple[str, str], ...] = (
     ("GET", "/api/operator/conversations"),
     ("GET", "/api/operator/conversations/{conversation_id}"),
     ("GET", "/api/operator/conversations/{conversation_id}/stream"),
+    ("GET", "/api/operator/hooks"),
     ("GET", "/api/operator/models"),
     ("GET", "/api/playbook-templates/"),
     ("GET", "/api/playbook-templates/{name}"),
@@ -195,7 +191,9 @@ _GOLDEN_ROUTES: tuple[tuple[str, str], ...] = (
     ("PUT", "/api/agents/{name}"),
     ("PUT", "/api/attention/dispositions/{item_id}"),
     ("PUT", "/api/engine-defs/{def_id}"),
+    ("PUT", "/api/hooks/library/{name}"),
     ("PUT", "/api/mcp/servers/{name}"),
+    ("PUT", "/api/operator/hooks"),
     ("PUT", "/api/playbooks/{name}"),
     ("PUT", "/api/projects/{name}"),
     ("PUT", "/api/workflow-defs/{def_id}"),
@@ -277,7 +275,7 @@ def test_golden_route_table_matches_pinned_snapshot():
 
 
 def test_golden_route_count_pinned():
-    assert len(_GOLDEN_ROUTES) == 131
+    assert len(_GOLDEN_ROUTES) == 137
 
 
 def _compiled_match_shape(path_template: str) -> str:
@@ -312,9 +310,9 @@ def test_find_duplicate_routes_empty_for_unique_entries():
 
 
 def test_normalize_route_match_shape_erases_param_names_but_keeps_converters():
-    """The reviewer's exact distinction: two untyped params with different
-    names collapse to one shape; a typed converter stays distinct from the
-    untyped param even when the name matches."""
+    """Two untyped params with different names collapse to one shape; a
+    typed converter stays distinct from the untyped param even when the
+    name matches."""
     shape_schedule_id = _compiled_match_shape("/api/schedules/{schedule_id}")
     shape_id = _compiled_match_shape("/api/schedules/{id}")
     shape_id_int = _compiled_match_shape("/api/schedules/{id:int}")
@@ -345,7 +343,11 @@ def test_duplicate_route_registration_is_caught_on_a_live_fastapi_app():
 
 
 def test_duplicate_route_registration_with_different_param_names_is_caught():
-    """The reviewer's exact regression: /api/schedules/{schedule_id} and /api/schedules/{id} read as different source but compile to the same dispatch target, so the gate must name them as duplicates even though no two path strings are equal -- one route goes through an APIRouter + prefix (like real studio routers), proving match-shape normalization survives prefix compilation."""
+    """/api/schedules/{schedule_id} and /api/schedules/{id} read as different
+    source but compile to the same dispatch target, so the gate must name
+    them as duplicates even though no two path strings are equal -- one
+    route goes through an APIRouter + prefix (like real studio routers),
+    proving match-shape normalization survives prefix compilation."""
     from fastapi import APIRouter, FastAPI
 
     app = FastAPI()
@@ -369,9 +371,7 @@ def test_duplicate_route_registration_with_different_param_names_is_caught():
     assert sorted(paths) == ["/api/schedules/{id}", "/api/schedules/{schedule_id}"]
 
 
-# ---------------------------------------------------------------------------
 # 2. The /api prefix contract -- the double-prefix regression class.
-# ---------------------------------------------------------------------------
 
 
 def test_api_prefix_appears_exactly_once_in_every_route_path():
@@ -384,9 +384,7 @@ def test_api_prefix_appears_exactly_once_in_every_route_path():
         assert path.count("/api") == 1, f"route path repeats the /api prefix: {path!r}"
 
 
-# ---------------------------------------------------------------------------
 # Shared fixtures/helpers for the per-family response-shape pins below.
-# ---------------------------------------------------------------------------
 
 
 def _patch_db(monkeypatch, db_path: Path) -> None:
@@ -417,7 +415,11 @@ def _patch_db(monkeypatch, db_path: Path) -> None:
 def _make_client() -> TestClient:
     from lionagi.studio.app import app
 
-    return TestClient(app, base_url="http://127.0.0.1:8765")
+    return TestClient(
+        app,
+        base_url="http://127.0.0.1:8765",
+        headers={"Content-Type": "application/json"},
+    )
 
 
 async def _seed_completed_session(db_path: Path, session_id: str) -> None:
@@ -451,9 +453,7 @@ async def _seed_running_session(db_path: Path, session_id: str) -> None:
         )
 
 
-# ---------------------------------------------------------------------------
 # 3a. Admin endpoint family.
-# ---------------------------------------------------------------------------
 
 
 def test_admin_doctor_response_shape(tmp_path, monkeypatch):
@@ -475,6 +475,7 @@ def test_admin_health_response_shape(tmp_path, monkeypatch):
         "code_identity",
         "db",
         "diagnostic_run_at",
+        "process_snapshot",
         "scheduler_timezone",
         "sessions",
     ]
@@ -565,9 +566,7 @@ def test_admin_prune_old_data_response_shape(tmp_path, monkeypatch):
     assert sorted(r.json().keys()) == ["dispatch_purged", "runs_pruned", "sessions_pruned"]
 
 
-# ---------------------------------------------------------------------------
 # 3b. Sessions endpoint family.
-# ---------------------------------------------------------------------------
 
 _SESSION_DETAIL_KEYS = sorted(
     [
@@ -581,7 +580,9 @@ _SESSION_DETAIL_KEYS = sorted(
         "duration_ms",
         "effort",
         "ended_at",
+        "ended_at_is_approximate",
         "graph",
+        "has_control_consumer",
         "id",
         "input_tokens",
         "invocation_id",
@@ -595,6 +596,7 @@ _SESSION_DETAIL_KEYS = sorted(
         "name",
         "node_metadata",
         "output_tokens",
+        "pause_is_held",
         "playbook_name",
         "project",
         "project_source",
@@ -664,34 +666,29 @@ def test_sessions_detail_malformed_cursor_400_shape(tmp_path, monkeypatch):
     assert sorted(r.json().keys()) == ["detail"]
 
 
-# ---------------------------------------------------------------------------
 # 3c. Schedules endpoint family.
-# ---------------------------------------------------------------------------
 
+# The projected detail shape. The schedules table carries roughly twice this many
+# columns; the route serves this allow-list, so a column added later stays private
+# until it is named both here and in the service's own list.
 _SCHEDULE_DETAIL_KEYS = sorted(
     [
         "action_agent",
-        "action_command",
-        "action_command_args",
+        # Read back by `li schedule create --machine` to report the execution root
+        # that was actually persisted. Record route only; no list surface serves it.
         "action_cwd",
-        "action_extra_args",
-        "action_flow_yaml",
         "action_kind",
         "action_model",
         "action_playbook",
         "action_project",
         "action_prompt",
-        "authored_spec",
         "budget_tokens",
         "budget_usd",
         "consecutive_failures",
         "created_at",
         "cron_expr",
         "description",
-        "effective_timezone",
-        "effective_timezone_source",
         "enabled",
-        "github_cursor",
         "github_filter",
         "github_repo",
         "health_last_outcome",
@@ -700,33 +697,19 @@ _SCHEDULE_DETAIL_KEYS = sorted(
         "health_state",
         "id",
         "interval_sec",
-        "last_alert_at",
+        "last_evaluated_at",
         "last_fired_at",
-        "last_healthy_poll_at",
         "last_status",
-        "managed_by",
         "max_runs",
         "missed_fire_policy",
         "name",
         "next_fire_at",
-        "notify_command",
-        "notify_on",
         "on_fail",
         "on_success",
         "overlap_policy",
-        "owner_key",
         "poll_interval_sec",
-        "poller_consecutive_401",
-        "predispatch_refusal_count",
-        "predispatch_refusal_event",
         "project",
-        "rate_limit",
         "recent_runs",
-        "resolved_digest",
-        "resolved_target",
-        "resolved_timezone",
-        "spec_version",
-        "threshold_config",
         "trigger_type",
         "updated_at",
     ]

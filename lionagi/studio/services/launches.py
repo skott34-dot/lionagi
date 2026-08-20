@@ -67,6 +67,12 @@ def _validate_request(data: dict[str, Any]) -> None:
     _svc_validate_identifier(data.get("action_project"), "action_project")
     _svc_validate_identifier(data.get("action_playbook"), "action_playbook")
     _svc_validate_extra_args(data.get("action_extra_args"))
+    if data.get("action_playbook_args"):
+        from lionagi.studio.scheduler.subprocess import _validate_playbook_args
+
+        _validate_playbook_args(data["action_playbook_args"])
+        if kind != "play":
+            raise ValueError("action_playbook_args is only valid for play launches")
     if kind == "engine":
         if not (data.get("action_engine_def") or "").strip():
             raise ValueError(
@@ -110,6 +116,7 @@ async def launch(data: dict[str, Any]) -> dict[str, Any]:
         "action_prompt": data.get("action_prompt") or "",
         "action_agent": data.get("action_agent"),
         "action_playbook": data.get("action_playbook"),
+        "action_playbook_args": data.get("action_playbook_args") or {},
         "action_project": data.get("action_project"),
         "action_extra_args": data.get("action_extra_args") or [],
         "action_flow_yaml": data.get("action_flow_yaml"),
@@ -265,7 +272,7 @@ async def _spawn_detached(
     """Spawn the process and update the invocation row when it exits."""
     from lionagi.state.reasons import RunReasons
 
-    from ..scheduler.subprocess import spawn_and_wait
+    from ..scheduler.subprocess import SubprocessDeadlineExceededError, spawn_and_wait
 
     output_tail = ""
     try:
@@ -307,6 +314,9 @@ async def _spawn_detached(
                 inv_id,
             )
         raise
+    except SubprocessDeadlineExceededError as exc:
+        status, reason = "timed_out", RunReasons.TIMED_OUT_DEADLINE
+        output_tail = str(exc)
     except Exception:
         _log.exception("Detached launch failed for invocation %s", inv_id)
         status, reason = "failed", RunReasons.FAILED_EXCEPTION
@@ -318,7 +328,11 @@ async def _spawn_detached(
                 inv_id,
                 new_status=status,
                 reason_code=reason,
-                reason_summary=_failure_reason_summary(status, output_tail),
+                reason_summary=(
+                    output_tail
+                    if status == "timed_out"
+                    else _failure_reason_summary(status, output_tail)
+                ),
                 evidence_refs=[],
                 source="executor",
                 actor=inv_id,
@@ -335,6 +349,7 @@ class LaunchRequest(BaseModel):
     action_prompt: str | None = None
     action_agent: str | None = None
     action_playbook: str | None = None
+    action_playbook_args: dict[str, Any] | None = None
     action_project: str | None = None
     action_flow_yaml: str | None = None
     action_engine_def: str | None = None

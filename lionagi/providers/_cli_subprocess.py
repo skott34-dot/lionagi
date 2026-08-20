@@ -9,12 +9,15 @@ import contextlib
 import json
 import logging
 import os
+import re
 import shutil
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+import sys
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote
 
 from lionagi.libs.path_safety import contain_and_resolve, has_traversal
 from lionagi.libs.schema.as_readable import as_readable
@@ -25,7 +28,7 @@ from lionagi.ln._proc import (
 )
 from lionagi.ln.concurrency.utils import maybe_await
 
-from ._secret_resolution import fill_declared_secrets
+from ._secret_resolution import fill_declared_secrets_and_names
 
 log = logging.getLogger(__name__)
 
@@ -38,9 +41,9 @@ def spawned_pgid(pid: int) -> int:
     """The process group of a just-spawned child.
 
     Falls back to the child's own pid: every spawn here uses
-    ``start_new_session``, so the child leads its own group by construction and
-    that pid IS the group id whenever the read fails because the child has
-    already exited.
+    ``start_new_session``, so the child leads its own group and that pid IS
+    the group id whenever the read fails because the child has already
+    exited.
     """
     try:
         return os.getpgid(pid)
@@ -51,15 +54,8 @@ def spawned_pgid(pid: int) -> int:
 def spawned_create_time(pid: int) -> float | None:
     """When the process at *pid* started, or None if that cannot be established.
 
-    The pid and the group id are both recyclable: once a process is reaped the
-    kernel is free to hand its numbers to anything, so a reader that has only
-    those two integers cannot tell this child from a stranger that arrived
-    later. The start time is what binds them to one process, and it is readable
-    only here, while the child is known to exist.
-
-    None is not a claim. It means the probe found no process or errored, and a
-    consumer must treat it as "no identity was captured" rather than as a
-    statement about the child.
+    None means "no identity was captured," not a statement about the child.
+    See docs/internals/providers.md#cli-subprocess-lifecycle.
     """
     import psutil
 
@@ -76,17 +72,11 @@ def spawned_create_time(pid: int) -> float | None:
 class SpawnedProcess:
     """The identity of a CLI child, as read at the moment it came into being.
 
-    ``pid`` and ``pgid`` are the handles a later sweep signals. ``create_time``
-    is what makes them an identity rather than two integers the OS may have
-    reissued in the meantime, so a consumer that intends to act on this record
-    later must compare a live start-time read against it and refuse to signal
-    when they disagree or when this field is None.
-
-    The group is the initial one, and a process group is not a containment
-    boundary: a child or descendant that calls ``setsid()`` leaves it, and this
-    record then says nothing about that process. Callers who need "nothing the
-    leg started survives" must either require non-daemonizing CLIs or use a
-    platform containment primitive; the group alone will not give it to them.
+    A consumer acting on this later must re-verify ``create_time`` against a
+    live read and refuse to signal when they disagree or it is None — pid and
+    pgid are both recyclable. The group is the initial one and is not a
+    containment boundary: a descendant that calls ``setsid()`` leaves it.
+    See docs/internals/providers.md#cli-subprocess-lifecycle.
     """
 
     pid: int
@@ -97,22 +87,9 @@ class SpawnedProcess:
 class Redacted:
     """A runtime-only value, wrapped so that nothing can print or serialize it.
 
-    ``repr=False`` on the field keeps a value out of a request's own
-    representation, and that is only one channel. Pydantic keeps the raw input
-    of a failing ``mode="before"`` validator on the error, and a model-level
-    validator holds the WHOLE raw mapping, so a request rejected for an
-    unrelated reason — an empty prompt, say — carries the child environment
-    along with the reason.
-
-    **Not a mapping, and that is the entire point.** A ``dict`` subclass with a
-    quiet ``__repr__`` closes the rendering channel and leaves the
-    serialization one wide open: ``str(err)`` and ``err.errors()`` go through
-    ``repr``, but ``err.json()`` walks the structure and writes out every key
-    and value, and ``err.json()`` is what a structured logger emits. Pydantic
-    has no structure to walk here, so all three channels get the same summary.
-
-    The real value stays reachable through :meth:`reveal` for the one validator
-    that has to look at it.
+    Deliberately not a mapping, so ``err.json()`` (which walks a structure)
+    has nothing to walk, same as ``repr()``-based channels.
+    See docs/internals/providers.md#cli-subprocess-lifecycle.
     """
 
     __slots__ = ("_value", "_label")
@@ -135,15 +112,10 @@ class Redacted:
 def raise_if_env_is_not_a_string_map(value: Mapping) -> None:
     """Reject a malformed environment without quoting anything out of it.
 
-    A string key is a variable NAME and naming it is what makes the error
-    actionable. A key of any other type is not a name, and printing it prints
-    whatever the caller put there — a tuple holding a token, for instance — so
-    those are reported by position and type only. Values are never printed at
-    all, whatever their type.
-
-    Raises TypeError rather than ValueError because pydantic converts
-    ValueError into a validation error that quotes the entire rejected input,
-    and lets anything else through untouched.
+    Values are never printed, whatever their type; non-string keys are
+    reported by position and type only, since printing one could print a
+    credential the caller embedded there. Raises TypeError, not ValueError —
+    pydantic quotes a ValueError's rejected input verbatim into the error.
     """
     named: list[str] = []
     unnamed: list[str] = []
@@ -161,40 +133,15 @@ def raise_if_env_is_not_a_string_map(value: Mapping) -> None:
 
 
 def redact_runtime_fields_in_place(data) -> None:
-    """Wrap the runtime-only values in a raw request mapping so nothing can
-    print or serialize them.
-
-    Called at the top of every model-level ``mode="before"`` validator, because
-    that is the one place a validator holds the WHOLE raw input, and pydantic
-    keeps a failing validator's raw input on the error. ``exclude`` and
-    ``repr=False`` do not reach that channel: they govern the model, and this
-    runs before a model exists.
-
-    Every declared runtime field is wrapped, not just ``env``. ``on_spawn`` is
-    a callback, and a bound one carries its receiver into its own ``repr``, so
-    a supervisor holding credentials would print them from the same error. The
-    wrapper is unwrapped by the field validators, which are the only code that
-    needs the value.
-
-    Anything the raw mapping holds under any other key is untouched and is not
-    covered by this. The claim here is about the two declared runtime fields.
-
-    **An immutable mapping is refused, not skipped.** Substituting in place is
-    not a convenience here, it is the whole mechanism: pydantic keeps the
-    object that was passed INTO the failing validator, so handing back a
-    sanitized copy changes nothing about what the error holds. When the raw
-    input cannot be written to, there is no way to make it safe, and the only
-    two options are to leak it or to refuse it. ``BaseModel.model_validate()``
-    accepts any mapping, so this route is public and reachable, and skipping
-    quietly meant a credential in ``str(exc)``, ``exc.errors()`` and
-    ``exc.json()`` alike.
-
-    The refusal is a ``TypeError`` because pydantic converts ``ValueError`` and
-    ``AssertionError`` into a ``ValidationError`` that quotes the rejected
-    input, which would reintroduce exactly what is being prevented. It names
-    the fields and the mapping type and never the values. A mapping carrying
-    neither runtime field has nothing to protect and passes through, so
-    read-only inputs are not broken in general.
+    """Wrap ``env``/``on_spawn`` in a raw request mapping so nothing can print
+    or serialize them. Called at the top of every model-level
+    ``mode="before"`` validator, the one place that holds pydantic's WHOLE raw
+    input on a failing validation. Substitution must happen in place, since
+    pydantic keeps the object passed INTO the failing validator on the error —
+    handing back a sanitized copy changes nothing about what the error holds.
+    An immutable mapping is therefore refused (TypeError, not ValueError —
+    pydantic quotes a ValueError's input verbatim), not silently skipped.
+    See docs/internals/providers.md#cli-subprocess-lifecycle.
     """
     if not isinstance(data, Mapping):
         return
@@ -220,41 +167,12 @@ def redact_runtime_fields_in_place(data) -> None:
 def _kill_abandoned_spawn(task: asyncio.Future) -> None:
     """End the group of a child nobody is left to receive.
 
-    Runs as a done-callback because by then there is nothing left to await
-    from: the coroutine that asked for the child has already unwound.
-
-    A cancelled task is a KNOWN HOLE here, not a case of nothing having
-    happened, and it is logged rather than passed over in silence. Interpreter
-    shutdown cancels pending tasks, and a cancellation landing inside the
-    creation call leaves a child the OS has made and whose pid was never
-    returned to anyone in this process. asyncio closes the transport on that
-    path, which ends the direct child; the group it leads is not reached,
-    because reaching it needs the pid.
-
-    This was measured rather than reasoned about: a leg spawned under a loop
-    that then shuts down leaves a SIGTERM-ignoring descendant running, and it
-    still does. Recording the handle as soon as the creation call returns was
-    tried and removed — it covers only a window between the call returning and
-    the caller resuming, which is not where the cancellation lands.
-
-    Closing it needs the pid before the creation call returns. There is a route
-    to that: driving ``loop.subprocess_exec`` with a protocol that records
-    ``transport.get_pid()`` in ``connection_made``, which the loop schedules
-    before the cancellable wait. It is declined here because it means
-    reimplementing ``create_subprocess_exec`` on top of stdlib classes outside
-    that module's ``__all__``, pinning this file to their shape across every
-    Python version supported.
-
-    Nor does anything recover it later. This said the opposite until it was
-    read against the code: that the orphan is in the record the caller writes
-    and a later sweep still finds it. ``on_spawn`` fires only once the creation
-    call has returned, which is precisely what did not happen here, so the
-    window leaves no record of any kind — which is what the log line is for,
-    and why it is a warning. Left as a stated hole, not a handled one.
-
-    The exception is retrieved where there is one, or asyncio reports it as
-    never-retrieved at exit and a cancelled spawn starts looking like a defect
-    in the spawn.
+    Runs as a done-callback since the awaiting coroutine has already unwound
+    by the time this fires. A cancellation landing inside the creation call
+    is a known, unclosed hole (logged, not silently passed over): the child
+    exists but its pid was never returned to this process, so only its
+    direct-child transport gets closed, never its group.
+    See docs/internals/providers.md#cli-subprocess-lifecycle.
     """
     if task.cancelled():
         log.warning(
@@ -272,20 +190,10 @@ def _kill_abandoned_spawn(task: asyncio.Future) -> None:
 
 
 def _end_group_with_evidence(proc: Any) -> str:
-    """End a child's group wherever its identity can be established.
-
-    TWO facts establish that a recorded group id still belongs to this child,
-    and they cover different moments, so checking only one leaves a hole where
-    the other applies. While the child is unreaped its pid cannot have been
-    reissued, so the group id is provably still its own and no scan is needed.
-    Once it has been reaped, only a live member pins that id, which is what the
-    membership scan looks for.
-
-    Checking only the second is what left a SIGTERM-ignoring descendant running
-    whenever the process table could not be read: the refusal is correct AFTER
-    the reap and wrong before it, where identity was never in question. The rule
-    was stated correctly and implemented halfway, which is the kind of gap that
-    reads as caution rather than as a defect.
+    """End a child's group wherever its identity can be established: while
+    unreaped (pid can't have been reissued, no scan needed) or, once reaped,
+    only if a live member still pins the group id.
+    See docs/internals/providers.md#cli-subprocess-lifecycle.
     """
     pgid = getattr(proc, "pid", None)
     if getattr(proc, "returncode", None) is None:
@@ -296,12 +204,10 @@ def _end_group_with_evidence(proc: Any) -> str:
 def _kill_group_if_occupied(pgid: Any) -> str:
     """End a process group if it can be shown to still hold someone.
 
-    Returns what happened, which the caller does not currently branch on but a
-    reader of the log needs: ``killed``, ``empty``, ``unproven`` or
-    ``no-group``. The unproven case is the one that matters — a process table
-    that could not be read completely and showed no members is not an empty
-    group, and it is the only outcome here where something may still be running
-    and nothing was done about it, so it says so rather than passing as clean.
+    Returns ``killed``/``empty``/``unproven``/``no-group`` for the log, not
+    for caller branching. ``unproven`` is the case that matters: a process
+    table read that failed and showed no members is not an empty group, and
+    is the only outcome where something may still be running unaddressed.
     """
     if not isinstance(pgid, int):
         return "no-group"
@@ -322,43 +228,14 @@ def _kill_group_if_occupied(pgid: Any) -> str:
 async def end_child_group(proc: Any, *, grace: float = 5.0) -> None:
     """End every member of the child's group, and survive being cancelled.
 
-    Two things this does that awaiting the graceful helper alone does not.
-
-    It drains the GROUP rather than the process. The graceful helper returns as
-    soon as the process it holds a handle to is gone, and a descendant that
-    ignores SIGTERM outlives a parent that does not — so the group is read
-    afterwards and killed if anyone is still in it. A group that answers with
-    members is still the group whose id was recorded, because a group id is not
-    reissued while it has members.
-
-    It cannot be interrupted into leaving something running. The graceful pass
-    waits out a grace period, and that wait is a cancellation point that a
-    runner being torn down is exactly where it meets. So a synchronous kill
-    runs in a ``finally`` when that pass did not finish: no await, so nothing
-    can interpose.
-
-    Every signal it sends is conditioned on the recorded group id still being
-    this child's, and there are exactly two things that establish that. Either
-    the child has not been waited, in which case its pid cannot have been
-    reissued and the polite signal is safe; or the group answers with a live
-    member, and an occupied group is never reissued. Nothing else counts, and
-    the graceful helper is therefore reached ONLY on the not-yet-waited path:
-    it signals the group id it is given without checking anything, so calling it
-    after a normal drain would send SIGTERM to whatever now holds a recycled id.
-
-    The escalation keys on that membership evidence rather than on whether the
-    direct child is dead. Those are different facts: a leader that died to
-    SIGTERM sets ``returncode`` while a descendant ignoring SIGTERM is still in
-    its group, and a backstop gated on the leader's liveness reads that as
-    nothing left to do. Confusing the two is the defect this function exists to
-    fix, so it must not be the condition the fix runs under.
-
-    What it therefore cannot close, rather than papering over it: a scan that
-    could not read the whole process table and saw no members leaves emptiness
-    unproved, and this refuses to signal on that, because an unprovable group
-    and a reissued one look the same from here. That refusal is logged rather
-    than silent — it is the one outcome where something may still be running
-    and nothing was done about it.
+    Drains the GROUP, not just the process — a descendant ignoring SIGTERM can
+    outlive a parent that doesn't, so the group is read afterwards and killed
+    if still occupied. Escalation is keyed on that membership evidence, not on
+    whether the direct child died, since those are different facts. The
+    graceful helper (reached only on the not-yet-waited path, since it signals
+    the group id unconditionally) is backed by a synchronous kill in a
+    ``finally`` so a second cancellation can't interpose.
+    See docs/internals/providers.md#cli-subprocess-lifecycle.
     """
     swept = False
     try:
@@ -384,20 +261,13 @@ _POST_EXIT_DRAIN_GRACE = 10.0
 def observe_spawned(pid: int) -> SpawnedProcess:
     """Read pid, group and start time as one observation of one process.
 
-    The group and the start time are two facts read separately by pid, and a
-    pid the OS reassigns between them answers the later read as the replacement
-    process. A record assembled from those two answers would describe no
-    process that ever existed, so the group read is bracketed by the start
-    time: read before, read again after, required to be unchanged. A failed
-    bracket yields ``create_time=None``, which already means "no identity was
-    captured" and is what stops a consumer from signalling on it.
-
-    The bracket rejects a replacement arriving DURING the observation. It
-    cannot speak for one that arrived before the first read, and the window
-    where that is possible is a child that exits and is reaped between the
-    spawn call returning and the first probe. What covers that window is the
-    probe itself: a reaped pid holds no process and an exited-not-yet-reaped
-    one is a zombie, and :func:`spawned_create_time` answers None to both.
+    The group read is bracketed by a start-time read before and after,
+    required unchanged, since the pid could otherwise be reassigned mid-read
+    and the two facts would describe a process that never existed. A failed
+    bracket yields ``create_time=None`` ("no identity captured"). A pid
+    reassigned before the first probe is separately covered:
+    :func:`spawned_create_time` returns None for both a reaped pid and a
+    zombie.
     """
     created = spawned_create_time(pid)
     pgid = spawned_pgid(pid)
@@ -413,17 +283,11 @@ def _no_stderr_reason(
 ) -> str:
     """Why a nonzero exit came with no stderr to quote.
 
-    A child that failed silently and a capture that failed to read it are
-    different facts about different components, and the caller acts on them
-    differently: the first is the child's own report and there is nothing more
-    to find, the second means the report exists somewhere this process did not
-    look. Collapsing both into the exit code makes a broken instrument read
-    exactly like a quiet subprocess, which is the direction that hides the
-    instrument.
-
-    The drain error contributes its exception type and never its message: that
-    message can embed the bytes being read when it raised, and this string is
-    what a caller stores or forwards.
+    Distinguishes a child that failed silently from a capture that failed to
+    read it — the caller acts on those differently, and collapsing them makes
+    a broken instrument read like a quiet subprocess. The drain error
+    contributes only its exception type, never its message, which can embed
+    the bytes being read when it raised.
     """
     exited = f"CLI subprocess exited with code {rc}"
     if drain_error is not None:
@@ -431,6 +295,269 @@ def _no_stderr_reason(
     if unavailable is not None:
         return f"{exited} and {unavailable}"
     return f"{exited} and wrote nothing to stderr"
+
+
+# Enough to carry a CLI's error banner without pasting a whole session into the
+# log line; the cap is on what is logged, not on what was captured.
+_ABANDONED_STDERR_LOG_CAP = 4096
+
+# Backstop against a wedged reader draining a closed pipe to EOF, not a budget
+# for the child to keep talking, so it is shorter than the exit-code path's wait.
+_ABANDONED_STDERR_DRAIN_TIMEOUT = 0.5
+
+
+# A credential reaches a child either from the environment we build for it or
+# from its own config, so the log path strips both what we injected and what
+# merely looks like a secret.
+# "sig" is bounded because it is short enough to sit inside ordinary words
+# (assignee, design, signal); the rest are long enough to stand alone.
+_SECRET_ENV_KEY_RE = re.compile(
+    r"(?i)key|token|secret|password|passwd|credential|auth|signature|bearer"
+    r"|(?<![a-z])sig(?![a-z])"
+)
+_SECRET_SHAPE_RE = re.compile(
+    r"(?i)\b(?:"
+    r"Bearer\s+\S+"
+    # To end of line, plus folded continuations: a scheme word ("Bearer x")
+    # otherwise ends the match early, and a value wrapped onto an indented
+    # continuation line leaves its tail behind.
+    r"|(?:Authorization|X-Api-Key|Api-Key)\s*:[^\r\n]*(?:\r?\n[ \t]+[^\r\n]*)*"
+    r"|(?:sk|rk)-[a-z0-9_-]{8,}"
+    r"|(?:ghp|gho|ghu|ghs|github_pat)_[a-z0-9_]{8,}"
+    r"|xox[abprs]-[a-z0-9-]{8,}"
+    r"|AKIA[0-9A-Z]{12,}"
+    r"|eyJ[a-z0-9_-]{8,}\.[a-z0-9_-]+\.[a-z0-9_-]+"
+    r")"
+)
+# A credential inside a connection string is invisible to both the name rule and
+# the token shapes. Only the password is replaced, so the host stays diagnostic.
+_URL_CREDENTIAL_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s:/?#@]*:)[^\s/?#@]+(@)")
+# The same credential passed as a query parameter has no "@" and so is invisible
+# to the rule above. Every parameter is matched and the name decides, so this
+# reads the name vocabulary above rather than restating it.
+_URL_QUERY_PARAM_RE = re.compile(r"([?&])([^=&\s]+)=([^&\s]+)")
+
+# The same credential written as a plain assignment has no "?" either, and may
+# be too short or too word-like to have become a candidate. Anchoring to the
+# name is what lets these two rules skip the length floor the guesses need.
+_ASSIGNMENT_RE = re.compile(r"([\w.\-]+)=([^\s&]+)")
+# And the space-separated form, which is how a child echoes its own argv back.
+# The value must not itself start with "-", or a bare flag eats the next one.
+_FLAG_VALUE_RE = re.compile(r"(--[\w.\-]+)(\s+)([^\s\-][^\s]*)")
+
+# Short values collide with ordinary words, which is the only reason either rule
+# below has a floor, so both use the same one. A declared name needs none.
+_MIN_REDACTABLE_VALUE_LEN = 8
+
+
+def _secret_candidates(
+    env: Mapping[str, str] | None, declared: Iterable[str] = ()
+) -> dict[str, str]:
+    """The environment values a log redactor must remove.
+
+    Declared names come first because the operator saying a variable holds a
+    secret is authority; the name pattern is only a guess, and it is what let a
+    secret named for its purpose rather than its kind through.
+    """
+    if not env:
+        return {}
+    named = frozenset(declared)
+    return {
+        key: value
+        for key, value in env.items()
+        if isinstance(key, str)
+        and isinstance(value, str)
+        # Empty would splice "[redacted]" between every character of the log.
+        and value
+        and (
+            key in named
+            or (len(value) >= _MIN_REDACTABLE_VALUE_LEN and _SECRET_ENV_KEY_RE.search(key))
+        )
+    }
+
+
+def _cmd_secret_values(cmd: Iterable[str] | None) -> dict[str, str]:
+    """Credentials passed as arguments, which no environment mapping holds.
+
+    A name or a flag is what makes an argument tellable from a path or a
+    subcommand, so a credential passed as a bare positional stays outside this:
+    nothing distinguishes it from the arguments the message needs to stay
+    useful. The environment is the supported channel for one, and it is covered
+    whatever the value looks like.
+
+    The anchored text rules already cover an echoed flag; this covers the child
+    printing the value alone, where nothing in the text says what it is. Same
+    length floor as the environment guesses, for the same reason: the flag name
+    is a guess, and a short value is not tellable from an ordinary word.
+
+    A caller that does need a bare positional covered declares the literal value
+    to remove, because it is the one that knows which argument is the credential.
+    Widening this to guess at positionals is not the extension: it would strip
+    the paths and subcommands the failure message exists to carry.
+    """
+    found: dict[str, str] = {}
+    awaiting: str | None = None
+    for token in cmd or ():
+        if not isinstance(token, str):
+            awaiting = None
+            continue
+        name, sep, value = token.partition("=")
+        if sep and _name_reads_as_credential(name):
+            if len(value) >= _MIN_REDACTABLE_VALUE_LEN:
+                found[name.lstrip("-")] = value
+            awaiting = None
+        elif awaiting is not None and not token.startswith("-"):
+            if len(token) >= _MIN_REDACTABLE_VALUE_LEN:
+                found[awaiting] = token
+            awaiting = None
+        else:
+            awaiting = token.lstrip("-") if _name_reads_as_credential(token) else None
+    return found
+
+
+def _bounded_env_values(
+    env: Mapping[str, str] | None, already_secret: Mapping[str, str]
+) -> dict[str, str]:
+    """Name-matched values under the floor, replaceable only as whole tokens.
+
+    The name is evidence the value is a credential, so length must not excuse
+    it entirely. What length does decide is the replacement: a short value can
+    sit inside an ordinary word, so it gets a bounded replacement while longer
+    values keep the stronger substring one.
+    """
+    if not env:
+        return {}
+    return {
+        key: value
+        for key, value in env.items()
+        if isinstance(key, str)
+        and isinstance(value, str)
+        and value
+        and key not in already_secret
+        and len(value) < _MIN_REDACTABLE_VALUE_LEN
+        and _SECRET_ENV_KEY_RE.search(key)
+    }
+
+
+def _opaque_env_values(
+    env: Mapping[str, str] | None, already_secret: Mapping[str, str]
+) -> dict[str, str]:
+    """Values the log will not echo even though nothing marks them secret.
+
+    A secret can sit in a variable whose name says nothing, so length is the
+    only signal left.
+    """
+    if not env:
+        return {}
+    return {
+        key: value
+        for key, value in env.items()
+        if isinstance(key, str)
+        and isinstance(value, str)
+        and key not in already_secret
+        and len(value) >= _MIN_REDACTABLE_VALUE_LEN
+    }
+
+
+def _name_reads_as_credential(name: str) -> bool:
+    """Whether a parameter, variable or flag name announces that it holds a secret."""
+    # Decoded before the test: `p%61ssword` is the same parameter to the server
+    # that reads it, and would otherwise carry its value past every rule.
+    return bool(_SECRET_ENV_KEY_RE.search(unquote(name)))
+
+
+def _redact_query_value(match: re.Match[str]) -> str:
+    """Replace a query parameter's value when its name reads as a credential."""
+    separator, name, value = match.groups()
+    if not _name_reads_as_credential(name):
+        return match.group(0)
+    return f"{separator}{name}=[redacted]"
+
+
+def _redact_assignment_value(match: re.Match[str]) -> str:
+    """Replace a bare NAME=value pair when the name reads as a credential."""
+    name, value = match.groups()
+    if not _name_reads_as_credential(name):
+        return match.group(0)
+    return f"{name}=[redacted]"
+
+
+def _redact_flag_value(match: re.Match[str]) -> str:
+    """Replace the value after a credential-named flag, as echoed argv shows it."""
+    flag, gap, value = match.groups()
+    if not _name_reads_as_credential(flag):
+        return match.group(0)
+    return f"{flag}{gap}[redacted]"
+
+
+def _escape_control_characters(text: str) -> str:
+    """Show control bytes rather than let child output forge a log record."""
+    return "".join(
+        character if character == " " or character.isprintable() else repr(character)[1:-1]
+        for character in text
+    )
+
+
+def _redact_secrets_for_log(
+    text: str,
+    secrets: Mapping[str, str] | None,
+    opaque: Mapping[str, str] | None = None,
+    bounded: Mapping[str, str] | None = None,
+) -> str:
+    """Strip credentials out of child output before any of it reaches a log.
+
+    Both arguments are already the sets to remove, not environments to filter:
+    one selection site, so the spawn path and the log path cannot drift apart.
+    A known secret becomes ``[redacted]`` because naming it adds nothing; an
+    unclassified value becomes its variable's name, which keeps the message
+    diagnostic without printing what the variable held.
+    """
+    if not text:
+        return text
+    replacements: dict[str, str] = {}
+    for key, value in (opaque or {}).items():
+        if isinstance(value, str) and value:
+            replacements[value] = f"[${key}]"
+    # Second, so a value in both classes is redacted rather than named.
+    for value in (secrets or {}).values():
+        if isinstance(value, str) and value:
+            replacements[value] = "[redacted]"
+    # Longest first, so a value containing another is not left half-revealed.
+    for value in sorted(replacements, key=len, reverse=True):
+        text = text.replace(value, replacements[value])
+    for value in sorted({v for v in (bounded or {}).values() if v}, key=len, reverse=True):
+        # Whole token only: a substring pass would splice into ordinary words.
+        text = re.sub(rf"(?<!\w){re.escape(value)}(?!\w)", "[redacted]", text)
+    text = _URL_CREDENTIAL_RE.sub(r"\1[redacted]\2", text)
+    text = _URL_QUERY_PARAM_RE.sub(_redact_query_value, text)
+    text = _ASSIGNMENT_RE.sub(_redact_assignment_value, text)
+    text = _FLAG_VALUE_RE.sub(_redact_flag_value, text)
+    # Escape last: the redaction patterns are written against the real text.
+    return _escape_control_characters(_SECRET_SHAPE_RE.sub("[redacted]", text))
+
+
+def _abandoned_without_output_note(
+    captured: str,
+    unavailable: str | None,
+    drain_error: str | None,
+    drain_incomplete: bool = False,
+) -> str:
+    """What to say about a child abandoned before it produced output; keeps ``_no_stderr_reason``'s three-way split so a broken capture cannot read as a quiet subprocess."""
+    if captured:
+        clipped = captured[:_ABANDONED_STDERR_LOG_CAP]
+        suffix = " [truncated]" if len(captured) > _ABANDONED_STDERR_LOG_CAP else ""
+        if drain_incomplete:
+            suffix += " [stderr drain did not finish]"
+        return f"its stderr said: {clipped}{suffix}"
+    if drain_error is not None:
+        return f"reading its stderr failed with {drain_error}, so no output was captured"
+    if drain_incomplete:
+        # An unfinished drain leaves the pipe unread, so silence here is
+        # unknown rather than a quiet child.
+        return "its stderr could not be drained in time, so whether it wrote anything is unknown"
+    if unavailable is not None:
+        return unavailable
+    return "it wrote nothing to stderr either"
 
 
 async def ndjson_from_cli(
@@ -443,36 +570,34 @@ async def ndjson_from_cli(
     tail_repair: Callable[[str], dict | None] | None = None,
     on_spawn: Callable[[SpawnedProcess], None | Awaitable[None]] | None = None,
 ) -> AsyncIterator[dict]:
-    """Yield dicts from an NDJSON-emitting CLI subprocess; tail_repair handles malformed final chunks.
-
-    ``stdin_data`` feeds text to the child over a pipe instead of the command
-    line, which is how an arbitrarily large prompt is delivered without
-    hitting the OS argument-length limit. It overrides ``stdin``: the child
-    always gets a pipe, the data is written by a task that runs concurrently
-    with the stdout/stderr readers below (a sequential write would deadlock as
-    soon as the data exceeds the pipe buffer and the child is blocked writing
-    output nobody is draining), and the pipe is closed afterwards so the child
-    sees EOF rather than waiting forever for more input.
-
-    ``on_spawn`` is called once with a :class:`SpawnedProcess` immediately
-    after the child exists, for a caller that must record the process identity
-    of a process it did not itself spawn. It may be a coroutine function; the
-    result is awaited before the first byte of output is read, so a recorder
-    that writes durably has finished writing before anything can consume the
-    stream. Its failure is deliberately not swallowed: a caller whose recording
-    fails has no record of a child that is now running, and continuing would
-    leave a live process outside whatever domain the record defines. The
-    exception propagates through the teardown below, which ends the group it
-    was called for.
+    """Yield dicts from an NDJSON-emitting CLI subprocess; tail_repair handles
+    malformed final chunks. ``stdin_data`` overrides ``stdin`` and is written
+    concurrently with the stdout/stderr readers below, then closed so the
+    child sees EOF. ``on_spawn`` is awaited (may be a coroutine function)
+    before any output is read, and its failure is not swallowed — it
+    propagates through the teardown below, which ends the child's group.
+    See docs/internals/providers.md#cli-subprocess-lifecycle.
     """
     # Every CLI provider spawns through here, so a secret the child must read
     # from its own environment is filled in one place rather than four. Purely
     # additive: with nothing configured this returns ``env`` unchanged, and a
     # lookup that fails leaves the child to fail the way it already failed.
-    child_env = await fill_declared_secrets(env)
+    # One config read for both: re-resolving after the fill's await would let a
+    # settings edit in that window hand the child a value the redactor is not
+    # told to remove.
+    child_env, declared = await fill_declared_secrets_and_names(env)
+    # One mapping for both the child and the redactor: with env=None the child
+    # reads os.environ at exec, later than any snapshot taken here.
+    spawn_env: dict[str, str] = dict(child_env) if child_env is not None else dict(os.environ)
+    redaction_env: Mapping[str, str] = {
+        **_secret_candidates(spawn_env, declared),
+        **_cmd_secret_values(cmd),
+    }
+    opaque_env: Mapping[str, str] = _opaque_env_values(spawn_env, redaction_env)
+    bounded_env: Mapping[str, str] = _bounded_env_values(spawn_env, redaction_env)
     kwargs: dict[str, Any] = dict(
         cwd=str(cwd) if cwd else None,
-        env=dict(child_env) if child_env is not None else None,
+        env=spawn_env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
@@ -548,6 +673,17 @@ async def ndjson_from_cli(
 
     stderr_task = asyncio.create_task(_drain_stderr())
 
+    def captured_stderr() -> str:
+        """The child's stderr as anything outside this process may see it."""
+        # Both the non-zero-exit error and the abandoned-child warning surface
+        # these same bytes, so they are redacted here rather than at each.
+        return _redact_secrets_for_log(
+            b"".join(stderr_chunks).decode(errors="replace").strip(),
+            redaction_env,
+            opaque_env,
+            bounded_env,
+        )
+
     async def _write_stdin(payload: bytes) -> None:
         if proc.stdin is None:
             return
@@ -570,22 +706,12 @@ async def ndjson_from_cli(
         payload = stdin_data.encode() if isinstance(stdin_data, str) else stdin_data
         stdin_task = asyncio.create_task(_write_stdin(payload))
 
-    # stdout EOF requires EVERY holder of the pipe's write end to close it —
-    # not just the child. A CLI child that spawns its own long-lived helpers
-    # (MCP servers, daemons) leaks the write end into them, so when the child
-    # dies its orphans keep the pipe open and a plain read() waits forever: a
-    # finished leg whose artifacts are on disk reads as "running" for the rest
-    # of the caller's budget. Racing each read against the child's exit, then
-    # bounding the drain once it has exited, turns that hang into the normal
-    # end-of-stream path; teardown then ends the process group, which is what
-    # actually closes the orphans' copy of the pipe.
+    # Guards against orphan-held pipes leaving stdout open forever; see
+    # docs/internals/providers.md#cli-subprocess-lifecycle.
     async def _await_child_exit() -> int:
-        # proc.wait() alone cannot be the exit signal: on newer Pythons it does
-        # not complete until every pipe transport disconnects, which is exactly
-        # what an orphan-held pipe prevents. returncode is set at process exit
-        # regardless of pipe state, so the wait races against a returncode
-        # poll; wait()'s result is preferred when it does complete, because it
-        # is the canonical exit code (and the only one a test double carries).
+        # wait() alone can block on an orphan-held pipe on newer Pythons, so it
+        # races a returncode poll; wait()'s result wins when it completes, since
+        # it's the canonical exit code (and the only one a test double carries).
         wait_task = asyncio.create_task(proc.wait())
         try:
             while proc.returncode is None and not wait_task.done():
@@ -614,11 +740,9 @@ async def ndjson_from_cli(
             await asyncio.wait({read_task, exit_task}, return_when=asyncio.FIRST_COMPLETED)
             child_exited = exit_task.done()
         if child_exited and not read_task.done():
-            # The grace is per read, never a shared deadline: output the child
-            # buffered before exiting must survive a consumer that processes
-            # slowly between reads. Only a read that produces nothing for the
-            # whole grace ends the stream. wait_for cancels the read on
-            # timeout, so nothing is left pending.
+            # Grace is per read, not a shared deadline, so buffered output
+            # survives a slow consumer; only a read producing nothing for the
+            # whole grace ends the stream.
             try:
                 return await asyncio.wait_for(read_task, _POST_EXIT_DRAIN_GRACE)
             except asyncio.TimeoutError:
@@ -630,6 +754,13 @@ async def ndjson_from_cli(
                 )
                 return b""
         return await read_task
+
+    # Set before each yield, never after: GeneratorExit lands at the yield, so a
+    # later assignment never runs and a child that spoke reads as one that did not.
+    produced_output = False
+    # Whether the exit-code path below already quoted stderr to the caller, so
+    # the teardown does not repeat it into the log.
+    stderr_already_surfaced = False
 
     try:
         while True:
@@ -645,6 +776,7 @@ async def ndjson_from_cli(
                     break
                 try:
                     obj, idx = json_decoder.raw_decode(buffer)
+                    produced_output = True
                     yield obj
                     buffer = buffer[idx:]
                 except json.JSONDecodeError:
@@ -655,12 +787,14 @@ async def ndjson_from_cli(
         if buffer:
             try:
                 obj, idx = json_decoder.raw_decode(buffer)
+                produced_output = True
                 yield obj
             except json.JSONDecodeError:
                 if tail_repair is not None:
                     try:
                         repaired = tail_repair(buffer)
                         if repaired is not None:
+                            produced_output = True
                             yield repaired
                             log.warning("Repaired malformed JSON fragment at stream end")
                         else:
@@ -681,22 +815,49 @@ async def ndjson_from_cli(
                 drain_truncated = True
             except asyncio.CancelledError:
                 raise
-            err = b"".join(stderr_chunks).decode(errors="replace").strip()
-            # Emptiness is decided on what was captured, before the drain note
-            # is appended. Deciding it on the concatenated string instead lets
-            # the note itself count as output, so a truncated drain that
-            # captured nothing would report neither the exit code nor the fact
-            # that there was nothing to quote. No probe I built reaches that
-            # arm; this orders the two steps so its reachability stops
-            # mattering.
+            err = captured_stderr()
+            # Emptiness decided on what was captured, before the drain note is
+            # appended, so a truncated drain that captured nothing still gets
+            # a message instead of the note masquerading as output.
             if not err:
                 err = _no_stderr_reason(rc, stderr_unavailable, stderr_drain_error)
             if drain_truncated:
                 err += " [stderr drain timed out]"
+            stderr_already_surfaced = True
             raise RuntimeError(err)
 
     finally:
+        # Neither stderr-quoting path covers this, and it is decided before any
+        # await, since awaiting in a finally can change sys.exc_info().
+        abandoned_silently = (
+            sys.exc_info()[1] is not None and not produced_output and not stderr_already_surfaced
+        )
+
         await end_child_group(proc)
+
+        if abandoned_silently:
+            # Drain first, or the warning reports "said nothing" about a child
+            # that spoke; shielded so a timeout cannot cancel it mid-buffer.
+            abandon_drain_incomplete = False
+            if stderr_task is not None:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(stderr_task), timeout=_ABANDONED_STDERR_DRAIN_TIMEOUT
+                    )
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    # Whatever it captured stays in the buffer, but the drain
+                    # did not finish, so an empty buffer is unknown rather than
+                    # evidence the child was quiet.
+                    abandon_drain_incomplete = True
+            log.warning(
+                "CLI subprocess produced no output before it was abandoned; %s",
+                _abandoned_without_output_note(
+                    captured_stderr(),
+                    stderr_unavailable,
+                    stderr_drain_error,
+                    abandon_drain_incomplete,
+                ),
+            )
 
         # Reap the helper tasks — contextlib.suppress(Exception) does NOT
         # catch CancelledError (BaseException), so we suppress it explicitly.

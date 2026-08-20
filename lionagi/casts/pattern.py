@@ -6,9 +6,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from lionagi.ln.types import Enum, ModelConfig, Params
+from lionagi.ln.types._sentinel import _compat_is_sentinel
 from lionagi.protocols._concepts import Composable
 
 if TYPE_CHECKING:
@@ -34,7 +35,7 @@ class PatternKind(Enum):
     MODE = "mode"
 
 
-@dataclass(init=False, frozen=True, slots=True)
+@dataclass(init=False, frozen=True, slots=True, eq=False)
 class Pattern(Params, Composable):
     """Composable, frozen atom of agent configuration; Role and Mode subclass and override ``kind``."""
 
@@ -81,7 +82,7 @@ def _list_builtin_modules(pkg: str) -> set[str]:
     return names
 
 
-@dataclass(init=False, frozen=True, slots=True)
+@dataclass(init=False, frozen=True, slots=True, eq=False)
 class Mode(Pattern):
     """Cognitive overlay — shapes *how* an agent reasons."""
 
@@ -101,7 +102,7 @@ class Mode(Pattern):
         return obj
 
 
-@dataclass(init=False, frozen=True, slots=True)
+@dataclass(init=False, frozen=True, slots=True, eq=False)
 class Role(Pattern):
     """Behavioral pattern: ``body`` composes into the system prompt; ``emits`` declares the emission contract."""
 
@@ -115,20 +116,31 @@ class Role(Pattern):
     def kind(self) -> PatternKind:
         return PatternKind.ROLE
 
-    def to_dict(self, exclude: set[str] | None = None) -> dict[str, Any]:
+    def to_dict(
+        self,
+        exclude: set[str] | None = None,
+        *,
+        mode: Literal["python", "json"] = "python",
+    ) -> dict[str, Any]:
         # Params.to_dict (not super()) — zero-arg super is unreliable under @dataclass(slots=True).
         d = Params.to_dict(self, exclude=exclude)
         if "emits" in d:
             d["emits"] = [m.__name__ for m in d["emits"]]
-        return d
+        from lionagi.ln.types.base import _apply_serialization_mode
+
+        return _apply_serialization_mode(d, mode)
 
     def emission_operable(self) -> Operable | None:
         """Build the Operable for this role's emission contract; None if no emits; always includes EscalationRequest."""
         from lionagi.casts.emission import build_emission_operable
-        from lionagi.ln.types import is_sentinel
 
         emits = getattr(self, "emits", ())
-        if is_sentinel(emits, none_as_sentinel=True, empty_as_sentinel=True):
+        if _compat_is_sentinel(
+            emits,
+            site="lionagi.casts.pattern.Role.emission_operable",
+            none_as_sentinel=True,
+            empty_as_sentinel=True,
+        ):
             return None
         return build_emission_operable(tuple(emits), name=f"{self.name}_emissions")
 

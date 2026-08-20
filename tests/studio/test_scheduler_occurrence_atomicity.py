@@ -21,6 +21,7 @@ from lionagi.state.db import StateDB
 from lionagi.state.reasons import RunReasons
 from lionagi.studio.scheduler.engine import SchedulerEngine
 from lionagi.studio.services.scheduler_state import _DBSchedulerStateService
+from tests._scheduler_claims import claim_and_advance
 
 
 def _schedule_row(schedule_id: str, **overrides) -> dict:
@@ -73,7 +74,8 @@ async def test_crash_between_insert_and_advance_does_not_double_fire(tmp_path):
     async with StateDB(db_path) as db:
         with patch.object(AsyncConnection, "execute", _crash):
             with pytest.raises(RuntimeError, match="simulated crash"):
-                await db.create_schedule_run_and_advance(
+                await claim_and_advance(
+                    db,
                     _run_row("run-1", sid, fired_at=1000.0),
                     schedule_id=sid,
                     schedule_fields={"next_fire_at": 2000.0, "last_fired_at": 1000.0},
@@ -91,7 +93,8 @@ async def test_crash_between_insert_and_advance_does_not_double_fire(tmp_path):
     # time) and must produce exactly one durable row -- proving the
     # crashed attempt left nothing behind to double up against.
     async with StateDB(db_path) as db:
-        await db.create_schedule_run_and_advance(
+        await claim_and_advance(
+            db,
             _run_row("run-1", sid, fired_at=1000.0),
             schedule_id=sid,
             schedule_fields={"next_fire_at": 2000.0, "last_fired_at": 1000.0},
@@ -121,7 +124,8 @@ async def test_github_path_crash_before_second_event_refires_only_second(tmp_pat
         )
 
         # Event 1: normal atomic commit.
-        await db.create_schedule_run_and_advance(
+        await claim_and_advance(
+            db,
             _run_row("run-event1", sid, fired_at=1000.0),
             schedule_id=sid,
             schedule_fields={"github_cursor": event1_time, "last_fired_at": 1000.0},
@@ -137,7 +141,8 @@ async def test_github_path_crash_before_second_event_refires_only_second(tmp_pat
     async with StateDB(db_path) as db:
         with patch.object(AsyncConnection, "execute", _crash):
             with pytest.raises(RuntimeError, match="simulated crash"):
-                await db.create_schedule_run_and_advance(
+                await claim_and_advance(
+                    db,
                     _run_row("run-event2", sid, fired_at=1100.0),
                     schedule_id=sid,
                     schedule_fields={"github_cursor": event2_time, "last_fired_at": 1100.0},
@@ -159,7 +164,8 @@ async def test_github_path_crash_before_second_event_refires_only_second(tmp_pat
     # because the poll's own cursor filter -- github_cursor -- excludes it;
     # this call models the recorded outcome of that re-poll).
     async with StateDB(db_path) as db:
-        await db.create_schedule_run_and_advance(
+        await claim_and_advance(
+            db,
             _run_row("run-event2", sid, fired_at=1100.0),
             schedule_id=sid,
             schedule_fields={"github_cursor": event2_time, "last_fired_at": 1100.0},
@@ -194,7 +200,8 @@ async def test_missed_fire_recovery_skips_occurrence_already_in_schedule_runs(
         # still in the past relative to "now" in this test, so the
         # schedule is still seen as due -- exercising the recovery path
         # rather than the ordinary tick).
-        await db.create_schedule_run_and_advance(
+        await claim_and_advance(
+            db,
             _run_row("run-crashed", sid, fired_at=due_at),
             schedule_id=sid,
             schedule_fields={"next_fire_at": due_at, "last_fired_at": due_at},
@@ -365,7 +372,8 @@ async def test_recovery_refires_occurrence_committed_but_never_dispatched(tmp_pa
         # Simulate _fire_inner()'s atomic commit landing (row + cursor
         # advance both durable), then the daemon dying before
         # spawn_and_wait's on_launched callback ever stamps dispatched_at.
-        await db.create_schedule_run_and_advance(
+        await claim_and_advance(
+            db,
             _run_row(
                 "run-orphaned",
                 sid,
@@ -436,7 +444,8 @@ async def test_recovery_never_touches_a_row_with_confirmed_dispatch(tmp_path, mo
 
     async with StateDB(db_path) as db:
         await db.create_schedule(_schedule_row(sid, next_fire_at=2000.0))
-        await db.create_schedule_run_and_advance(
+        await claim_and_advance(
+            db,
             _run_row("run-dispatched", sid, fired_at=1000.0),
             schedule_id=sid,
             schedule_fields={"next_fire_at": 2000.0, "last_fired_at": 1000.0},
@@ -475,7 +484,8 @@ async def test_recovery_tombstones_undispatched_chain_child_without_retry(tmp_pa
         # The chain-parent row must exist first -- chain_parent_id is a real
         # FK reference to schedule_runs(id). Its own status is irrelevant to
         # this test; only its existence satisfies the constraint.
-        await db.create_schedule_run_and_advance(
+        await claim_and_advance(
+            db,
             _run_row("run-parent", sid, fired_at=999.0),
             schedule_id=sid,
             schedule_fields={"next_fire_at": 1000.0, "last_fired_at": 999.0},
@@ -485,7 +495,8 @@ async def test_recovery_tombstones_undispatched_chain_child_without_retry(tmp_pa
         # this test isolates the chain-child-specific tombstone-without-retry
         # behavior from the ordinary top-level re-fire path.
         await db.update_schedule_run("run-parent", dispatched_at=999.5)
-        await db.create_schedule_run_and_advance(
+        await claim_and_advance(
+            db,
             _run_row(
                 "run-chain-child",
                 sid,
@@ -519,7 +530,8 @@ async def test_tombstone_and_replace_schedule_run_is_atomic(tmp_path):
 
     async with StateDB(db_path) as db:
         await db.create_schedule(_schedule_row(sid, next_fire_at=2000.0))
-        await db.create_schedule_run_and_advance(
+        await claim_and_advance(
+            db,
             _run_row("run-orphan", sid, fired_at=1000.0),
             schedule_id=sid,
             schedule_fields={"next_fire_at": 2000.0, "last_fired_at": 1000.0},
@@ -582,7 +594,8 @@ async def test_recovery_leaves_orphan_untouched_when_refire_crashes_before_atomi
 
     async with StateDB(db_path) as db:
         await db.create_schedule(_schedule_row(sid, next_fire_at=2000.0))
-        await db.create_schedule_run_and_advance(
+        await claim_and_advance(
+            db,
             _run_row(
                 "run-orphaned", sid, fired_at=1000.0, trigger_context=orphaned_trigger_context
             ),
@@ -662,7 +675,8 @@ async def test_recovery_never_double_fires_across_two_passes(tmp_path, monkeypat
 
     async with StateDB(db_path) as db:
         await db.create_schedule(_schedule_row(sid, next_fire_at=2000.0))
-        await db.create_schedule_run_and_advance(
+        await claim_and_advance(
+            db,
             _run_row("run-orphaned", sid, fired_at=1000.0),
             schedule_id=sid,
             schedule_fields={"next_fire_at": 2000.0, "last_fired_at": 1000.0},
@@ -711,13 +725,14 @@ async def test_recovery_never_double_fires_across_two_passes(tmp_path, monkeypat
 
 @pytest.mark.asyncio
 async def test_tombstone_and_replace_schedule_run_refuses_when_dispatch_confirmed(tmp_path):
-    """The CAS predicate requires dispatched_at IS NULL, not just status='running': a launch confirmation landing between a recovery scan and this write means the row is no longer undispatched, and tombstoning it would flip an actually-launched run to 'failed' and fire a duplicate -- reviewer repro: dispatched_at already set must refuse (applied=False), inserting nothing."""
+    """The CAS predicate requires dispatched_at IS NULL, not just status='running': a launch confirmation landing between a recovery scan and this write means the row is no longer undispatched, and tombstoning it would flip an actually-launched run to 'failed' and fire a duplicate -- dispatched_at already set must refuse (applied=False), inserting nothing."""
     db_path = tmp_path / "state.db"
     sid = "sched-dispatched-race"
 
     async with StateDB(db_path) as db:
         await db.create_schedule(_schedule_row(sid, next_fire_at=2000.0))
-        await db.create_schedule_run_and_advance(
+        await claim_and_advance(
+            db,
             _run_row("run-live", sid, fired_at=1000.0),
             schedule_id=sid,
             schedule_fields={"next_fire_at": 2000.0, "last_fired_at": 1000.0},
@@ -743,7 +758,7 @@ async def test_tombstone_and_replace_schedule_run_refuses_when_dispatch_confirme
 
 @pytest.mark.asyncio
 async def test_recovery_refire_is_noop_when_dispatch_confirmed_mid_race(tmp_path, monkeypatch):
-    """The reviewer-specified race: a concurrently-confirmed launch (dispatched_at stamped) lands after recovery's scan but before its atomic re-fire write; the strengthened CAS makes that write a no-op, leaving the live run completely untouched, and abandonment cancels only the doomed pre-spawn recovery invocation, never the live run's own."""
+    """A concurrently-confirmed launch (dispatched_at stamped) lands after recovery's scan but before its atomic re-fire write; the strengthened CAS makes that write a no-op, leaving the live run completely untouched, and abandonment cancels only the doomed pre-spawn recovery invocation, never the live run's own."""
     import lionagi.state.db as state_db_mod
 
     db_path = tmp_path / "state.db"
@@ -754,7 +769,8 @@ async def test_recovery_refire_is_noop_when_dispatch_confirmed_mid_race(tmp_path
     async with StateDB(db_path) as db:
         await db.create_schedule(_schedule_row(sid, next_fire_at=2000.0))
         await db.create_invocation({"id": "inv-live", "skill": "test", "started_at": 1000.0})
-        await db.create_schedule_run_and_advance(
+        await claim_and_advance(
+            db,
             _run_row("run-live", sid, fired_at=1000.0, invocation_id="inv-live"),
             schedule_id=sid,
             schedule_fields={"next_fire_at": 2000.0, "last_fired_at": 1000.0},
@@ -817,10 +833,8 @@ async def test_recovery_refire_is_noop_when_dispatch_confirmed_mid_race(tmp_path
     assert recovery_invocation["status_reason_code"] == RunReasons.CANCELLED_STALE_AUTO
 
 
-# ---------------------------------------------------------------------------
 # _reconcile_dispatched_orphans -- confirmed-dispatch rows the scheduler
-# never recorded an outcome for (#2755)
-# ---------------------------------------------------------------------------
+# never recorded an outcome for
 
 
 async def _seed_dispatched_run_with_session(
@@ -846,7 +860,8 @@ async def _seed_dispatched_run_with_session(
             "status": session_status,
         }
     )
-    await db.create_schedule_run_and_advance(
+    await claim_and_advance(
+        db,
         _run_row(run_id, sid, fired_at=1000.0, invocation_id=inv_id),
         schedule_id=sid,
         schedule_fields={"next_fire_at": 2000.0, "last_fired_at": 1000.0},
@@ -934,7 +949,8 @@ async def test_reconcile_leaves_row_running_when_no_sessions_recorded(tmp_path, 
         await db.create_invocation(
             {"id": inv_id, "skill": "command", "started_at": 1000.0, "status": "running"}
         )
-        await db.create_schedule_run_and_advance(
+        await claim_and_advance(
+            db,
             _run_row(run_id, sid, fired_at=1000.0, invocation_id=inv_id, action_kind="command"),
             schedule_id=sid,
             schedule_fields={"next_fire_at": 2000.0, "last_fired_at": 1000.0},
@@ -990,7 +1006,8 @@ async def test_reconcile_finalizes_completed_empty_orphan_as_failed_not_success(
                 "status": "completed_empty",
             }
         )
-        await db.create_schedule_run_and_advance(
+        await claim_and_advance(
+            db,
             _run_row(run_id, sid, fired_at=1000.0, invocation_id=inv_id),
             schedule_id=sid,
             schedule_fields={"next_fire_at": 2000.0, "last_fired_at": 1000.0},

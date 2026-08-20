@@ -13,6 +13,7 @@ import { createElement } from "react";
 import type { ComponentType, ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import Markdown, { isNoArtifactRootDetail } from "./Markdown";
+import type { FileResolutionContext } from "./Markdown";
 import * as MarkdownModule from "./Markdown";
 
 const SRC = fs.readFileSync(path.resolve(__dirname, "Markdown.tsx"), "utf-8");
@@ -77,7 +78,7 @@ describe("Markdown.tsx — file-link resolution wiring", () => {
     expect(SRC).toMatch(/knownFiles: fileContext\.knownFiles/);
   });
 
-  it("renders a distinct no-artifact-root state, not the generic missing-file message (issue #2848)", () => {
+  it("renders a distinct no-artifact-root state, not the generic missing-file message", () => {
     expect(SRC).toMatch(/status === "no_artifact_root"/);
     expect(SRC).toMatch(/isNoArtifactRootDetail\(result\.detail\)/);
   });
@@ -156,14 +157,64 @@ describe("Markdown.tsx — the file viewer renders markdown as markdown", () => 
     }
 
     const remoteUrl = remoteUrls[0];
+    // Operator messages, run output, and library content are untrusted too;
+    // the guard is the default rather than an opt-in viewer policy.
     const ordinaryHtml = renderToStaticMarkup(
       createElement(MarkdownRenderer, null, `![remote tracker](${remoteUrl})`),
     );
-    expect(ordinaryHtml).toContain("<img");
-    expect(ordinaryHtml).toContain(remoteUrl);
+    expect(ordinaryHtml).not.toContain("<img");
+    expect(ordinaryHtml).not.toContain(remoteUrl);
+    expect(ordinaryHtml).toContain("Remote image blocked");
   });
 
   it("gives a rendered document more width than raw source, since tables need it", () => {
     expect(SRC).toMatch(/maxWidth=\{isMarkdown \? "max-w-4xl" : "max-w-2xl"\}/);
+  });
+});
+
+describe("Markdown.tsx — a reference against a truncated file surface", () => {
+  // fileContext is typed off the component so a prop-contract change fails here
+  // rather than leaving the test exercising a stale shape.
+  const MarkdownRenderer = Markdown as unknown as ComponentType<{
+    children?: ReactNode;
+    fileContext?: FileResolutionContext;
+  }>;
+  const ctx = (bounded: boolean): FileResolutionContext => ({
+    runId: "r1",
+    knownFiles: ["/runs/r1/kept.md"],
+    knownFilesBounded: bounded,
+  });
+
+  it("does not present an unmatched ref as ordinary prose when the surface was cut", () => {
+    const html = renderToStaticMarkup(
+      createElement(MarkdownRenderer, { fileContext: ctx(true) }, "see `omitted.md` for detail"),
+    );
+    expect(html).toContain("omitted.md");
+    expect(html).toContain("could not be checked");
+    // Marking it must not promote it to a link: the file was never resolved.
+    expect(html).not.toContain("<button");
+  });
+
+  it("leaves an unmatched ref as prose when the surface was complete", () => {
+    const html = renderToStaticMarkup(
+      createElement(MarkdownRenderer, { fileContext: ctx(false) }, "see `omitted.md` for detail"),
+    );
+    expect(html).not.toContain("could not be checked");
+  });
+
+  it("still links a ref the truncated surface holds", () => {
+    const html = renderToStaticMarkup(
+      createElement(MarkdownRenderer, { fileContext: ctx(true) }, "see `kept.md` for detail"),
+    );
+    expect(html).toContain("<button");
+    expect(html).not.toContain("could not be checked");
+  });
+
+  it("keeps an unmatched markdown link navigable, since a cut surface is not evidence it is dead", () => {
+    const html = renderToStaticMarkup(
+      createElement(MarkdownRenderer, { fileContext: ctx(true) }, "see [guide](guide.md)"),
+    );
+    expect(html).toContain('href="guide.md"');
+    expect(html).toContain("could not be checked");
   });
 });

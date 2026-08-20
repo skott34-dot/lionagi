@@ -5,9 +5,7 @@
 
 import pytest
 
-# ---------------------------------------------------------------------------
 # check_async_postgres_available
-# ---------------------------------------------------------------------------
 
 
 def test_check_async_postgres_available_reports_missing_optional_dependency(
@@ -35,20 +33,22 @@ def test_check_async_postgres_available_true_when_dependencies_present(monkeypat
     assert result is True
 
 
-# ---------------------------------------------------------------------------
 # to_obj calls _ensure_table before delegating to parent
-# ---------------------------------------------------------------------------
 
 
 async def test_async_postgres_to_obj_ensures_table_for_dsn_before_delegating(
     monkeypatch,
 ):
     """Requires lionagi[postgres] extra (pydapter[postgres], sqlalchemy, asyncpg)."""
-    pytest.importorskip("sqlalchemy", reason="requires lionagi[postgres] extra")
+    # The module the body needs, not one of its dependencies: sqlalchemy is
+    # present without the extra, so guarding on it lets the import below raise.
+    # The returned module is what the body uses, so the path is named once.
+    async_postgres_ = pytest.importorskip(
+        "pydapter.extras.async_postgres_", reason="requires lionagi[postgres] extra"
+    )
+    AsyncPostgresAdapter = async_postgres_.AsyncPostgresAdapter
 
     from unittest.mock import AsyncMock
-
-    from pydapter.extras.async_postgres_ import AsyncPostgresAdapter
 
     from lionagi.adapters.async_postgres_adapter import (
         create_lionagi_async_postgres_adapter,

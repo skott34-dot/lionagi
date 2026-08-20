@@ -1,21 +1,11 @@
 # Copyright (c) 2023-2026, HaiyangLi <quantocean.li at gmail dot com>
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for the OBSERVER W2 scheduler signal bus + mint call sites.
+"""Tests for the scheduler signal bus and its mint call sites.
 
-Covers:
-  * SchedulerSignalBus.observe/unobserve/emit: type matching, predicate
-    (reason_code) filtering, sync + async handler dispatch.
-  * Failure semantics: emit() raises an ExceptionGroup (never a blanket
-    swallow) while still running every matching handler; the engine's mint
-    call site catches that group, writes a durable admin_events row, and
-    the tick loop keeps going (a broken handler never stops unrelated
-    schedules).
-  * build_schedule_run_signal(): mint-site-agnostic field derivation from
-    entity_id/new_status/reason_code (the same fields any
-    _guarded_terminal_status caller already has).
-  * SchedulerEngine._fire_inner() actually mints the right signal on each
-    terminal path (succeeded, failed-nonzero-exit, failed-exception,
-    cancelled).
+emit() raises an ExceptionGroup rather than swallowing handler failures,
+but still runs every matching handler first; the engine's mint call site
+catches that group, writes a durable admin_events row, and keeps ticking —
+a broken handler must never stop unrelated schedules.
 """
 
 from __future__ import annotations
@@ -27,6 +17,7 @@ import pytest
 
 from lionagi.state.reasons import RunReasons
 from lionagi.studio.scheduler.signals import (
+    SchedulerHandlerCancelled,
     SchedulerSignalBus,
     ScheduleRunCancelled,
     ScheduleRunFailed,
@@ -34,10 +25,9 @@ from lionagi.studio.scheduler.signals import (
     build_schedule_run_signal,
     record_handler_failure,
 )
+from tests._scheduler_claims import fire_with_claim
 
-# ---------------------------------------------------------------------------
 # Helpers (mirrors tests/studio/test_scheduler_engine.py's fixtures)
-# ---------------------------------------------------------------------------
 
 
 def _minimal_schedule(**overrides) -> dict:
@@ -82,9 +72,7 @@ def _make_svc() -> AsyncMock:
     return svc
 
 
-# ---------------------------------------------------------------------------
 # SchedulerSignalBus — observe/emit matching + dispatch
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -161,6 +149,90 @@ async def test_bus_sync_and_async_handlers_both_run():
     assert async_calls == [sig]
 
 
+@pytest.mark.asyncio
+async def test_bus_starts_matching_handlers_concurrently_and_keeps_registration_order():
+    bus = SchedulerSignalBus()
+    first_started = asyncio.Event()
+    second_started = asyncio.Event()
+
+    async def first(_signal):
+        first_started.set()
+        await second_started.wait()
+        return "first"
+
+    async def second(_signal):
+        second_started.set()
+        await first_started.wait()
+        return "second"
+
+    bus.observe(ScheduleRunSucceeded, handler=first)
+    bus.observe(ScheduleRunSucceeded, handler=second)
+    signal = ScheduleRunSucceeded(
+        run_id="r-concurrent",
+        schedule_id="s1",
+        reason_code=RunReasons.COMPLETED_OK,
+    )
+
+    results = await asyncio.wait_for(bus.emit(signal), timeout=1.0)
+
+    assert first_started.is_set()
+    assert second_started.is_set()
+    assert results == ["first", "second"]
+
+
+@pytest.mark.asyncio
+async def test_bus_awaits_custom_awaitable_returned_by_sync_handler():
+    bus = SchedulerSignalBus()
+
+    class TrackingAwaitable:
+        def __init__(self):
+            self.awaited = False
+
+        def __await__(self):
+            self.awaited = True
+            if False:  # pragma: no cover - makes this a generator-based awaitable
+                yield None
+            return "awaited"
+
+    returned = TrackingAwaitable()
+    bus.observe(ScheduleRunSucceeded, handler=lambda _signal: returned)
+    signal = ScheduleRunSucceeded(
+        run_id="r-awaitable",
+        schedule_id="s1",
+        reason_code=RunReasons.COMPLETED_OK,
+    )
+
+    assert await bus.emit(signal) == ["awaited"]
+    assert returned.awaited is True
+
+
+@pytest.mark.asyncio
+async def test_bus_groups_failure_raised_by_returned_custom_awaitable():
+    from lionagi.ln.concurrency import ExceptionGroup
+
+    bus = SchedulerSignalBus()
+
+    class FailingAwaitable:
+        def __await__(self):
+            if False:  # pragma: no cover - makes this a generator-based awaitable
+                yield None
+            raise RuntimeError("returned awaitable failed")
+
+    bus.observe(ScheduleRunSucceeded, handler=lambda _signal: FailingAwaitable())
+    signal = ScheduleRunSucceeded(
+        run_id="r-failing-awaitable",
+        schedule_id="s1",
+        reason_code=RunReasons.COMPLETED_OK,
+    )
+
+    with pytest.raises(ExceptionGroup) as excinfo:
+        await bus.emit(signal)
+
+    assert len(excinfo.value.exceptions) == 1
+    assert type(excinfo.value.exceptions[0]) is RuntimeError
+    assert str(excinfo.value.exceptions[0]) == "returned awaitable failed"
+
+
 def test_bus_has_no_topic_or_route_stream_machinery():
     """SchedulerSignalBus is a stripped registry: only observe/unobserve/emit
     -- no Flow/route()/stream() (SessionObserver's DB-persistence-oriented
@@ -199,9 +271,7 @@ async def test_emit_with_zero_handlers_is_a_noop():
     assert results == []
 
 
-# ---------------------------------------------------------------------------
 # Per-run coordination counters (emitted/received/acted_on) + pop_run_counters
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -361,9 +431,7 @@ async def test_counters_are_isolated_per_run_id():
     assert counters_r2 == {"emitted": {"ScheduleRunSucceeded": 1}, "received": 1, "acted_on": 1}
 
 
-# ---------------------------------------------------------------------------
 # Failure semantics: ExceptionGroup, never a blanket swallow, siblings still run
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -471,8 +539,8 @@ async def test_emit_predicate_exception_does_not_abort_sibling_dispatch():
 async def test_emit_reraises_cancellation_without_nesting_baseexception():
     """gather(return_exceptions=True) can return a raw CancelledError.
     Folding that into ExceptionGroup would raise TypeError ("cannot nest
-    BaseExceptions") -- cancellation must propagate as itself instead of
-    being wrapped or swallowed, and sibling handlers must still run."""
+    BaseExceptions") -- handler cancellation must become the named scheduler
+    cancellation rather than an ordinary failure, and siblings still run."""
     bus = SchedulerSignalBus()
     ran: list = []
 
@@ -486,7 +554,7 @@ async def test_emit_reraises_cancellation_without_nesting_baseexception():
     bus.observe(ScheduleRunSucceeded, handler=_good)
 
     sig = ScheduleRunSucceeded(run_id="r1", schedule_id="s1", reason_code=RunReasons.COMPLETED_OK)
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(SchedulerHandlerCancelled):
         await bus.emit(sig)
 
     assert ran == [sig]
@@ -496,8 +564,8 @@ async def test_emit_reraises_cancellation_without_nesting_baseexception():
 async def test_emit_reraises_cancellation_even_with_other_handler_failures():
     """A genuine handler bug alongside a cancellation must not turn into a
     TypeError from ExceptionGroup nesting a BaseException -- cancellation
-    still wins and propagates, with the handler failure chained for
-    visibility rather than silently dropped."""
+    still wins as the named scheduler cancellation, with the handler failure
+    chained for visibility rather than silently dropped."""
     from lionagi.ln.concurrency import ExceptionGroup
 
     bus = SchedulerSignalBus()
@@ -512,16 +580,14 @@ async def test_emit_reraises_cancellation_even_with_other_handler_failures():
     bus.observe(ScheduleRunSucceeded, handler=_boom)
 
     sig = ScheduleRunSucceeded(run_id="r1", schedule_id="s1", reason_code=RunReasons.COMPLETED_OK)
-    with pytest.raises(asyncio.CancelledError) as exc_info:
+    with pytest.raises(SchedulerHandlerCancelled) as exc_info:
         await bus.emit(sig)
 
     assert isinstance(exc_info.value.__cause__, ExceptionGroup)
     assert isinstance(exc_info.value.__cause__.exceptions[0], RuntimeError)
 
 
-# ---------------------------------------------------------------------------
 # record_handler_failure — durable surfaced record
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -578,9 +644,7 @@ async def test_record_handler_failure_is_best_effort_and_never_raises(monkeypatc
     await record_handler_failure(eg, sig)
 
 
-# ---------------------------------------------------------------------------
 # build_schedule_run_signal — mint-site-agnostic field derivation
-# ---------------------------------------------------------------------------
 
 
 def test_build_schedule_run_signal_completed_derives_succeeded():
@@ -627,9 +691,7 @@ def test_build_schedule_run_signal_unknown_status_raises():
         build_schedule_run_signal(entity_id="run-4", new_status="running", reason_code="x")
 
 
-# ---------------------------------------------------------------------------
 # SchedulerEngine._fire_inner integration — mint on each terminal path
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -653,7 +715,7 @@ async def test_fire_happy_path_mints_schedule_run_succeeded():
             new=AsyncMock(return_value=(0, "")),
         ),
     ):
-        await engine._fire(schedule, "run-001", trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, "run-001", trigger_context={"scheduled": True})
 
     assert len(captured) == 1
     sig = captured[0]
@@ -683,7 +745,7 @@ async def test_fire_nonzero_exit_mints_schedule_run_failed():
             new=AsyncMock(return_value=(1, "error text")),
         ),
     ):
-        await engine._fire(schedule, "run-002", trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, "run-002", trigger_context={"scheduled": True})
 
     assert len(captured) == 1
     assert captured[0].reason_code == RunReasons.FAILED_EXIT_NONZERO
@@ -718,7 +780,7 @@ async def test_fire_inner_exception_mints_schedule_run_failed():
             new=AsyncMock(side_effect=_raise_after_launch),
         ),
     ):
-        await engine._fire(schedule, "run-005", trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, "run-005", trigger_context={"scheduled": True})
 
     assert len(captured) == 1
     assert captured[0].reason_code == RunReasons.FAILED_EXCEPTION
@@ -754,7 +816,7 @@ async def test_fire_cancellation_mints_schedule_run_cancelled():
         ),
     ):
         with pytest.raises(asyncio.CancelledError):
-            await engine._fire(schedule, "run-004", trigger_context={"scheduled": True})
+            await fire_with_claim(engine, schedule, "run-004", trigger_context={"scheduled": True})
 
     assert len(captured) == 1
     assert captured[0].reason_code == RunReasons.CANCELLED_SYSTEM
@@ -785,7 +847,7 @@ async def test_fire_does_not_mint_when_guarded_write_loses_race():
             new=AsyncMock(return_value=(0, "")),
         ),
     ):
-        await engine._fire(schedule, "run-006", trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, "run-006", trigger_context={"scheduled": True})
 
     assert captured == []
 
@@ -809,7 +871,7 @@ async def test_fire_build_argv_exception_mints_schedule_run_failed():
         "lionagi.studio.scheduler.subprocess.build_argv",
         side_effect=ValueError("bad action_kind"),
     ):
-        await engine._fire(schedule, "run-010", trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, "run-010", trigger_context={"scheduled": True})
 
     assert len(captured) == 1
     sig = captured[0]
@@ -838,16 +900,14 @@ async def test_fire_build_argv_exception_does_not_mint_when_write_lost_race():
         "lionagi.studio.scheduler.subprocess.build_argv",
         side_effect=ValueError("bad action_kind"),
     ):
-        await engine._fire(schedule, "run-011", trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, "run-011", trigger_context={"scheduled": True})
 
     assert captured == []
 
 
-# ---------------------------------------------------------------------------
 # Regression: a broken handler surfaces a durable record and the tick loop
 # continues -- it must not stop this schedule's own bookkeeping, and a
 # following, unrelated fire must still succeed normally.
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -880,7 +940,7 @@ async def test_broken_handler_surfaces_admin_event_and_fire_completes(tmp_path, 
         ),
     ):
         # Must not raise -- the handler bug is contained at the mint call site.
-        await engine._fire(schedule, "run-007", trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, "run-007", trigger_context={"scheduled": True})
 
     # The schedule_run's own bookkeeping (invocation/run rows, status writes,
     # max_runs check) still ran normally despite the broken handler.
@@ -926,8 +986,8 @@ async def test_handler_cancelled_error_at_exit_mint_does_not_cancel_completed_ru
             new=AsyncMock(return_value=(0, "")),
         ),
     ):
-        await engine._fire(
-            _minimal_schedule(), "run-handler-cancel", trigger_context={"scheduled": True}
+        await fire_with_claim(
+            engine, _minimal_schedule(), "run-handler-cancel", trigger_context={"scheduled": True}
         )
 
     terminal_statuses = [
@@ -1012,7 +1072,7 @@ async def test_broken_predicate_does_not_block_sibling_handler_and_surfaces_admi
             new=AsyncMock(return_value=(0, "")),
         ),
     ):
-        await engine._fire(schedule, "run-012", trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, "run-012", trigger_context={"scheduled": True})
 
     assert len(healthy) == 1  # sibling handler ran despite the raising predicate
 
@@ -1058,10 +1118,10 @@ async def test_unrelated_fire_still_succeeds_after_a_prior_handler_failure(tmp_p
             new=AsyncMock(return_value=(0, "")),
         ),
     ):
-        await engine._fire(schedule, "run-008", trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, "run-008", trigger_context={"scheduled": True})
         # Second, unrelated fire on the same engine/bus must still complete
         # normally -- the handler exception from the first fire must not
         # have crashed the tick loop or left the bus/engine in a bad state.
-        await engine._fire(schedule, "run-009", trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, "run-009", trigger_context={"scheduled": True})
 
     assert svc.create_schedule_run_and_advance.await_count == 2

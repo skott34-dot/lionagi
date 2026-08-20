@@ -116,7 +116,8 @@
       "busyPlaceholder": "Operator is working…",
       "hint": "Enter to send · Shift+Enter for a new line",
       "send": "Send",
-      "sending": "Sending…"
+      "sending": "Sending…",
+      "autoAllow": "Permitir propuestas automáticamente"
     },
     "message": {
       "you": "You",
@@ -169,7 +170,12 @@
     "model": {
       "label": "Model",
       "default": "Predeterminado",
-      "unavailable": "{model} (unavailable)"
+      "unavailable": "{model} (unavailable)",
+      "recommendedGroup": "{provider} · recomendado",
+      "legacyGroup": "Selección heredada",
+      "efforts": "Esfuerzo: {efforts}",
+      "effortInModel": "El esfuerzo está codificado en el ID del modelo",
+      "effortAsSetting": "El esfuerzo se envía como ajuste del proveedor"
     },
     "effort": {
       "label": "Esfuerzo",
@@ -239,7 +245,7 @@
       "createWorkflow": "Nuevo flujo de trabajo",
       "createAgent": "Nuevo agente",
       "allSkill": "No se encontraron skills.",
-      "allSkillHint": "Agrega un SKILL.md en ~/.lionagi/skills/<name>/ para verlo aquí.",
+      "allSkillHint": "Agrega un SKILL.md en ~/.lionagi/skills/NAME/ para verlo aquí.",
       "allPlugin": "No se encontraron plugins.",
       "allPluginHint": "Instala un plugin en ~/.claude/plugins/ para verlo aquí."
     },
@@ -376,6 +382,38 @@
       "creating": "Creating…",
       "create": "Create",
       "createError": "Could not create this server."
+    },
+    "filterHooks": "Hooks",
+    "hooks": {
+      "title": "Hooks",
+      "description": "Hooks reutilizables con nombre, definidos una vez aquí y ensamblados por agente: cada agente vincula hooks de esta biblioteca a eventos (antes de una llamada de herramienta, al enviar el prompt, después de una respuesta). El mismo ensamblaje funciona en cualquier CLI de proveedor.",
+      "libraryTitle": "Biblioteca de hooks",
+      "newHook": "Nuevo hook",
+      "emptyLibrary": "Aún no hay hooks definidos. Crea uno para que todos los agentes puedan ensamblarlo.",
+      "emptyLibraryHint": "Define primero los hooks en la biblioteca: los adjuntos vinculan hooks de la biblioteca a eventos.",
+      "operatorTitle": "Ensamblaje del Operator",
+      "operatorDescription": "Hooks que ejecuta el Operator de Studio. El Operator no hereda configuración de usuario ni de proyecto, así que los hooks adjuntados aquí son los únicos que cargan sus turnos.",
+      "enabled": "Activado",
+      "save": "Guardar",
+      "saving": "Guardando…",
+      "savedNotice": "Guardado: se aplica desde el próximo turno.",
+      "cancel": "Cancelar",
+      "delete": "Eliminar",
+      "fieldName": "Nombre",
+      "fieldDescription": "Descripción",
+      "fieldCommand": "Comando",
+      "fieldTimeout": "Tiempo de espera (segundos)",
+      "nameRequired": "Un hook necesita un nombre.",
+      "timeoutInvalid": "El tiempo de espera debe ser un número.",
+      "noAttachments": "No hay hooks adjuntos.",
+      "attachmentHook": "Hook",
+      "attachmentOn": "en",
+      "attachmentEvent": "Evento",
+      "attachmentMatcher": "Matcher",
+      "matcherPlaceholder": "matcher (opcional)",
+      "removeAttachment": "Quitar adjunto",
+      "addAttachment": "Adjuntar hook",
+      "agentSectionTitle": "Hooks"
     }
   },
   "history": {
@@ -445,6 +483,8 @@
       "statMessages": "Mensajes",
       "statToolCalls": "Llamadas a herramienta",
       "statErrors": "Errores",
+      "statTokensIn": "Tokens de entrada",
+      "statTokensOut": "Tokens de salida",
       "statTopic": "Tema",
       "statPlay": "Play",
       "statPlaybook": "Flujo de trabajo",
@@ -468,6 +508,7 @@
       "statErrorsRecent": "Errores (recientes)",
       "noBranchErrorsPartial": "No hay errores en los mensajes cargados.",
       "noFilesPartial": "No se detectaron operaciones de archivo en los mensajes cargados.",
+      "filesUnionBounded": "Algunas operaciones de archivo no aparecen: esta ejecución tocó más archivos de los que recoge una vista.",
       "olderUnavailable": "No se pudo cargar el historial anterior — esta conversación avanzó antes de que se completara la solicitud.",
       "reloadConversation": "Recargar conversación",
       "graphEdgeCount": "{count} aristas",
@@ -481,17 +522,51 @@
       "graphNodeStatusDone": "listo",
       "graphNodeStatusFailed": "fallido",
       "graphNodeStatusSkipped": "omitido",
+      "graphNodeStatusCancelled": "cancelado",
       "graphNodeStatusEscalated": "escalado",
       "progressTotal": "Total",
       "progressCompleted": "Completado",
       "progressRunning": "En ejecución",
       "progressFailed": "Fallido",
       "progressPending": "Pendiente",
+      "progressEscalated": "Escalado",
       "progressElapsed": "Transcurrido",
       "expandGraph": "Expandir gráfico de ejecución",
       "collapseGraph": "Contraer gráfico de ejecución",
       "closeExpandedGraph": "Cerrar",
-      "nodeNoBranch": "No se encontró ninguna rama para «{node}» — este paso aún no ha comenzado."
+      "nodeNoBranch": "No se encontró ninguna rama para «{node}» — este paso aún no ha comenzado.",
+      "viewGraph": "Graph",
+      "viewList": "List",
+      "viewToggleLabel": "Graph or list view",
+      "selectedNode": "Selected: {node}",
+      "controls": {
+        "pause": "Pause",
+        "pausePhasePausing": "Pausing…",
+        "pausePhasePaused": "Paused",
+        "resume": "Resume gate",
+        "steer": "Steer",
+        "steerSend": "Send",
+        "steerPlaceholder": "Message to steer the run…",
+        "confirmYes": "Confirm",
+        "confirmCancel": "Cancel",
+        "proposeFailed": "Could not propose the command.",
+        "confirmFailed": "Could not confirm the command.",
+        "confirm": {
+          "pause": "Confirm pause?",
+          "resume": "Confirm resume?",
+          "message": "Confirm sending this message?"
+        },
+        "reason": {
+          "run-terminal": "This run has ended.",
+          "agent-no-pause-seam": "An agent run has no pause seam inside a single turn — steer instead.",
+          "no-live-consumer": "This run is a mirrored or imported session, so no runner would deliver a control.",
+          "already-pause-requested": "A pause has already been requested.",
+          "not-paused": "The run is not paused.",
+          "still-pausing": "Still finishing in-flight operations.",
+          "no-executable-path": "Todavía no existe ningún comando que ejecute esta acción.",
+          "no-project-scope": "Esta ejecución no tiene proyecto, por lo que no se puede autorizar ningún control."
+        }
+      }
     },
     "masterAria": "Lista de historial",
     "detailAria": "Detalle del elemento"
@@ -758,6 +833,9 @@
       "noRuns": "Aún no hay ejecuciones",
       "ago": " atrás",
       "cancel": "Cancelar",
+      "discardWarning": "Hay cambios sin guardar.",
+      "keepEditing": "Seguir editando",
+      "discardChanges": "Descartar cambios",
       "save": "Guardar cambios",
       "saving": "Guardando…",
       "saveFailed": "No se pudo guardar.",
@@ -796,6 +874,7 @@
       "permission": "permiso denegado",
       "missingDependency": "dependencia faltante",
       "notFound": "archivo no encontrado",
+      "unclassified": "error sin clasificar",
       "showDetails": "Mostrar error completo",
       "hideDetails": "Ocultar error completo"
     }
@@ -837,7 +916,7 @@
     "stale": {
       "error": "error · {message}",
       "unreachable": "API inaccesible",
-      "lastUpdated": "inactivo · última actualización hace {age} s"
+      "lastUpdated": "última actualización hace {age} s"
     },
     "detail": {
       "hint": "Selecciona una sesión para inspeccionarla",
@@ -853,8 +932,7 @@
       "updated": "Actualizado",
       "branchesTitle": "Ramas ({count})",
       "noBranches": "Sin ramas.",
-      "msgs": " mensajes",
-      "engineRuns": "Ejecuciones de motor"
+      "msgs": " mensajes"
     },
     "split": {
       "master": "Lista de sesiones",
@@ -1000,7 +1078,7 @@
     "stale": {
       "error": "error · {message}",
       "unreachable": "API inaccesible",
-      "lastUpdated": "obsoleto · última actualización hace {age} s"
+      "lastUpdated": "última actualización hace {age} s"
     },
     "zeroState": {
       "heading": "Comenzar",
@@ -1089,6 +1167,7 @@
     "showEarlier": "Mostrar {count, plural, one {# mensaje anterior} other {# mensajes anteriores}}",
     "noArgs": "(sin args)",
     "noOutput": "(sin salida)",
+    "outputWithheld": "no leído",
     "roleUser": "usuario",
     "roleThinking": "pensando",
     "roleResponse": "respuesta",

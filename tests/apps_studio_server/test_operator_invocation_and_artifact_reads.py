@@ -34,9 +34,7 @@ def _assert_planted_values_are_scrubbed(raw_source: object, tool_result: object)
     assert PLANTED_STORE_URL not in result_text
 
 
-# ---------------------------------------------------------------------------
 # get_invocation
-# ---------------------------------------------------------------------------
 
 
 async def test_get_invocation_returns_projected_fields_for_known_id(monkeypatch):
@@ -134,9 +132,7 @@ async def test_get_invocation_reports_unknown_for_missing_invocation_id(monkeypa
     assert result == {"known": False}
 
 
-# ---------------------------------------------------------------------------
 # list_artifacts
-# ---------------------------------------------------------------------------
 
 
 async def test_list_artifacts_returns_metadata_for_known_owner(monkeypatch):
@@ -210,9 +206,7 @@ async def test_list_artifacts_returns_empty_for_unknown_owner_id(monkeypatch):
     assert result["truncated"] is False
 
 
-# ---------------------------------------------------------------------------
 # get_artifact
-# ---------------------------------------------------------------------------
 
 
 async def test_get_artifact_returns_full_projection_for_known_id(monkeypatch):
@@ -290,9 +284,7 @@ async def test_get_artifact_reports_unknown_for_missing_artifact_id(monkeypatch)
     assert result == {"known": False}
 
 
-# ---------------------------------------------------------------------------
 # connection mode
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -335,9 +327,7 @@ async def test_the_read_tools_ask_for_a_read_only_open_where_the_store_offers_on
     assert seen == [True, False]
 
 
-# ---------------------------------------------------------------------------
 # redaction: the key-marker layer
-# ---------------------------------------------------------------------------
 
 # Deliberately shapeless: no prefix, no separator, no key=value or bearer form,
 # so none of redact.py's pattern layers can claim it. Whatever redacts this can
@@ -478,6 +468,23 @@ async def test_a_textual_secret_under_a_counter_shaped_name_is_still_redacted():
     projected = _safe_content({"token_count": UNSHAPED_SECRET})
 
     assert projected == {"token_count": "[redacted]"}
+
+
+async def test_token_shaped_mapping_keys_are_scrubbed_on_both_read_paths():
+    """A credential can appear as a JSON key, not only as its value.
+
+    The session/artifact projector already scrubs mapping keys as free text;
+    tool arguments and manifests must apply the same rule or the latter path
+    leaks the token verbatim.
+    """
+    from lionagi.studio.operator import application_mcp, redact
+
+    secret_key = "ghp_abcdefghijklmnopqrstuvwxyz123456"
+    expected = {"[redacted]": "visible value"}
+
+    assert redact.scrub_text(secret_key) == "[redacted]"
+    assert application_mcp._safe_content({secret_key: "visible value"}) == expected
+    assert redact.redact_arguments({secret_key: "visible value"}) == expected
 
 
 def _spellings(name: str) -> list[str]:

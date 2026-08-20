@@ -1,10 +1,16 @@
 """End-to-end tests for PydanticSpecAdapter: Spec → FieldInfo → Model → Validation."""
 
+import math
+import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+from typing import Any
+
 import pytest
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from lionagi.adapters.spec_adapters import PydanticSpecAdapter
-from lionagi.ln.types import Operable, Spec
+from lionagi.ln.types import Operable, Spec, Undefined, Unset
 
 
 class TestProtocolConformance:
@@ -246,9 +252,7 @@ and more text"""
         assert original.age == 30
 
 
-# ---------------------------------------------------------------------------
 # callable default becomes default_factory
-# ---------------------------------------------------------------------------
 
 
 def test_pydantic_field_adapter_uses_callable_metadata_as_default_factory():
@@ -267,9 +271,7 @@ def test_pydantic_field_adapter_uses_callable_metadata_as_default_factory():
     assert instance.result == "computed"
 
 
-# ---------------------------------------------------------------------------
 # strict fuzzy_match_fields raises; non-strict coerces typos and drops unknowns
-# ---------------------------------------------------------------------------
 
 
 def test_pydantic_field_adapter_strict_fuzzy_match_raises_on_unmatched_key():
@@ -310,8 +312,244 @@ class TestEdgeCases:
             Spec(int),  # No name
         ]
         operable = Operable(specs)
-        TestModel = PydanticSpecAdapter.create_model(operable, "TestModel")
 
-        # Only named field should be included
-        assert "valid" in TestModel.model_fields
-        assert len(TestModel.model_fields) == 1
+        with pytest.raises(
+            ValueError,
+            match="Pydantic model fields require a string name.*index 1",
+        ):
+            PydanticSpecAdapter.create_model(operable, "TestModel")
+
+    def test_empty_string_name_is_not_collapsed_into_absence(self):
+        def reject_bad(value):
+            if value == "bad":
+                raise ValueError("bad value")
+            return value
+
+        operable = Operable((Spec(str, name="", validator=reject_bad),))
+
+        model_type = PydanticSpecAdapter.create_model(operable, "EmptyNameModel")
+
+        assert tuple(model_type.model_fields) == ("",)
+        assert model_type.model_validate({"": "value"}).model_dump() == {"": "value"}
+        with pytest.raises(ValidationError, match="bad value"):
+            model_type.model_validate({"": "bad"})
+
+    def test_unresolved_specs_materialize_as_required_any_fields(self):
+        operable = Operable(
+            (
+                Spec(Undefined, name="missing"),
+                Spec(Unset, name="unresolved"),
+            )
+        )
+
+        model_type = PydanticSpecAdapter.create_model(
+            operable,
+            "UnresolvedAnyFields",
+        )
+        marker = object()
+        instance = model_type(missing={"nested": True}, unresolved=marker)
+
+        for field in model_type.model_fields.values():
+            assert field.annotation is Any
+            assert field.is_required()
+        with pytest.raises(ValidationError):
+            model_type()
+        assert instance.missing == {"nested": True}
+        assert instance.unresolved is marker
+
+    def test_unresolved_base_identity_is_preserved_in_model_cache_keys(self):
+        class CacheBase(BaseModel):
+            pass
+
+        undefined = Operable((Spec(Undefined, name="value"),))
+        unresolved = Operable((Spec(Unset, name="value"),))
+
+        first = PydanticSpecAdapter.create_model(
+            undefined,
+            "UnresolvedCacheModel",
+            base_type=CacheBase,
+        )
+        repeated = PydanticSpecAdapter.create_model(
+            undefined,
+            "UnresolvedCacheModel",
+            base_type=CacheBase,
+        )
+        distinct = PydanticSpecAdapter.create_model(
+            unresolved,
+            "UnresolvedCacheModel",
+            base_type=CacheBase,
+        )
+
+        assert repeated is first
+        assert distinct is not first
+
+    def test_model_cache_distinguishes_bool_and_int_defaults(self):
+        class CacheBase(BaseModel):
+            pass
+
+        boolean = Operable((Spec(int, name="value", default=True),))
+        integer = Operable((Spec(int, name="value", default=1),))
+
+        boolean_model = PydanticSpecAdapter.create_model(
+            boolean,
+            "TypedDefaultCacheModel",
+            base_type=CacheBase,
+        )
+        integer_model = PydanticSpecAdapter.create_model(
+            integer,
+            "TypedDefaultCacheModel",
+            base_type=CacheBase,
+        )
+
+        assert boolean_model is not integer_model
+        assert boolean_model.model_fields["value"].default is True
+        assert integer_model.model_fields["value"].default == 1
+        assert type(integer_model.model_fields["value"].default) is int
+
+    def test_model_cache_distinguishes_signed_zero_defaults(self):
+        class CacheBase(BaseModel):
+            pass
+
+        positive = Operable((Spec(float, name="value", default=0.0),))
+        negative = Operable((Spec(float, name="value", default=-0.0),))
+        positive_model = PydanticSpecAdapter.create_model(
+            positive,
+            "SignedZeroCacheModel",
+            base_type=CacheBase,
+        )
+        negative_model = PydanticSpecAdapter.create_model(
+            negative,
+            "SignedZeroCacheModel",
+            base_type=CacheBase,
+        )
+
+        assert positive_model is not negative_model
+        assert math.copysign(1.0, positive_model.model_fields["value"].default) == 1.0
+        assert math.copysign(1.0, negative_model.model_fields["value"].default) == -1.0
+
+    def test_model_cache_keys_base_models_by_identity(self):
+        class EqualModelMeta(type(BaseModel)):
+            def __eq__(cls, other):
+                return isinstance(other, EqualModelMeta)
+
+            def __hash__(cls):
+                return 1
+
+        class AlphaBase(BaseModel, metaclass=EqualModelMeta):
+            pass
+
+        class BetaBase(BaseModel, metaclass=EqualModelMeta):
+            pass
+
+        fields = Operable((Spec(int, name="value"),))
+        alpha = PydanticSpecAdapter.create_model(
+            fields,
+            "IdentityBaseCacheModel",
+            base_type=AlphaBase,
+        )
+        beta = PydanticSpecAdapter.create_model(
+            fields,
+            "IdentityBaseCacheModel",
+            base_type=BetaBase,
+        )
+
+        assert alpha is not beta
+        assert issubclass(alpha, AlphaBase)
+        assert issubclass(beta, BetaBase)
+
+    def test_model_cache_keys_adapter_classes_by_identity(self):
+        class CacheBase(BaseModel):
+            pass
+
+        class DefaultingAdapter(PydanticSpecAdapter):
+            @classmethod
+            def create_field(cls, spec):
+                field = Field(default=17)
+                field.annotation = spec.annotation
+                return field
+
+        fields = Operable((Spec(int, name="value"),))
+        required = PydanticSpecAdapter.create_model(
+            fields,
+            "AdapterIdentityCacheModel",
+            base_type=CacheBase,
+        )
+        defaulted = DefaultingAdapter.create_model(
+            fields,
+            "AdapterIdentityCacheModel",
+            base_type=CacheBase,
+        )
+
+        assert required is not defaulted
+        with pytest.raises(ValidationError):
+            required()
+        assert defaulted().value == 17
+
+    def test_model_cache_keys_concrete_spec_types(self):
+        class CacheBase(BaseModel):
+            pass
+
+        class RenamedSpec(Spec):
+            @property
+            def name(self):
+                return "renamed"
+
+        ordinary = Operable((Spec(int, name="value"),))
+        renamed = Operable((RenamedSpec(int, name="value"),))
+        ordinary_model = PydanticSpecAdapter.create_model(
+            ordinary,
+            "SpecIdentityCacheModel",
+            base_type=CacheBase,
+        )
+        renamed_model = PydanticSpecAdapter.create_model(
+            renamed,
+            "SpecIdentityCacheModel",
+            base_type=CacheBase,
+        )
+
+        assert ordinary_model is not renamed_model
+        assert tuple(ordinary_model.model_fields) == ("value",)
+        assert tuple(renamed_model.model_fields) == ("renamed",)
+
+    def test_model_cache_constructs_one_class_under_concurrency(self, monkeypatch):
+        from lionagi.models import _build_model
+
+        class CacheBase(BaseModel):
+            pass
+
+        original = _build_model.build_model_type
+        build_calls = []
+
+        def slow_build(*args, **kwargs):
+            build_calls.append(None)
+            time.sleep(0.05)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(_build_model, "build_model_type", slow_build)
+        fields = Operable((Spec(int, name="value"),))
+        barrier = Barrier(2)
+
+        def materialize():
+            barrier.wait()
+            return PydanticSpecAdapter.create_model(
+                fields,
+                "ConcurrentIdentityCacheModel",
+                base_type=CacheBase,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first, second = tuple(pool.map(lambda _: materialize(), range(2)))
+
+        assert first is second
+        assert len(build_calls) == 1
+
+    def test_unresolved_listable_nullable_projection_is_adapter_owned(self):
+        operable = Operable((Spec(Unset, name="items", listable=True, nullable=True),))
+
+        model_type = PydanticSpecAdapter.create_model(
+            operable,
+            "UnresolvedNullableList",
+        )
+
+        assert model_type(items=[1, "two"]).items == [1, "two"]
+        assert model_type(items=None).items is None

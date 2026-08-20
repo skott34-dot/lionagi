@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from lionagi._spec_limits import MAX_SPEC_PROMPT_CHARS
 from lionagi.mcp import dispatch, jobs, verbs
 
 
@@ -69,12 +70,32 @@ def test_catalog_carries_a_signature_not_a_bare_name():
     assert all(e["summary"] for e in entries.values())
 
 
-def test_catalog_names_an_unavailable_verb_with_its_reason():
+def test_catalog_names_an_unavailable_verb_and_routes_it():
     # Hiding it would make "not built" and "cannot be built yet" the same answer.
+    # The catalog states that it cannot run and where it does run; the paragraph
+    # on why is one targeted call away, so every caller does not pay for it.
     entries = {e["verb"]: e for e in call(help=True)["verbs"]}
     absent = entries["schedule.apply"]
     assert absent["available"] is False
-    assert "machine result" in absent["reason"]
+    assert absent["cli_path"] == "schedule apply"
+    assert "reason" not in absent
+    assert "machine result" in call(help="schedule.apply")["reason"]
+
+
+def test_catalog_omits_available_and_required_at_their_defaults():
+    # Both are paid on every entry of a 70-verb listing. Absent means the
+    # default, which the catalog's own help_usage states. Asserted over the
+    # whole listing rather than one entry: the cost is per-entry, so a single
+    # example would not show that the default is omitted everywhere.
+    catalog = call(help=True)
+    entries = catalog["verbs"]
+    assert entries, "an empty catalog would pass every assertion below"
+    assert [e["verb"] for e in entries if e.get("available") is True] == []
+    assert [e["verb"] for e in entries if e.get("required") == []] == []
+    # and the key still carries its non-default value where it applies
+    assert any(e.get("available") is False for e in entries)
+    assert any(e.get("required") for e in entries)
+    assert catalog["available_count"] == sum(1 for e in entries if e.get("available", True))
 
 
 def test_catalog_never_advertises_a_previous_surface_name():
@@ -89,6 +110,15 @@ def test_help_for_a_verb_returns_the_projected_schema():
     assert schema["properties"]["timeout"]["type"] == "integer"
     assert schema["properties"]["yolo"]["type"] == "boolean"
     assert schema["properties"]["agent"]["x-flag"] == "--agent"
+
+
+def test_agent_submit_schema_discloses_the_prompt_admission_cap():
+    schema = call(help="agent.submit")
+    prompt = schema["schema"]["properties"]["prompt"]
+    prompt_file = schema["schema"]["properties"]["prompt_file"]
+
+    assert prompt["maxLength"] == MAX_SPEC_PROMPT_CHARS
+    assert str(MAX_SPEC_PROMPT_CHARS) in prompt_file["description"]
 
 
 def test_help_for_an_unavailable_verb_says_why_instead_of_failing():
@@ -542,16 +572,15 @@ def test_a_stale_playbook_fingerprint_is_told_the_same_qualified_source(a_playbo
 def test_targeted_help_withholds_a_fingerprint_no_successful_call_can_carry():
     """`play.submit` requires a playbook, so its argument-free fingerprint is dead.
 
-    Every *successful* `play.submit` op names a playbook and therefore resolves a
-    schema that is not the argument-free one. The argument-free fingerprint is
-    accepted only by a call that omits the playbook, which then fails validation —
-    so its sole effect is to buy a round-trip on the way to a different error. The
-    catalog withheld it and targeted help returned it, so one contract had two
-    answers depending on which way you asked.
-
-    Withholding it is not silence — the answer names the parameter the fingerprint
-    varies with, so the caller knows to ask again with a playbook rather than to
-    retry with a stale string.
+    Every *successful* `play.submit` op names a playbook and resolves a
+    schema that is not the argument-free one -- that fingerprint is accepted
+    only by a call that omits the playbook, which then fails validation, so
+    its sole effect is to buy a round-trip on the way to a different error.
+    The catalog withheld it while targeted help returned it, so one contract
+    had two answers depending on which way you asked. Withholding it is not
+    silence: the answer names the parameter the fingerprint varies with, so
+    the caller knows to ask again with a playbook rather than retry with a
+    stale string.
     """
     answer = call(help="play.submit")
     assert "schema_fingerprint" not in answer
@@ -913,6 +942,41 @@ def test_a_submission_that_names_a_model_still_spawns(submitted, op, args):
     answer = call(ops=[spawn_op(op, args)])["ops"][0]
     assert answer["ok"] is True
     assert submitted["kind"]
+
+
+def test_agent_submit_rejects_inline_prompt_over_shared_limit_before_spawn(submitted):
+    answer = call(
+        ops=[
+            spawn_op(
+                "agent.submit",
+                {"query": ["codex"], "prompt": "x" * (MAX_SPEC_PROMPT_CHARS + 1)},
+            )
+        ]
+    )["ops"][0]
+
+    assert answer["ok"] is False
+    assert answer["error"]["kind"] == "invalid_input"
+    assert str(MAX_SPEC_PROMPT_CHARS) in answer["error"]["message"]
+    assert submitted == {}
+
+
+def test_agent_submit_rejects_prompt_file_over_shared_limit_before_spawn(submitted, tmp_path):
+    prompt_file = tmp_path / "prompt.md"
+    prompt_file.write_text("x" * (MAX_SPEC_PROMPT_CHARS + 1))
+
+    answer = call(
+        ops=[
+            spawn_op(
+                "agent.submit",
+                {"query": ["codex"], "prompt_file": str(prompt_file)},
+            )
+        ]
+    )["ops"][0]
+
+    assert answer["ok"] is False
+    assert answer["error"]["kind"] == "invalid_input"
+    assert str(MAX_SPEC_PROMPT_CHARS) in answer["error"]["message"]
+    assert submitted == {}
 
 
 def test_a_spec_file_may_be_the_thing_that_names_the_model(submitted):

@@ -15,6 +15,7 @@ from lionagi.casts.emission import (
 )
 from lionagi.casts.pack import Pack, RolePolicy
 from lionagi.casts.pattern import PatternKind, Role, list_roles
+from lionagi.ln.types import ModelConfig
 
 _ROOT = Path(__file__).parents[2]
 DEFAULT_PACK = _ROOT / "lionagi/casts/packs/default.yaml"
@@ -58,6 +59,15 @@ def test_role_emits_serialized_as_names():
     assert d["emits"] == ["Verdict", "Finding"]
 
 
+def test_role_json_projection_keeps_emission_names():
+    role = Role.load("critic")
+
+    projected = role.to_dict({"body"}, mode="json")
+
+    assert projected["emits"] == ["Verdict", "Finding"]
+    assert "body" not in projected
+
+
 def test_role_emission_contract():
     critic = Role.load("critic")
     assert critic.emits == (Verdict, Finding)
@@ -66,6 +76,15 @@ def test_role_emission_contract():
     assert op is not None
     # a role with no emission contract yields no operable
     assert Role(name="x", description="d").emission_operable() is None
+
+
+def test_emission_absence_is_independent_of_subclass_serialization_config():
+    class NeutralRole(Role):
+        _config = ModelConfig()
+
+    role = NeutralRole(name="x", description="d", emits=None)
+
+    assert role.emission_operable() is None
 
 
 @pytest.mark.parametrize("name", list_roles())

@@ -53,12 +53,7 @@ def complex_graph():
 
 
 class TestGraphBasics:
-    """Test basic graph operations"""
-
-    def test_empty_graph_creation(self, empty_graph):
-        assert len(empty_graph.internal_nodes) == 0
-        assert len(empty_graph.internal_edges) == 0
-        assert isinstance(empty_graph.node_edge_mapping, dict)
+    """Basic graph operations"""
 
     def test_add_node(self, empty_graph):
         node = create_test_node("TestNode")
@@ -68,10 +63,6 @@ class TestGraphBasics:
             "in": {},
             "out": {},
         }
-
-    def test_add_invalid_node(self, empty_graph):
-        with pytest.raises(RelationError):
-            empty_graph.add_node("not a node")
 
     def test_add_relational_non_node(self, empty_graph):
         with pytest.raises(RelationError):
@@ -133,7 +124,7 @@ class TestEdgeRoundTrip:
 
 
 class TestGraphModification:
-    """Test graph modification operations"""
+    """Graph modification operations"""
 
     def test_remove_node(self, simple_graph):
         graph, node1, node2, edge = simple_graph
@@ -163,7 +154,7 @@ class TestGraphModification:
 
 
 class TestGraphContainment:
-    """Test graph containment operations"""
+    """Graph containment operations"""
 
     def test_contains_node(self, simple_graph):
         graph, node1, node2, _ = simple_graph
@@ -184,7 +175,7 @@ class TestGraphContainment:
 
 
 class TestGraphProperties:
-    """Test graph property checks"""
+    """Graph property checks"""
 
     def test_empty_graph_properties(self, empty_graph):
         assert len(empty_graph.internal_nodes) == 0

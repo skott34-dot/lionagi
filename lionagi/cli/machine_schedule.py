@@ -53,12 +53,14 @@ def _studio(path: str, method: str = "GET", body: dict[str, Any] | None = None) 
 
     url = f"{_studio_url()}/api/schedules{path}"
     data = json.dumps(body).encode() if body is not None else None
+    declares_json = data is not None or method.upper() not in {"GET", "HEAD", "OPTIONS"}
     request = urllib.request.Request(  # noqa: S310 — fixed http(s) Studio base URL
         url,
         data=data,
         method=method,
-        headers={"Content-Type": "application/json"} if data else {},
+        headers={"Content-Type": "application/json"} if declares_json else {},
     )
+    started_at = time.monotonic()
     try:
         with urllib.request.urlopen(request, timeout=STUDIO_TIMEOUT_SECONDS) as response:  # noqa: S310
             raw = response.read()
@@ -66,6 +68,30 @@ def _studio(path: str, method: str = "GET", body: dict[str, Any] | None = None) 
         detail = exc.read().decode(errors="replace")[:2000]
         raise MachineError(_error_kind(exc.code), _http_message(exc.code, detail)) from exc
     except OSError as exc:
+        from lionagi.studio.cli import (
+            _is_schedule_request_timeout,
+            _schedule_request_timeout_message,
+        )
+
+        if _is_schedule_request_timeout(exc):
+            elapsed_seconds = max(0.0, time.monotonic() - started_at)
+            raise MachineError(
+                "unavailable",
+                _schedule_request_timeout_message(
+                    method=method,
+                    url=url,
+                    elapsed_seconds=elapsed_seconds,
+                    limit_seconds=STUDIO_TIMEOUT_SECONDS,
+                ),
+                detail={
+                    "reason": "request_timeout",
+                    "method": method,
+                    "path": f"/api/schedules{path}",
+                    "elapsed_seconds": round(elapsed_seconds, 3),
+                    "limit_seconds": STUDIO_TIMEOUT_SECONDS,
+                    "completion": "unknown",
+                },
+            ) from exc
         raise MachineError(
             "unavailable",
             f"could not reach Studio at {_studio_url()}: {exc}. The schedule store is "

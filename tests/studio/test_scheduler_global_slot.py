@@ -14,6 +14,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from tests._scheduler_claims import fire_with_claim
+
 
 def _minimal_schedule(**overrides) -> dict:
     base = {
@@ -55,9 +57,7 @@ def _make_svc() -> AsyncMock:
     return svc
 
 
-# ---------------------------------------------------------------------------
 # _reserve_global_slot / _release_global_slot — pure reservation logic
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -131,9 +131,7 @@ async def test_release_global_slot_decrements_and_floors_at_zero(monkeypatch):
     assert engine._global_inflight == 0
 
 
-# ---------------------------------------------------------------------------
 # _maybe_fire — defers on no slot, fires normally when available
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -209,9 +207,7 @@ async def test_maybe_fire_fires_when_slot_available(monkeypatch):
     assert kwargs["global_slot_claim"] is not None
 
 
-# ---------------------------------------------------------------------------
 # _tick_github — defers before fetch when no slot; releases on no-events
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -281,12 +277,19 @@ async def test_tick_github_releases_slot_when_max_runs_reservation_raises(monkey
 
     monkeypatch.setattr(engine, "_reserve_max_runs_budget", _boom)
 
-    from lionagi.studio.scheduler.github import GithubPollItem, GithubPollResult
+    from lionagi.studio.scheduler.github import (
+        GithubPollItem,
+        GithubPollResult,
+        _cursor_for,
+    )
 
     poll_result = GithubPollResult(
         items=[
             GithubPollItem(
-                event={"pr_number": 1}, updated_at="2026-07-07T10:00:00Z", dispatchable=True
+                event={"pr_number": 1},
+                updated_at="2026-07-07T10:00:00Z",
+                dispatchable=True,
+                cursor=_cursor_for("2026-07-07T10:00:00Z", 1),
             )
         ],
         scan_complete=True,
@@ -323,12 +326,19 @@ async def test_tick_github_max_runs_refusal_does_not_crash_when_cap_unlimited(mo
 
     monkeypatch.setattr(engine, "_reserve_max_runs_budget", _refuse)
 
-    from lionagi.studio.scheduler.github import GithubPollItem, GithubPollResult
+    from lionagi.studio.scheduler.github import (
+        GithubPollItem,
+        GithubPollResult,
+        _cursor_for,
+    )
 
     poll_result = GithubPollResult(
         items=[
             GithubPollItem(
-                event={"pr_number": 1}, updated_at="2026-07-07T10:00:00Z", dispatchable=True
+                event={"pr_number": 1},
+                updated_at="2026-07-07T10:00:00Z",
+                dispatchable=True,
+                cursor=_cursor_for("2026-07-07T10:00:00Z", 1),
             )
         ],
         scan_complete=True,
@@ -364,12 +374,19 @@ async def test_tick_github_fires_and_releases_slot_on_completion(monkeypatch):
         trigger_type="github_poll", github_repo="acme/widgets", last_fired_at=0
     )
 
-    from lionagi.studio.scheduler.github import GithubPollItem, GithubPollResult
+    from lionagi.studio.scheduler.github import (
+        GithubPollItem,
+        GithubPollResult,
+        _cursor_for,
+    )
 
     poll_result = GithubPollResult(
         items=[
             GithubPollItem(
-                event={"pr_number": 1}, updated_at="2026-07-07T10:00:00Z", dispatchable=True
+                event={"pr_number": 1},
+                updated_at="2026-07-07T10:00:00Z",
+                dispatchable=True,
+                cursor=_cursor_for("2026-07-07T10:00:00Z", 1),
             )
         ],
         scan_complete=True,
@@ -393,9 +410,7 @@ async def test_tick_github_fires_and_releases_slot_on_completion(monkeypatch):
     assert engine._global_inflight == 0
 
 
-# ---------------------------------------------------------------------------
 # fire_now — refuses (does not defer) at capacity
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -437,9 +452,7 @@ async def test_fire_now_succeeds_when_slot_available(monkeypatch):
     assert kwargs["global_slot_claim"] is not None
 
 
-# ---------------------------------------------------------------------------
 # Slot released after a real _fire() completes
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -465,7 +478,8 @@ async def test_fire_releases_global_slot_on_completion(monkeypatch):
             new=AsyncMock(return_value=(0, "")),
         ),
     ):
-        await engine._fire(
+        await fire_with_claim(
+            engine,
             schedule,
             "run-001",
             trigger_context={"scheduled": True},
@@ -492,7 +506,8 @@ async def test_fire_releases_global_slot_on_exception(monkeypatch):
         "lionagi.studio.scheduler.subprocess.build_argv",
         side_effect=ValueError("bad action_kind"),
     ):
-        await engine._fire(
+        await fire_with_claim(
+            engine,
             schedule,
             "run-002",
             trigger_context={"scheduled": True},
@@ -502,9 +517,7 @@ async def test_fire_releases_global_slot_on_exception(monkeypatch):
     assert engine._global_inflight == 0
 
 
-# ---------------------------------------------------------------------------
 # Deferred-record throttling
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -528,13 +541,11 @@ async def test_maybe_record_deferred_throttles_after_first(monkeypatch):
     assert svc.create_schedule_run.await_count == 2
 
 
-# ---------------------------------------------------------------------------
 # _run_task_worker_tick — ad-hoc executions draw from their own independent
 # concurrency pool (MAX_ADHOC_CONCURRENT / _adhoc_inflight), never the
 # scheduled-fire cap. A shared counter let a continuously replenished stream
 # of scheduled fires starve the ad-hoc lane indefinitely; each lane now has
 # its own guaranteed capacity.
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio

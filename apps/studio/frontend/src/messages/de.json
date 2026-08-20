@@ -116,7 +116,8 @@
       "busyPlaceholder": "Operator is working…",
       "hint": "Enter to send · Shift+Enter for a new line",
       "send": "Send",
-      "sending": "Sending…"
+      "sending": "Sending…",
+      "autoAllow": "Vorschläge automatisch erlauben"
     },
     "message": {
       "you": "You",
@@ -169,7 +170,12 @@
     "model": {
       "label": "Model",
       "default": "Standard",
-      "unavailable": "{model} (unavailable)"
+      "unavailable": "{model} (unavailable)",
+      "recommendedGroup": "{provider} · empfohlen",
+      "legacyGroup": "Legacy-Auswahl",
+      "efforts": "Aufwand: {efforts}",
+      "effortInModel": "Der Aufwand ist in der Modell-ID codiert",
+      "effortAsSetting": "Der Aufwand wird als Anbieter-Einstellung gesendet"
     },
     "effort": {
       "label": "Aufwand",
@@ -239,7 +245,7 @@
       "createWorkflow": "Neuer Workflow",
       "createAgent": "Neuer Agent",
       "allSkill": "Keine Skills gefunden.",
-      "allSkillHint": "Füge eine SKILL.md unter ~/.lionagi/skills/<name>/ hinzu, um sie hier zu sehen.",
+      "allSkillHint": "Füge eine SKILL.md unter ~/.lionagi/skills/NAME/ hinzu, um sie hier zu sehen.",
       "allPlugin": "Keine Plugins gefunden.",
       "allPluginHint": "Installiere ein Plugin unter ~/.claude/plugins/, um es hier zu sehen."
     },
@@ -376,6 +382,38 @@
       "creating": "Creating…",
       "create": "Create",
       "createError": "Could not create this server."
+    },
+    "filterHooks": "Hooks",
+    "hooks": {
+      "title": "Hooks",
+      "description": "Benannte, wiederverwendbare Hooks — hier einmal definiert, dann pro Agent zusammengesetzt: Jeder Agent bindet Hooks aus dieser Bibliothek an Ereignisse (vor einem Tool-Aufruf, beim Absenden des Prompts, nach einer Antwort). Dieselbe Zusammenstellung läuft auf jedem Provider-CLI.",
+      "libraryTitle": "Hook-Bibliothek",
+      "newHook": "Neuer Hook",
+      "emptyLibrary": "Noch keine Hooks definiert. Lege einen an, damit ihn jeder Agent einbinden kann.",
+      "emptyLibraryHint": "Definiere zuerst Hooks in der Bibliothek — Anbindungen verknüpfen Bibliotheks-Hooks mit Ereignissen.",
+      "operatorTitle": "Operator-Zusammenstellung",
+      "operatorDescription": "Hooks, die der Studio-Operator ausführt. Der Operator erbt keine Benutzer- oder Projekteinstellungen; nur die hier angebundenen Hooks werden geladen.",
+      "enabled": "Aktiviert",
+      "save": "Speichern",
+      "saving": "Speichern…",
+      "savedNotice": "Gespeichert — gilt ab dem nächsten Zug.",
+      "cancel": "Abbrechen",
+      "delete": "Löschen",
+      "fieldName": "Name",
+      "fieldDescription": "Beschreibung",
+      "fieldCommand": "Befehl",
+      "fieldTimeout": "Timeout (Sekunden)",
+      "nameRequired": "Ein Hook braucht einen Namen.",
+      "timeoutInvalid": "Timeout muss eine Zahl sein.",
+      "noAttachments": "Keine Hooks angebunden.",
+      "attachmentHook": "Hook",
+      "attachmentOn": "bei",
+      "attachmentEvent": "Ereignis",
+      "attachmentMatcher": "Matcher",
+      "matcherPlaceholder": "Matcher (optional)",
+      "removeAttachment": "Anbindung entfernen",
+      "addAttachment": "Hook anbinden",
+      "agentSectionTitle": "Hooks"
     }
   },
   "history": {
@@ -445,6 +483,8 @@
       "statMessages": "Nachrichten",
       "statToolCalls": "Toolaufrufe",
       "statErrors": "Fehler",
+      "statTokensIn": "Eingabe-Tokens",
+      "statTokensOut": "Ausgabe-Tokens",
       "statTopic": "Thema",
       "statPlay": "Play",
       "statPlaybook": "Workflow",
@@ -468,6 +508,7 @@
       "statErrorsRecent": "Fehler (aktuell)",
       "noBranchErrorsPartial": "Keine Fehler in den geladenen Nachrichten.",
       "noFilesPartial": "Keine Dateioperationen in den geladenen Nachrichten erkannt.",
+      "filesUnionBounded": "Einige Dateioperationen fehlen in der Liste: Dieser Lauf hat mehr Dateien berührt, als eine Ansicht erfasst.",
       "olderUnavailable": "Ältere Verlaufsdaten konnten nicht geladen werden — diese Unterhaltung ist weitergegangen, bevor die Anfrage abgeschlossen wurde.",
       "reloadConversation": "Unterhaltung neu laden",
       "graphEdgeCount": "{count} Kanten",
@@ -481,17 +522,51 @@
       "graphNodeStatusDone": "fertig",
       "graphNodeStatusFailed": "fehlgeschlagen",
       "graphNodeStatusSkipped": "übersprungen",
+      "graphNodeStatusCancelled": "abgebrochen",
       "graphNodeStatusEscalated": "eskaliert",
       "progressTotal": "Gesamt",
       "progressCompleted": "Abgeschlossen",
       "progressRunning": "Läuft",
       "progressFailed": "Fehlgeschlagen",
       "progressPending": "Ausstehend",
+      "progressEscalated": "Eskaliert",
       "progressElapsed": "Verstrichen",
       "expandGraph": "Ausführungsgraph erweitern",
       "collapseGraph": "Ausführungsgraph einklappen",
       "closeExpandedGraph": "Schließen",
-      "nodeNoBranch": "Kein Branch für „{node}“ gefunden — dieser Schritt hat noch nicht begonnen."
+      "nodeNoBranch": "Kein Branch für „{node}“ gefunden — dieser Schritt hat noch nicht begonnen.",
+      "viewGraph": "Graph",
+      "viewList": "List",
+      "viewToggleLabel": "Graph or list view",
+      "selectedNode": "Selected: {node}",
+      "controls": {
+        "pause": "Pause",
+        "pausePhasePausing": "Pausing…",
+        "pausePhasePaused": "Paused",
+        "resume": "Resume gate",
+        "steer": "Steer",
+        "steerSend": "Send",
+        "steerPlaceholder": "Message to steer the run…",
+        "confirmYes": "Confirm",
+        "confirmCancel": "Cancel",
+        "proposeFailed": "Could not propose the command.",
+        "confirmFailed": "Could not confirm the command.",
+        "confirm": {
+          "pause": "Confirm pause?",
+          "resume": "Confirm resume?",
+          "message": "Confirm sending this message?"
+        },
+        "reason": {
+          "run-terminal": "This run has ended.",
+          "agent-no-pause-seam": "An agent run has no pause seam inside a single turn — steer instead.",
+          "no-live-consumer": "This run is a mirrored or imported session, so no runner would deliver a control.",
+          "already-pause-requested": "A pause has already been requested.",
+          "not-paused": "The run is not paused.",
+          "still-pausing": "Still finishing in-flight operations.",
+          "no-executable-path": "Es gibt noch keinen Befehl, der dies ausführen kann.",
+          "no-project-scope": "Dieser Lauf hat kein Projekt, daher kann keine Steuerung autorisiert werden."
+        }
+      }
     },
     "masterAria": "Verlaufsliste",
     "detailAria": "Elementdetails"
@@ -758,6 +833,9 @@
       "noRuns": "Noch keine Ausführungen",
       "ago": " zuvor",
       "cancel": "Abbrechen",
+      "discardWarning": "Es gibt ungespeicherte Änderungen.",
+      "keepEditing": "Weiter bearbeiten",
+      "discardChanges": "Änderungen verwerfen",
       "save": "Änderungen speichern",
       "saving": "Wird gespeichert…",
       "saveFailed": "Speichern fehlgeschlagen.",
@@ -796,6 +874,7 @@
       "permission": "Zugriff verweigert",
       "missingDependency": "fehlende Abhängigkeit",
       "notFound": "Datei nicht gefunden",
+      "unclassified": "nicht klassifizierter Fehler",
       "showDetails": "Vollständigen Fehler anzeigen",
       "hideDetails": "Vollständigen Fehler ausblenden"
     }
@@ -837,7 +916,7 @@
     "stale": {
       "error": "Fehler · {message}",
       "unreachable": "API nicht erreichbar",
-      "lastUpdated": "veraltet · zuletzt vor {age}s aktualisiert"
+      "lastUpdated": "zuletzt vor {age}s aktualisiert"
     },
     "detail": {
       "hint": "Wähle eine Session aus, um sie zu untersuchen",
@@ -853,8 +932,7 @@
       "updated": "Aktualisiert",
       "branchesTitle": "{count, plural, one {Zweig (#)} other {Zweige (#)}}",
       "noBranches": "Keine Branches.",
-      "msgs": " Nachrichten",
-      "engineRuns": "Engine-Läufe"
+      "msgs": " Nachrichten"
     },
     "split": {
       "master": "Sessionliste",
@@ -1000,7 +1078,7 @@
     "stale": {
       "error": "Fehler · {message}",
       "unreachable": "API nicht erreichbar",
-      "lastUpdated": "veraltet · zuletzt vor {age}s aktualisiert"
+      "lastUpdated": "zuletzt vor {age}s aktualisiert"
     },
     "zeroState": {
       "heading": "Loslegen",
@@ -1089,6 +1167,7 @@
     "showEarlier": "{count, plural, one {{count, number} frühere Nachricht anzeigen} other {{count, number} frühere Nachrichten anzeigen}}",
     "noArgs": "(keine Args)",
     "noOutput": "(keine Ausgabe)",
+    "outputWithheld": "nicht gelesen",
     "roleUser": "Benutzer",
     "roleThinking": "Denkprozess",
     "roleResponse": "Antwort",

@@ -14,9 +14,7 @@ import pytest
 
 from lionagi.engines.engine import Engine, EngineRun
 
-# ---------------------------------------------------------------------------
 # EngineRun._agent_errors accumulation via notify()
-# ---------------------------------------------------------------------------
 
 
 def _make_minimal_engine_run() -> EngineRun:
@@ -61,13 +59,18 @@ def test_notify_still_forwards_to_on_event():
 
     er.notify("agent_error", agent="worker-1", error="boom")
 
-    assert calls == [{"type": "agent_error", "agent": "worker-1", "error": "boom"}]
+    assert calls == [
+        {
+            "type": "agent_error",
+            "engine_instance_id": er.run_id,
+            "agent": "worker-1",
+            "error": "boom",
+        }
+    ]
     assert er._agent_errors == ["worker-1: boom"]
 
 
-# ---------------------------------------------------------------------------
 # Engine._total_agent_failure — flagged only when every agent made errored
-# ---------------------------------------------------------------------------
 
 
 async def test_total_agent_failure_true_when_all_agents_errored():

@@ -89,7 +89,16 @@ async def _failing_execute(row: dict) -> tuple[int, str]:
     return 1, "boom"
 
 
-# ── 1. Claim CAS race ────────────────────────────────────────────────────
+async def _timed_out_execute(row: dict) -> tuple[int, str]:
+    from lionagi.studio.scheduler.subprocess import SubprocessDeadlineExceededError
+
+    raise SubprocessDeadlineExceededError(
+        invocation_id=f"inv-{row['id']}",
+        deadline_seconds=2,
+    )
+
+
+# Claim CAS race
 
 
 async def test_two_concurrent_claims_exactly_one_wins(tmp_path) -> None:
@@ -114,7 +123,7 @@ async def test_two_concurrent_claims_exactly_one_wins(tmp_path) -> None:
     assert row["status"] == "completed"
 
 
-# ── 2. Cancel beats claim ────────────────────────────────────────────────
+# Cancel beats claim
 
 
 async def test_cancelled_before_claim_is_never_leased(db: StateDB) -> None:
@@ -131,7 +140,7 @@ async def test_cancelled_before_claim_is_never_leased(db: StateDB) -> None:
     assert row["leased_by"] is None
 
 
-# ── 3. Lease-expiry recovery ─────────────────────────────────────────────
+# Lease-expiry recovery
 
 
 async def test_expired_lease_recovers_to_queued(db: StateDB) -> None:
@@ -194,7 +203,7 @@ async def test_live_lease_is_never_reaped(db: StateDB) -> None:
     assert row["leased_by"] == "w1"
 
 
-# ── 4. Bounded re-queue (R1) ─────────────────────────────────────────────
+# Bounded re-queue
 
 
 async def test_third_lease_expiry_fails_terminal_not_requeued(db: StateDB) -> None:
@@ -239,7 +248,7 @@ async def test_third_lease_expiry_fails_terminal_not_requeued(db: StateDB) -> No
     assert counts == {"requeued": 0, "failed": 0}
 
 
-# ── 5. Terminal re-entry rejected (R2) ───────────────────────────────────
+# Terminal re-entry rejected
 
 
 async def test_completed_to_running_rejected(db: StateDB) -> None:
@@ -286,7 +295,7 @@ async def test_failed_to_running_rejected(db: StateDB) -> None:
         )
 
 
-# ── 6. Claim predicate ───────────────────────────────────────────────────
+# Claim predicate
 
 
 async def test_capability_carrying_row_is_never_leased(db: StateDB) -> None:
@@ -316,7 +325,7 @@ async def test_scheduler_fired_row_is_never_leased(db: StateDB) -> None:
     assert row["status"] == "queued"
 
 
-# ── 7. Round trip ─────────────────────────────────────────────────────────
+# Round trip
 
 
 async def test_submit_claim_execute_completed_round_trip(db: StateDB) -> None:
@@ -349,6 +358,20 @@ async def test_submit_claim_execute_completed_round_trip(db: StateDB) -> None:
         ("queued", "running"),
         ("running", "completed"),
     ]
+
+
+async def test_claimed_task_deadline_is_recorded_as_timed_out(db: StateDB) -> None:
+    run_id = await _submit_host_task(db)
+
+    claimed = await claim_and_execute(
+        db,
+        worker_id="w1",
+        execute=_timed_out_execute,
+    )
+
+    assert claimed == 1
+    row = await db.fetch_one("SELECT status FROM schedule_runs WHERE id = ?", (run_id,))
+    assert row["status"] == "timed_out"
 
 
 async def test_cancelled_to_running_rejected(db: StateDB) -> None:
@@ -426,7 +449,7 @@ async def test_stale_worker_cannot_finalize_a_reclaimed_lease(db: StateDB) -> No
     assert row["lease_expires_at"] == t0 + 3600
 
 
-# ── Global slot reservation hook (#2751) ─────────────────────────────────
+# Global slot reservation hook
 
 
 async def test_worker_tick_respects_injected_global_slot_reservation(db: StateDB) -> None:

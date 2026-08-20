@@ -5,14 +5,14 @@ from __future__ import annotations
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Annotated, Any, ClassVar
+from typing import Any, ClassVar, cast
 
 from typing_extensions import Self, override
 
 from .._errors import ValidationError
-from ..ln._cache import BoundedLRUCache
 from ..ln._lazy_init import LazyInit
-from ..ln.types import Meta, ModelConfig, Params, Spec
+from ..ln.types import MaybeSentinel, Meta, ModelConfig, Params, Spec, Undefined, Unset
+from ..ln.types._annotation import _materialize_annotation
 
 # Cache of valid Pydantic Field parameters
 _lazy_field_params = LazyInit()
@@ -34,33 +34,27 @@ def _get_pydantic_field_params() -> set[str]:
     return _PYDANTIC_FIELD_PARAMS
 
 
-_annotated_cache: BoundedLRUCache[tuple[type, tuple[Meta, ...]], type] = BoundedLRUCache(
-    "LIONAGI_FIELD_CACHE_SIZE", 10000
-)
-
 METADATA_LIMIT = int(os.environ.get("LIONAGI_FIELD_META_LIMIT", "10"))
 
 
-@dataclass(slots=True, frozen=True, init=False)
+@dataclass(slots=True, frozen=True, init=False, eq=False)
 class FieldModel(Params):
     """Compositional field definition with lazy Annotated-type materialization."""
 
     _config: ClassVar[ModelConfig] = ModelConfig(prefill_unset=True, none_as_sentinel=True)
 
-    base_type: type[Any]
+    base_type: MaybeSentinel[type[Any]] | None
     metadata: tuple[Meta, ...]
 
-    def __init__(self, base_type: type[Any] | None = None, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        base_type: MaybeSentinel[type[Any]] | None = None,
+        **kwargs: Any,
+    ) -> None:
         if base_type is not None:
             kwargs["base_type"] = base_type
         converted = self._convert_kwargs_to_params(**kwargs)
-        for k, v in converted.items():
-            if k in self.allowed():
-                object.__setattr__(self, k, v)
-            else:
-                raise ValueError(f"Invalid parameter: {k}")
-
-        self._validate()
+        Params.__init__(self, **converted)
 
     def _validate(self) -> None:
         Params._validate(self)
@@ -106,9 +100,19 @@ class FieldModel(Params):
         if "base_type" in kwargs:
             params["base_type"] = kwargs.pop("base_type")
         if "metadata" in kwargs:
-            params["metadata"] = tuple(kwargs.pop("metadata"))
+            raw_metadata = kwargs.pop("metadata")
+            params["metadata"] = (
+                raw_metadata
+                if raw_metadata is Undefined or raw_metadata is Unset
+                else tuple(raw_metadata)
+            )
 
-        metadata = list(params.get("metadata", ()))
+        current_metadata = params.get("metadata", ())
+        metadata = (
+            []
+            if current_metadata is Undefined or current_metadata is Unset
+            else list(current_metadata)
+        )
 
         if "name" in kwargs:
             name = kwargs.pop("name")
@@ -273,29 +277,13 @@ class FieldModel(Params):
     # ---- materialization -------------------------------------------------- #
 
     def annotated(self) -> type[Any]:
-        """Materialize into an Annotated type (LRU-cached, thread-safe)."""
-        cache_key = (self.base_type, self.metadata)
-
-        cached = _annotated_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        actual_type = Any if self._is_sentinel(self.base_type) else self.base_type
-        current_metadata = () if self._is_sentinel(self.metadata) else self.metadata
-
-        if any(m.key == "nullable" and m.value for m in current_metadata):
-            actual_type = actual_type | None  # type: ignore
-
-        if current_metadata:
-            args = [actual_type] + list(current_metadata)
-            # Subscription (not the __class_getitem__ attribute, which 3.14
-            # removed from special forms). Annotated[(a, b, c)] == Annotated[a, b, c].
-            result = Annotated[tuple(args)]  # type: ignore
-        else:
-            result = actual_type  # type: ignore[misc]
-
-        _annotated_cache.put(cache_key, result)  # type: ignore[arg-type]
-        return result  # type: ignore[return-value]
+        """Materialize through the shared identity-safe annotation cache."""
+        return _materialize_annotation(
+            owner=self,
+            base_type=self.base_type,
+            metadata=self.metadata,
+            sentinel_predicate=self._is_sentinel,
+        )
 
     def extract_metadata(self, key: str) -> Any:
         if not self._is_sentinel(self.metadata):
@@ -403,7 +391,7 @@ class FieldModel(Params):
     def annotation(self) -> type[Any]:
         if self._is_sentinel(self.base_type):
             return Any
-        t_ = self.base_type
+        t_ = cast(type[Any], self.base_type)
         if self.is_listable:
             # Avoid double-wrapping if base_type is already list[X]
             origin = getattr(t_, "__origin__", None)
@@ -421,7 +409,11 @@ class FieldModel(Params):
         metas.append(Meta("nullable", self.is_nullable))
         metas.append(Meta("listable", self.is_listable))
 
-        return Spec(self.base_type, metadata=tuple(metas))
+        # FieldModel historically accepts annotation=None as an unspecified
+        # adapter input. Keep that boundary explicit instead of teaching Spec
+        # to collapse a caller-supplied null into absence.
+        base_type = Unset if self.base_type is None else self.base_type
+        return Spec(base_type, metadata=tuple(metas))
 
     def metadata_dict(self, exclude: list[str] | None = None) -> dict[str, Any]:
         result = {}

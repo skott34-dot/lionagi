@@ -4,7 +4,8 @@
 - **Kind**: Retrospective
 - **Area**: utilities
 - **Date**: 2026-07-09
-- **Relations**: none
+- **Relations**: extended by ADR-0119 (deterministic declarations, three-state absence, and
+  schema materialization)
 
 ## Context
 
@@ -203,11 +204,16 @@ class ModelConfig:
     use_enum_values: bool = False
     serialize_exclude: frozenset[str] = frozenset()
 
-@dataclass(slots=True, frozen=True, init=False)
+@dataclass(slots=True, frozen=True, init=False, eq=False)
 class Params:
     def __init__(self, **kwargs: Any): ...
-    def to_dict(self, exclude: set[str] = None) -> dict[str, str]: ...
-    def with_updates(self, **kwargs: Any) -> DataClass: ...
+    def to_dict(
+        self,
+        exclude: Collection[str] | None = None,
+        *,
+        mode: Literal["python", "json"] = "python",
+    ) -> dict[str, Any]: ...
+    def with_updates(self, **kwargs: Any) -> Self: ...
 ```
 
 Pydantic-side serializers preserve the same omission meaning:
@@ -232,9 +238,10 @@ class Note(BaseModel):
 - `UndefinedType()` and `UnsetType()` return one cached instance per sentinel
   subclass. `copy` and `deepcopy` return that same instance; both objects are falsy
   and render as `Undefined` or `Unset`.
-- `is_sentinel()` always recognizes the two objects by identity. It recognizes
-  `None` only when `none_as_sentinel=True`, and the shipped empty tuple, set,
-  frozenset, dict, list, and empty string only when `empty_as_sentinel=True`.
+- Public `is_sentinel()` / `not_sentinel()` recognize only the two objects by
+  identity and reject truthy legacy collapse flags. ADR-0119's private named
+  compatibility gateway may additionally recognize `None`, or the shipped empty
+  tuple, set, frozenset, dict, list, and empty string, only for an allowlisted axis.
 - `Params` rejects unknown constructor keys with `ValueError`. With
   `prefill_unset=True`, an allowed field that remains `Undefined` becomes `Unset`.
   With `strict=True`, any value considered a sentinel by the configured policy
@@ -270,14 +277,14 @@ to the Pydantic adapter lazily.
 `lionagi/ln/types/operable.py`) is:
 
 ```python
-@dataclass(frozen=True, slots=True, init=False)
+@dataclass(frozen=True, slots=True, init=False, eq=False)
 class Spec:
-    base_type: type
+    base_type: MaybeSentinel[type[Any]]
     metadata: tuple[Meta, ...]
 
     def __init__(
         self,
-        base_type: type = None,
+        base_type: MaybeSentinel[type[Any]] = Undefined,
         *args,
         metadata: tuple[Meta, ...] = None,
         **kw,
@@ -298,16 +305,16 @@ class Operable:
     def get_specs(
         self,
         *,
-        include: set[str] | None = None,
-        exclude: set[str] | None = None,
+        include: Collection[str] | None = None,
+        exclude: Collection[str] | None = None,
     ) -> tuple[Spec, ...]: ...
 
     def create_model(
         self,
         adapter: Literal["pydantic"] = "pydantic",
         model_name: str | None = None,
-        include: set[str] | None = None,
-        exclude: set[str] | None = None,
+        include: Collection[str] | None = None,
+        exclude: Collection[str] | None = None,
         **kw,
     ): ...
 ```
@@ -328,8 +335,8 @@ class PydanticSpecAdapter(SpecAdapter):
         cls,
         op: Operable,
         model_name: str,
-        include: set[str] | None = None,
-        exclude: set[str] | None = None,
+        include: Collection[str] | None = None,
+        exclude: Collection[str] | None = None,
         base_type: type[BaseModel] | None = None,
         doc: str | None = None,
     ) -> type[BaseModel]: ...
@@ -338,10 +345,10 @@ class PydanticSpecAdapter(SpecAdapter):
 `FieldModel` is the intermediate Pydantic-oriented field shape:
 
 ```python
-@dataclass(slots=True, frozen=True, init=False)
+@dataclass(slots=True, frozen=True, init=False, eq=False)
 class FieldModel(Params):
     _config = ModelConfig(prefill_unset=True, none_as_sentinel=True)
-    base_type: type[Any]
+    base_type: MaybeSentinel[type[Any]] | None
     metadata: tuple[Meta, ...]
 
     def create_field(self) -> Any: ...
@@ -356,12 +363,16 @@ class FieldModel(Params):
   `default_factory`, a non-callable default factory, a non-callable validator,
   and a `base_type` that is not a type or type annotation. An async default
   factory is accepted with a compatibility warning.
+- An omitted or explicit `Undefined` base type remains `Undefined`; explicit `Unset`
+  remains unresolved, and explicit `None` is invalid. The Pydantic compatibility
+  adapter materializes either sentinel as `Any`, but that does not resolve `Unset`
+  for persistence or policy adapters. `FieldModel(annotation=None)` retains its
+  legacy unspecified-input behavior by mapping to `Unset` in `to_spec()`.
 - `Operable` converts an input list to a tuple, rejects non-`Spec` items, and
-  rejects duplicate non-`None` spec names. Multiple unnamed specs are allowed.
+  rejects duplicate resolved spec names. Multiple `None`/`Undefined`/`Unset` names are allowed.
 - `Operable.get()` returns `Unset` on a miss unless another default is supplied.
-  Supplying both `include` and `exclude` is an error. `exclude` preserves original
-  spec order; `include` iterates the caller's set and therefore does not promise
-  original order.
+  Supplying both `include` and `exclude` is an error. Both filters treat their
+  collection as membership and retain the declarations' original order.
 - `create_model()` supports only the key `"pydantic"`. An unknown key raises
   `ValueError`. Import failure is re-raised with the explicit Pydantic installation
   message. The default generated class name is `model_name`, then `Operable.name`,
@@ -369,7 +380,8 @@ class FieldModel(Params):
 - `PydanticSpecAdapter` converts each named spec to a `FieldInfo`, collects one
   Pydantic field validator per spec carrying `validator` metadata, calls
   `build_model_type(..., inherit_base=True)`, then calls `model_rebuild()`.
-  Unnamed specs do not become model fields.
+  Materialization rejects an unnamed or non-string spec before emitting any model;
+  neutral `Operable` storage continues to allow multiple unnamed declarations.
 - `FieldModel` accepts the legacy aliases `annotation -> base_type` and
   `field -> name`. A callable `default` becomes a Pydantic `default_factory`.
   Unknown Pydantic field metadata is placed in `json_schema_extra`, except type
@@ -560,8 +572,8 @@ The current limits are:
 |---------|---------------|------------------------|
 | `compute_hash()` payload | 10 MiB (`10 * 1024 * 1024`) | Raises `ValueError` before hashing a larger encoded payload. The source records DoS prevention as the reason; the exact 10 MiB choice is inherited with no more specific recorded rationale. |
 | `fuzzy_json()` / JSON extraction input | 10 MiB by default | Rejects empty, non-string, or oversized input before repair/parsing. The source records memory-exhaustion prevention and calls 10 MiB generous for normal use; callers may pass a different `max_size`. |
-| `Spec` annotated-type cache | 10,000 entries by default | LRU-style bounded cache configured by `LIONAGI_FIELD_CACHE_SIZE`. It prevents unbounded generated-type retention; no rationale is recorded for exactly 10,000. |
-| `FieldModel` annotated-type cache | 10,000 entries by default | Thread-safe `BoundedLRUCache`, controlled by the same environment key. No rationale is recorded for exactly 10,000. |
+| Shared `Spec`/`FieldModel` annotated-type cache | 10,000 entries total by default | Thread-safe `BoundedLRUCache`, configured by `LIONAGI_FIELD_CACHE_SIZE`. Sharing one materializer removes two competing key authorities and caps their combined retention; no rationale is recorded for exactly 10,000. |
+| Stable structural declaration projection cache | 10,000 entries by default | Thread-safe `BoundedLRUCache`, configured by `LIONAGI_STRUCTURAL_CACHE_SIZE`. It retains only recursively cache-stable frozen dataclasses and keeps recursive projection off annotation/model cache-hit paths; mutable declarations never enter it. No rationale is recorded for exactly 10,000. |
 | `FieldModel` metadata warning | 10 items by default | `LIONAGI_FIELD_META_LIMIT`; exceeding it warns but does not reject. The warning asks callers to simplify field definitions; no rationale is recorded for exactly 10. |
 | Adapter string detail | 500 characters | Error rendering truncates longer string values after redaction. This bounds diagnostic output; no rationale is recorded for exactly 500. |
 | `acreate_path()` timeout | `None` | No deadline unless supplied by the caller; there is no inherited numeric timeout. |

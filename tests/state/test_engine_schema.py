@@ -21,7 +21,7 @@ from lionagi.state.engine import (
 )
 from lionagi.state.schema_meta import metadata
 
-# ── normalize_state_db_url ────────────────────────────────────────────────────
+# normalize_state_db_url
 
 
 def test_normalize_none_returns_sqlite_default():
@@ -82,7 +82,7 @@ def test_normalize_postgresql_asyncpg_already_qualified():
     assert normalize_state_db_url(original) == original
 
 
-# ── mask_db_url ───────────────────────────────────────────────────────────────
+# mask_db_url
 
 
 def test_mask_no_password():
@@ -114,7 +114,7 @@ def test_mask_short_password():
     assert "[3 chars]" in masked
 
 
-# ── dialect_of ────────────────────────────────────────────────────────────────
+# dialect_of
 
 
 def test_dialect_sqlite():
@@ -127,7 +127,7 @@ def test_dialect_postgresql():
     assert dialect_of("postgres://host/db") == "postgresql"
 
 
-# ── make_engine (SQLite only — sync verification) ────────────────────────────
+# make_engine (SQLite only — sync verification)
 
 
 def test_make_engine_sqlite_creates_engine():
@@ -141,7 +141,7 @@ def test_make_engine_sqlite_creates_engine():
     asyncio.run(engine.dispose())
 
 
-# ── make_readonly_engine ──────────────────────────────────────────────────────
+# make_readonly_engine
 
 
 def test_make_readonly_engine_rejects_postgres():
@@ -187,7 +187,7 @@ async def test_make_readonly_engine_rejects_writes(tmp_path):
         await ro_engine.dispose()
 
 
-# ── Schema-parity: MetaData vs schema.sql (SQLite leg, always runs) ──────────
+# Schema-parity: MetaData vs schema.sql (SQLite leg, always runs)
 
 ALL_TABLES = {
     "schema_meta",
@@ -341,6 +341,60 @@ async def test_branches_index_matches_runtime_migration_definition(tmp_path, sql
     assert migration_cols == raw_composite_cols
 
 
+async def test_invocation_reaper_index_matches_every_schema_path(tmp_path, sqlite_meta_engine):
+    """Fresh SQL, metadata, and runtime repair all install the seek index."""
+    import re
+
+    from lionagi.state.db import _SCHEMA_PATH, StateDB
+    from lionagi.state.schema_migrations import MIGRATION_INDEXES
+
+    expected_columns = ["status", "started_at", "id"]
+
+    raw_db = tmp_path / "raw_invocation_reaper_idx.db"
+    schema_text = _SCHEMA_PATH.read_text()
+    lines = [ln for ln in schema_text.splitlines() if not ln.strip().upper().startswith("PRAGMA")]
+    with sqlite3.connect(raw_db) as conn:
+        conn.executescript("\n".join(lines))
+        raw_columns = [row[2] for row in conn.execute("PRAGMA index_info(idx_invocations_reaper)")]
+    assert raw_columns == expected_columns
+
+    def _metadata_indexes(sync_conn):
+        return {
+            idx["name"]: idx["column_names"]
+            for idx in sa.inspect(sync_conn).get_indexes("invocations")
+        }
+
+    async with sqlite_meta_engine.connect() as conn:
+        metadata_indexes = await conn.run_sync(_metadata_indexes)
+    assert metadata_indexes["idx_invocations_reaper"] == expected_columns
+
+    for dialect in ("sqlite", "postgresql"):
+        (migration_sql,) = (
+            sql for sql in MIGRATION_INDEXES[dialect] if "idx_invocations_reaper" in sql
+        )
+        migration_columns = [
+            value.strip()
+            for value in re.search(r"invocations\(([^)]+)\)", migration_sql).group(1).split(",")
+        ]
+        assert migration_columns == expected_columns
+
+    # metadata.create_all() does not restore an index on an existing table;
+    # reopening after a simulated old/missing index exercises MIGRATION_INDEXES.
+    repaired_db = tmp_path / "repaired_invocation_reaper_idx.db"
+    async with StateDB(repaired_db):
+        pass
+    with sqlite3.connect(repaired_db) as conn:
+        conn.execute("DROP INDEX idx_invocations_reaper")
+        conn.commit()
+    async with StateDB(repaired_db):
+        pass
+    with sqlite3.connect(repaired_db) as conn:
+        repaired_columns = [
+            row[2] for row in conn.execute("PRAGMA index_info(idx_invocations_reaper)")
+        ]
+    assert repaired_columns == expected_columns
+
+
 async def test_metadata_check_constraint_parity_vs_schema_sql(tmp_path, sqlite_meta_engine):
     """Enum CHECK value-sets from MetaData match those from real schema.sql."""
     import re
@@ -458,7 +512,7 @@ async def test_metadata_unique_enforcement_present(sqlite_meta_engine):
         assert key in found, f"missing unique enforcement: {key}; found={found}"
 
 
-# ── Postgres leg (pg_url fixture: testcontainers, or LIONAGI_TEST_PG_URL) ─────
+# Postgres leg (pg_url fixture: testcontainers, or LIONAGI_TEST_PG_URL)
 
 
 async def test_metadata_create_all_postgres(pg_url):
@@ -500,7 +554,7 @@ def _create_in_schema(sync_conn, schema_name: str) -> None:
     scoped.create_all(sync_conn, checkfirst=True)
 
 
-# ── WAL-reset precondition ────────────────────────────────────────────────────
+# WAL-reset precondition
 
 
 @pytest.mark.parametrize(

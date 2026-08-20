@@ -14,10 +14,10 @@ fastapi = pytest.importorskip("fastapi", reason="studio extra not installed")
 from fastapi.testclient import TestClient  # noqa: E402
 
 import lionagi.state.db as state_db_mod
+from lionagi.state.db import NO_CURSOR_CLAIM
+from tests._scheduler_claims import fire_with_claim
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 
 def _make_client(monkeypatch, fake_db: Path | None = None) -> TestClient:
@@ -36,9 +36,7 @@ def _make_client(monkeypatch, fake_db: Path | None = None) -> TestClient:
     return TestClient(app, raise_server_exceptions=False, base_url="http://127.0.0.1:8765")
 
 
-# ---------------------------------------------------------------------------
 # Artifact GET routes bearer auth guard
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.integration
@@ -118,9 +116,7 @@ class TestArtifactAuthBypass:
         assert resp.status_code != 401
 
 
-# ---------------------------------------------------------------------------
 # Scheduler fire task lifecycle — tracking and cancellation on shutdown
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -142,7 +138,9 @@ class TestSchedulerFireTaskLifecycle:
 
         # Inject a tracked task directly via _tracked_fire
         with patch.object(engine, "_fire", side_effect=fake_fire):
-            task = engine._tracked_fire({}, "run_id", trigger_context={})
+            task = engine._tracked_fire(
+                {}, "run_id", trigger_context={}, expect_next_fire_at=NO_CURSOR_CLAIM
+            )
 
         # Task is still running — should be in the set
         await fired.wait()
@@ -191,9 +189,7 @@ class TestSchedulerFireTaskLifecycle:
         assert len(engine._fire_tasks) == 0, "Outstanding fire tasks remain after stop()"
 
 
-# ---------------------------------------------------------------------------
 # Schedule action kind validation
-# ---------------------------------------------------------------------------
 
 
 class TestBuildArgvValidation:
@@ -254,9 +250,7 @@ class TestBuildArgvValidation:
             build_argv({"action_kind": ""}, {})
 
 
-# ---------------------------------------------------------------------------
 # Orphaned subprocess on cancel + invalid-kind run recording
-# ---------------------------------------------------------------------------
 
 
 def _interval_schedule(**over):
@@ -293,7 +287,7 @@ class TestFireBuildFailureRecorded:
         schedule = _interval_schedule(action_kind="totally-bogus")  # same id
 
         # Must NOT raise (no LookupError leaking out) and must return cleanly.
-        await engine._fire(schedule, run_id, trigger_context={})
+        await fire_with_claim(engine, schedule, run_id, trigger_context={})
 
         async with StateDB() as db:
             run = await db.get_schedule_run(run_id)
@@ -446,7 +440,9 @@ class TestFireCancellationRecorded:
 
         engine = SchedulerEngine()
         run_id = "run-cancel"
-        engine._tracked_fire(_interval_schedule(), run_id, trigger_context={})
+        engine._tracked_fire(
+            _interval_schedule(), run_id, trigger_context={}, expect_next_fire_at=NO_CURSOR_CLAIM
+        )
 
         await started.wait()  # row created, now inside spawn
         await engine.stop()  # cancels + awaits the fire task
@@ -552,10 +548,8 @@ class TestInvocationReasonAggregation:
         assert reason_code == RunReasons.ABORTED_USER
 
 
-# ---------------------------------------------------------------------------
 # Router-level PATCH validation (HTTP 400 for invalid flow_yaml transitions),
 # covering the ValueError→HTTPException translation in services/schedules.py.
-# ---------------------------------------------------------------------------
 
 
 class TestSchedulePatchRouterValidation:
@@ -619,9 +613,7 @@ class TestSchedulePatchRouterValidation:
         assert r.status_code == 404, f"expected 404, got {r.status_code}: {r.text}"
 
 
-# ---------------------------------------------------------------------------
 # CWE-88 argument injection — router-level 400 responses
-# ---------------------------------------------------------------------------
 
 
 class TestScheduleArgvInjectionRouterValidation:
@@ -764,12 +756,10 @@ class TestScheduleArgvInjectionRouterValidation:
         assert r.status_code == 400, f"expected 400, got {r.status_code}: {r.text}"
 
 
-# ---------------------------------------------------------------------------
 # CWE-88 argument injection — real-service router tests
 #
 # These tests use the REAL service layer (no mock) with a temp SQLite DB to
 # validate that flag-injection rejections propagate through the router as 400.
-# ---------------------------------------------------------------------------
 
 
 def _real_svc_client(monkeypatch, tmp_path: Path) -> TestClient:
@@ -910,9 +900,7 @@ class TestScheduleArgvInjectionRealService:
         )
 
 
-# ---------------------------------------------------------------------------
 # CWE-918 github_repo path manipulation — real-service router tests
-# ---------------------------------------------------------------------------
 
 
 class TestGithubRepoRealServiceValidation:
@@ -1185,7 +1173,7 @@ class TestGithubRepoRealServiceValidation:
         )
         assert r.status_code == 400, f"expected 400, got {r.status_code}: {r.text}"
 
-    # -- PATCH preserves bad stored value (MAJOR #3) --
+    # PATCH preserves bad stored value
 
     def test_patch_unrelated_field_rejects_bad_stored_github_repo(
         self, monkeypatch, tmp_path

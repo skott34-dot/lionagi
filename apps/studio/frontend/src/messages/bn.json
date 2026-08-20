@@ -116,7 +116,8 @@
       "busyPlaceholder": "Operator is working…",
       "hint": "Enter to send · Shift+Enter for a new line",
       "send": "Send",
-      "sending": "Sending…"
+      "sending": "Sending…",
+      "autoAllow": "Auto-allow proposals"
     },
     "message": {
       "you": "You",
@@ -169,7 +170,12 @@
     "model": {
       "label": "Model",
       "default": "ডিফল্ট",
-      "unavailable": "{model} (unavailable)"
+      "unavailable": "{model} (unavailable)",
+      "recommendedGroup": "{provider} · প্রস্তাবিত",
+      "legacyGroup": "পুরোনো নির্বাচন",
+      "efforts": "প্রচেষ্টা: {efforts}",
+      "effortInModel": "প্রচেষ্টা মডেল আইডিতে এনকোড করা হয়",
+      "effortAsSetting": "প্রচেষ্টা প্রদানকারীর সেটিং হিসেবে পাঠানো হয়"
     },
     "effort": {
       "label": "প্রচেষ্টা",
@@ -239,7 +245,7 @@
       "createWorkflow": "নতুন ওয়ার্কফ্লো",
       "createAgent": "নতুন এজেন্ট",
       "allSkill": "কোনো স্কিল পাওয়া যায়নি।",
-      "allSkillHint": "এখানে দেখতে ~/.lionagi/skills/<name>/ এর অধীনে একটি SKILL.md যোগ করুন।",
+      "allSkillHint": "এখানে দেখতে ~/.lionagi/skills/NAME/ এর অধীনে একটি SKILL.md যোগ করুন।",
       "allPlugin": "কোনো প্লাগইন পাওয়া যায়নি।",
       "allPluginHint": "এখানে দেখতে ~/.claude/plugins/ এর অধীনে একটি প্লাগইন ইনস্টল করুন।"
     },
@@ -376,6 +382,38 @@
       "creating": "Creating…",
       "create": "Create",
       "createError": "Could not create this server."
+    },
+    "filterHooks": "Hooks",
+    "hooks": {
+      "title": "Hooks",
+      "description": "Named, reusable hooks defined once here, then assembled per agent: each agent binds hooks from this library to events (before a tool call, on prompt submit, after a response). The same assembly runs on any provider CLI.",
+      "libraryTitle": "Hook library",
+      "newHook": "New hook",
+      "emptyLibrary": "No hooks defined yet. Create one to make it assemblable by every agent.",
+      "emptyLibraryHint": "Define hooks in the library first — attachments bind library hooks to events.",
+      "operatorTitle": "Operator assembly",
+      "operatorDescription": "Hooks the Studio Operator runs. The Operator inherits no user or project settings, so hooks attached here are the only ones its turns load.",
+      "enabled": "Enabled",
+      "save": "Save",
+      "saving": "Saving…",
+      "savedNotice": "Saved — applies from the next turn.",
+      "cancel": "Cancel",
+      "delete": "Delete",
+      "fieldName": "Name",
+      "fieldDescription": "Description",
+      "fieldCommand": "Command",
+      "fieldTimeout": "Timeout (seconds)",
+      "nameRequired": "A hook needs a name.",
+      "timeoutInvalid": "Timeout must be a number.",
+      "noAttachments": "No hooks attached.",
+      "attachmentHook": "Hook",
+      "attachmentOn": "on",
+      "attachmentEvent": "Event",
+      "attachmentMatcher": "Matcher",
+      "matcherPlaceholder": "matcher (optional)",
+      "removeAttachment": "Remove attachment",
+      "addAttachment": "Attach hook",
+      "agentSectionTitle": "Hooks"
     }
   },
   "history": {
@@ -445,6 +483,8 @@
       "statMessages": "মেসেজ",
       "statToolCalls": "টুল কল",
       "statErrors": "ত্রুটি",
+      "statTokensIn": "ইনপুট টোকেন",
+      "statTokensOut": "আউটপুট টোকেন",
       "statTopic": "টপিক",
       "statPlay": "Play",
       "statPlaybook": "ওয়ার্কফ্লো",
@@ -468,6 +508,7 @@
       "statErrorsRecent": "ত্রুটি (সাম্প্রতিক)",
       "noBranchErrorsPartial": "লোড করা মেসেজে কোনো ত্রুটি নেই।",
       "noFilesPartial": "লোড করা মেসেজে কোনো ফাইল অপারেশন শনাক্ত হয়নি।",
+      "filesUnionBounded": "কিছু ফাইল অপারেশন তালিকাভুক্ত নয়: এই রানটি একটি ভিউ যত ফাইল সংগ্রহ করে তার চেয়ে বেশি ফাইল স্পর্শ করেছে।",
       "olderUnavailable": "পুরোনো ইতিহাস লোড করা যায়নি — অনুরোধ সম্পূর্ণ হওয়ার আগেই এই কথোপকথনটি এগিয়ে গেছে।",
       "reloadConversation": "কথোপকথন পুনরায় লোড করুন",
       "graphEdgeCount": "{count}টি প্রান্ত",
@@ -481,17 +522,51 @@
       "graphNodeStatusDone": "সম্পন্ন",
       "graphNodeStatusFailed": "ব্যর্থ",
       "graphNodeStatusSkipped": "এড়ানো",
+      "graphNodeStatusCancelled": "বাতিল",
       "graphNodeStatusEscalated": "এস্কেলেটেড",
       "progressTotal": "মোট",
       "progressCompleted": "সম্পন্ন",
       "progressRunning": "চলমান",
       "progressFailed": "ব্যর্থ",
       "progressPending": "মুলতুবি",
+      "progressEscalated": "এস্কেলেটেড",
       "progressElapsed": "অতিবাহিত সময়",
       "expandGraph": "এক্সিকিউশন গ্রাফ প্রসারিত করুন",
       "collapseGraph": "এক্সিকিউশন গ্রাফ সংকুচিত করুন",
       "closeExpandedGraph": "বন্ধ করুন",
-      "nodeNoBranch": "“{node}”-এর জন্য কোনো ব্রাঞ্চ পাওয়া যায়নি — এই ধাপটি এখনও শুরু হয়নি।"
+      "nodeNoBranch": "“{node}”-এর জন্য কোনো ব্রাঞ্চ পাওয়া যায়নি — এই ধাপটি এখনও শুরু হয়নি।",
+      "viewGraph": "Graph",
+      "viewList": "List",
+      "viewToggleLabel": "Graph or list view",
+      "selectedNode": "Selected: {node}",
+      "controls": {
+        "pause": "Pause",
+        "pausePhasePausing": "Pausing…",
+        "pausePhasePaused": "Paused",
+        "resume": "Resume gate",
+        "steer": "Steer",
+        "steerSend": "Send",
+        "steerPlaceholder": "Message to steer the run…",
+        "confirmYes": "Confirm",
+        "confirmCancel": "Cancel",
+        "proposeFailed": "Could not propose the command.",
+        "confirmFailed": "Could not confirm the command.",
+        "confirm": {
+          "pause": "Confirm pause?",
+          "resume": "Confirm resume?",
+          "message": "Confirm sending this message?"
+        },
+        "reason": {
+          "run-terminal": "This run has ended.",
+          "agent-no-pause-seam": "An agent run has no pause seam inside a single turn — steer instead.",
+          "no-live-consumer": "This run is a mirrored or imported session, so no runner would deliver a control.",
+          "already-pause-requested": "A pause has already been requested.",
+          "not-paused": "The run is not paused.",
+          "still-pausing": "Still finishing in-flight operations.",
+          "no-executable-path": "এটি সম্পন্ন করার জন্য এখনও কোনো কমান্ড নেই।",
+          "no-project-scope": "এই রানের কোনো প্রকল্প নেই, তাই কোনো নিয়ন্ত্রণ অনুমোদন করা যাবে না।"
+        }
+      }
     },
     "masterAria": "হিস্ট্রি তালিকা",
     "detailAria": "আইটেমের বিস্তারিত"
@@ -758,6 +833,9 @@
       "noRuns": "এখনও কোনো রান নেই",
       "ago": " আগে",
       "cancel": "বাতিল",
+      "discardWarning": "আপনার অসংরক্ষিত পরিবর্তন আছে।",
+      "keepEditing": "সম্পাদনা চালিয়ে যান",
+      "discardChanges": "পরিবর্তন বাতিল করুন",
       "save": "পরিবর্তন সেভ করুন",
       "saving": "সেভ হচ্ছে…",
       "saveFailed": "সেভ ব্যর্থ।",
@@ -796,6 +874,7 @@
       "permission": "অনুমতি প্রত্যাখ্যাত",
       "missingDependency": "নির্ভরতা অনুপস্থিত",
       "notFound": "ফাইল পাওয়া যায়নি",
+      "unclassified": "অশ্রেণীবদ্ধ ত্রুটি",
       "showDetails": "সম্পূর্ণ ত্রুটি দেখান",
       "hideDetails": "সম্পূর্ণ ত্রুটি লুকান"
     }
@@ -837,7 +916,7 @@
     "stale": {
       "error": "ত্রুটি · {message}",
       "unreachable": "API পৌঁছানো যায় না",
-      "lastUpdated": "স্টেল · শেষ আপডেট {age}s আগে"
+      "lastUpdated": "শেষ আপডেট {age}s আগে"
     },
     "detail": {
       "hint": "বিস্তারিত দেখতে একটি সেশন নির্বাচন করুন",
@@ -853,8 +932,7 @@
       "updated": "আপডেটেড",
       "branchesTitle": "{count, plural, one {ব্রাঞ্চ (#)} other {ব্রাঞ্চ (#)}}",
       "noBranches": "কোনো ব্রাঞ্চ নেই।",
-      "msgs": " মেসেজ",
-      "engineRuns": "ইঞ্জিন রান"
+      "msgs": " মেসেজ"
     },
     "split": {
       "master": "সেশন তালিকা",
@@ -1000,7 +1078,7 @@
     "stale": {
       "error": "ত্রুটি · {message}",
       "unreachable": "API পৌঁছানো যায় না",
-      "lastUpdated": "স্টেল · শেষ আপডেট {age}s আগে"
+      "lastUpdated": "শেষ আপডেট {age}s আগে"
     },
     "zeroState": {
       "heading": "শুরু করুন",
@@ -1089,6 +1167,7 @@
     "showEarlier": "{count, plural, one {আগের {count, number}টি মেসেজ দেখান} other {আগের {count, number}টি মেসেজ দেখান}}",
     "noArgs": "(কোনো args নেই)",
     "noOutput": "(কোনো আউটপুট নেই)",
+    "outputWithheld": "পড়া হয়নি",
     "roleUser": "ইউজার",
     "roleThinking": "ভাবছে",
     "roleResponse": "রেসপন্স",

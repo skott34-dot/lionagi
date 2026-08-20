@@ -374,18 +374,12 @@ def _interpolate_prompt(template: str, positional: str | None, playbook_args: di
 def _check_assembled_prompt(prompt: str) -> str | None:
     """Measure the prompt that will run, not the one it was written from.
 
-    A spec's prompt field is checked when the file is read, but that is a
-    template: the caller's positional and the playbook's arguments are
-    substituted into it afterwards, and either can make the result far longer
-    than the text that passed. A caller that names no spec at all skips the
-    file check outright. Both forms arrive here holding the finished text,
-    which is the only version that reaches a run.
-
-    Same bound as the spec field, deliberately: the number exists to refuse a
-    file that is not a prompt, and it sits far enough out that template plus
-    arguments together stay well under it. A second, larger bound here would
-    mean the assembled prompt could pass while the template it came from could
-    not, which is the asymmetry this check is closing.
+    A spec's prompt field is checked at file-read time, but that's a
+    template — substituting the caller's positional and the playbook's
+    arguments afterward can make the result far longer than the text that
+    passed. Uses the same length bound as the spec-field check, deliberately:
+    a larger bound here would let an assembled prompt pass while the
+    template it came from would not have.
     """
     if len(prompt) > MAX_SPEC_PROMPT_CHARS:
         return (
@@ -557,7 +551,7 @@ def add_orchestrate_subparser(
     )
 
     _add_mcp_config_args(fo)
-    add_common_cli_args(fo)
+    add_common_cli_args(fo, resume_on_timeout_supported=False)
 
     fl = orch_sub.add_parser(
         "flow",
@@ -761,6 +755,19 @@ def add_orchestrate_subparser(
         ),
     )
     fl.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help=(
+            "With --resume: run the ops the checkpoint recorded as failed "
+            "again, instead of refusing. Their reactive children from the "
+            "superseded attempt are dropped so the re-run decides its own. "
+            "Without this flag a checkpoint holding any failed op refuses "
+            "loudly, naming them, because replaying one as terminal skips it "
+            "and everything downstream. Re-running re-executes whatever side "
+            "effects the first attempt already had."
+        ),
+    )
+    fl.add_argument(
         "--allow-degraded-context",
         action="store_true",
         help=(
@@ -771,7 +778,7 @@ def add_orchestrate_subparser(
         ),
     )
     _add_mcp_config_args(fl)
-    add_common_cli_args(fl)
+    add_common_cli_args(fl, resume_on_timeout_supported=False)
 
     # `li o ctl status <id>` aliases the same status renderer as `li agent
     # status`; pause/resume/msg queue session_controls rows for the poller.
@@ -943,11 +950,38 @@ def _run_orch_command(coro, *, verbose: bool, extra_handlers: tuple = ()) -> tup
     return result, 0
 
 
+def _warn_resume_on_timeout_is_inert(args: argparse.Namespace) -> None:
+    """Tell a caller that passed ``--resume-on-timeout`` that nothing reads it.
+
+    Neither orchestrate command implements the auto-resume contract, so the
+    value is discarded. That is invisible from the outside: the run succeeds
+    and nothing in its output suggests the option did nothing, which is why
+    the only honest moment to say so is before the work starts. The option is
+    still accepted, because invocations that pass it parse today and would
+    fail outright if it were simply deleted.
+    """
+    if not getattr(args, "resume_on_timeout", False):
+        return
+
+    import warnings
+
+    from .._logging import warn
+
+    message = (
+        "--resume-on-timeout has no effect on `li orchestrate "
+        f"{args.orch_command}` and will be removed in a future release. "
+        "Only `li agent` implements it."
+    )
+    warnings.warn(message, DeprecationWarning, stacklevel=2)
+    warn(message)
+
+
 @auto_register(
     area="orchestrate",
     cli=CliDeclaration(seed="orchestrate", parser_factory=add_orchestrate_subparser),
 )
 def run_orchestrate(args: argparse.Namespace) -> int:
+    _warn_resume_on_timeout_is_inert(args)
     if args.orch_command == "fanout":
         resolved = _resolve_model_and_prompt(getattr(args, "query", None) or [])
         if resolved is None:
@@ -1017,6 +1051,7 @@ def run_orchestrate(args: argparse.Namespace) -> int:
                 _resume_flow(
                     resume_target,
                     allow_degraded_context=getattr(args, "allow_degraded_context", False),
+                    retry_failed=getattr(args, "retry_failed", False),
                     dry_run=args.dry_run,
                     show_graph=getattr(args, "show_graph", False),
                     notify=getattr(args, "notify", None),

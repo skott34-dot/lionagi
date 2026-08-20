@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import stat
 import time
@@ -268,7 +269,7 @@ CORS_ORIGINS: list[str] = (
     ]
 )
 
-# ── Launch admission config ───────────────────────────────────────────────────
+# Launch admission config
 # Maximum number of on-demand launch tasks that may run in parallel.
 # When saturated, POST /api/launches returns 429.
 MAX_LAUNCHES: int = int(os.environ.get("LIONAGI_STUDIO_MAX_LAUNCHES", "4"))
@@ -286,16 +287,57 @@ MAX_SCHEDULED_CONCURRENT: int = int(os.environ.get("LIONAGI_STUDIO_MAX_SCHEDULED
 # 0 = unlimited (worker executions impose no concurrency limit of their own).
 MAX_ADHOC_CONCURRENT: int = int(os.environ.get("LIONAGI_STUDIO_MAX_ADHOC_CONCURRENT", "4"))
 
-# ── Lifecycle reaper config ───────────────────────────────────────────────────
+
+# Lifecycle reaper config
 # Default invocation deadline in seconds (2 hours). Override per action kind
 # via LIONAGI_STUDIO_INVOCATION_DEADLINE_<KIND>_SECONDS (e.g. _AGENT_SECONDS).
 # Pairs with per-schedule budget_usd/budget_tokens (schedules table, see
 # SchedulerEngine._check_budget): the budget gate is a pre-fire cumulative
 # check, not a mid-run kill, so this deadline is what bounds a single run's
 # worst-case spend.
-INVOCATION_DEADLINE_SECONDS: int = int(
-    os.environ.get("LIONAGI_STUDIO_INVOCATION_DEADLINE_SECONDS", "7200")
+def _positive_deadline_seconds(value: str | int | float, *, source: str) -> float:
+    """Parse one execution deadline and reject values that cannot bound work."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{source} must be a positive number of seconds, got {value!r}") from exc
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError(f"{source} must be positive and finite, got {value!r}")
+    return seconds
+
+
+INVOCATION_DEADLINE_SECONDS: float = _positive_deadline_seconds(
+    os.environ.get("LIONAGI_STUDIO_INVOCATION_DEADLINE_SECONDS", "7200"),
+    source="LIONAGI_STUDIO_INVOCATION_DEADLINE_SECONDS",
 )
+
+
+def invocation_deadline_seconds(
+    action_kind: str | None,
+    *,
+    global_default: float | int | None = None,
+) -> float:
+    """Resolve and validate the execution deadline for one action kind.
+
+    Per-kind environment overrides are intentionally read at action admission,
+    matching the command allow-list's revocation behavior. A malformed or
+    non-positive override fails before spawn instead of turning the deadline
+    into an unbounded wait.
+    """
+    default = INVOCATION_DEADLINE_SECONDS if global_default is None else global_default
+    default_seconds = _positive_deadline_seconds(
+        default,
+        source="global invocation deadline",
+    )
+    if not action_kind:
+        return default_seconds
+    env_key = f"LIONAGI_STUDIO_INVOCATION_DEADLINE_{action_kind.upper()}_SECONDS"
+    raw = os.environ.get(env_key)
+    if raw is None:
+        return default_seconds
+    return _positive_deadline_seconds(raw, source=env_key)
+
+
 # Grace period before a running invocation with zero child sessions is reaped.
 ZERO_SESSION_GRACE_SECONDS: int = int(
     os.environ.get("LIONAGI_STUDIO_ZERO_SESSION_GRACE_SECONDS", "300")
@@ -321,7 +363,7 @@ SHOW_STALE_HOURS: float = float(os.environ.get("LIONAGI_STUDIO_SHOW_STALE_HOURS"
 # Minimum seconds between consecutive periodic reaper runs (throttle).
 REAPER_INTERVAL_SECONDS: int = int(os.environ.get("LIONAGI_STUDIO_REAPER_INTERVAL_SECONDS", "300"))
 
-# ── Scheduler cron timezone ───────────────────────────────────────────────────
+# Scheduler cron timezone
 # Cron expressions (trigger_type="cron") are interpreted in this IANA timezone;
 # next_fire_at is always stored as a UTC epoch regardless. Resolved once here
 # and frozen for the process lifetime, so it's reported on /api/admin/health
@@ -367,17 +409,41 @@ def scheduler_timezone_report() -> dict[str, Any]:
     }
 
 
-# ── DB maintenance config ─────────────────────────────────────────────────────
-# Size threshold in bytes above which /api/stats raises a size_alert (500 MB).
-DB_SIZE_ALERT_BYTES: int = int(
-    os.environ.get("LIONAGI_STUDIO_DB_SIZE_ALERT_BYTES", str(500 * 1024 * 1024))
-)
+# DB maintenance config
 # Minimum seconds between automatic WAL checkpoints from the scheduler tick.
 CHECKPOINT_INTERVAL_SECONDS: int = int(
     os.environ.get("LIONAGI_STUDIO_CHECKPOINT_INTERVAL_SECONDS", "3600")
 )
 # Sessions/runs older than this many days (with terminal status) will be pruned.
 PRUNE_KEEP_DAYS: int = int(os.environ.get("LIONAGI_STUDIO_PRUNE_KEEP_DAYS", "30"))
+
+# Whole-file bytes per retained day, measured on one deployment (~272 MB/day
+# over 38 days); a measurement rather than a policy, so re-measure as it decays.
+_DB_BYTES_PER_RETAINED_DAY: int = int(
+    os.environ.get("LIONAGI_STUDIO_DB_BYTES_PER_RETAINED_DAY", str(272 * 1024 * 1024))
+)
+# Multiple of steady state above which the size is more than retention explains.
+_DB_SIZE_ALERT_HEADROOM: float = 1.5
+# Floor, so a short or zero keep window cannot derive a threshold that always alerts.
+_DB_SIZE_ALERT_FLOOR_BYTES: int = 512 * 1024 * 1024
+
+
+def _derive_db_size_alert_bytes(keep_days: int) -> int:
+    """Size at which a store is larger than *keep_days* of retention explains."""
+    return max(
+        _DB_SIZE_ALERT_FLOOR_BYTES,
+        int(keep_days * _DB_BYTES_PER_RETAINED_DAY * _DB_SIZE_ALERT_HEADROOM),
+    )
+
+
+# Bytes above which /api/stats raises a size_alert, derived from the retention
+# policy so the two cannot disagree and a legitimate steady state cannot fire it.
+DB_SIZE_ALERT_BYTES: int = int(
+    os.environ.get(
+        "LIONAGI_STUDIO_DB_SIZE_ALERT_BYTES",
+        str(_derive_db_size_alert_bytes(PRUNE_KEEP_DAYS)),
+    )
+)
 # Directory to archive pruned rows to before deletion. Unset (default) preserves
 # the pre-archive prune behaviour exactly. When set, prune refuses to delete any
 # row unless the archive for that pass was written and verified first.
@@ -389,6 +455,17 @@ PRUNE_ARCHIVE_DIR: Path | None = (
 # transaction so the write lock is released between chunks and an interrupted
 # prune keeps the chunks that already committed.
 PRUNE_CHUNK_ROWS: int = max(1, int(os.environ.get("LIONAGI_STUDIO_PRUNE_CHUNK_ROWS", "100")))
+# Minimum seconds between automatic retention prunes from the scheduler tick;
+# 0 disables the automatic pass and leaves prune to the admin route. The gap is
+# measured from when a prune last committed, read back from the admin event log,
+# not from when this process started: a daemon restarted more often than the
+# interval would otherwise never reach a pass. A database that has never been
+# pruned starts its clock at process start rather than firing immediately, so
+# adopting this on an installation with a large backlog has a predictable first
+# pass instead of one during startup.
+RETENTION_INTERVAL_SECONDS: int = int(
+    os.environ.get("LIONAGI_STUDIO_RETENTION_INTERVAL_SECONDS", "86400")
+)
 
 # dispatch_outbox retention (ADR-0059 delta 3). Two windows: terminal-success
 # rows (delivered/acked) are low-signal once past the window, so they use a
@@ -403,21 +480,89 @@ DISPATCH_RETENTION_DEAD_LETTER_DAYS: int = int(
     os.environ.get("LIONAGI_STUDIO_DISPATCH_RETENTION_DEAD_LETTER_DAYS", "30")
 )
 
-# ── Ambient transcript mirror ─────────────────────────────────────────────────
+# Ambient transcript mirror
 # When on, studio tails the local agent transcript trees in-process so those
 # sessions show up (and stream live) without a separate `li mirror`. Bounded by
 # the window below, so startup catches up the recent window only and never
 # backfills full history — which matters most for codex, whose rollout corpus
 # runs to tens of thousands of files.
-MIRROR_CLAUDE_ENABLED: bool = os.environ.get(
-    "LIONAGI_STUDIO_MIRROR_CLAUDE", "1"
-).strip().lower() not in ("0", "false", "no", "off", "")
+
+
+def _mirror_import_ambient_default() -> bool:
+    """Whether an unconfigured mirror may read the user's CLI transcript trees.
+
+    The conventional ``~/.lionagi`` profile shares the same user boundary as
+    ``~/.claude`` and ``~/.codex``. An explicitly selected ``LIONAGI_HOME`` is
+    isolated unless the operator opts back in. Resolution failures fail closed.
+    """
+    configured_home = os.environ.get("LIONAGI_HOME")
+    if configured_home is None:
+        return True
+    try:
+        selected = Path(configured_home).expanduser().resolve()
+        ambient = (Path.home() / ".lionagi").resolve()
+    except (OSError, RuntimeError):
+        return False
+    return selected == ambient
+
+
+def _optional_mirror_root(env_var: str) -> Path | None:
+    """Resolve an optional transcript root without echoing its value on error."""
+    raw = os.environ.get(env_var)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return Path(raw).expanduser().resolve()
+    except (OSError, RuntimeError):
+        raise ValueError(f"{env_var} could not be resolved") from None
+
+
+_TRUE_FLAG_VALUES = frozenset({"1", "true", "yes", "on"})
+_FALSE_FLAG_VALUES = frozenset({"0", "false", "no", "off", ""})
+
+
+def _env_flag(env_var: str, *, default: bool) -> bool:
+    """Read a boolean env var, refusing values that are neither true nor false.
+
+    Deciding by exclusion — anything that is not a known false spelling counts
+    as true — turns a typo into an opt-in. These flags govern whether Studio
+    reads the user's own transcript trees, so the direction a mistake fails in
+    is the whole question: "disabled", "none" and "of" all mean off to whoever
+    typed them, and all read as on under an exclusion test.
+    """
+    raw = os.environ.get(env_var)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in _TRUE_FLAG_VALUES:
+        return True
+    if value in _FALSE_FLAG_VALUES:
+        return False
+    raise ValueError(
+        f"{env_var} must be one of {sorted(_TRUE_FLAG_VALUES)} or "
+        f"{sorted(_FALSE_FLAG_VALUES - {''})} (empty means off), got {raw!r}"
+    )
+
+
+MIRROR_CLAUDE_ENABLED: bool = _env_flag("LIONAGI_STUDIO_MIRROR_CLAUDE", default=True)
 MIRROR_CLAUDE_SINCE: str = os.environ.get("LIONAGI_STUDIO_MIRROR_CLAUDE_SINCE", "24h")
 MIRROR_CLAUDE_INTERVAL: float = float(os.environ.get("LIONAGI_STUDIO_MIRROR_CLAUDE_INTERVAL", "5"))
 # Which transcript trees the ambient mirror reads: "both", "claude", or "codex".
+# An unrecognized value used to fall back to "both", which is the widest of the
+# three: a misspelled "claude" silently read the codex tree as well. Refuse it
+# instead, for the same reason the flags above refuse one.
+_MIRROR_SOURCE_CHOICES = ("both", "claude", "codex")
 _MIRROR_SOURCE_RAW: str = os.environ.get("LIONAGI_STUDIO_MIRROR_SOURCE", "both").strip().lower()
-MIRROR_SOURCE: str = (
-    _MIRROR_SOURCE_RAW if _MIRROR_SOURCE_RAW in ("both", "claude", "codex") else "both"
+if _MIRROR_SOURCE_RAW not in _MIRROR_SOURCE_CHOICES:
+    raise ValueError(
+        f"LIONAGI_STUDIO_MIRROR_SOURCE must be one of {list(_MIRROR_SOURCE_CHOICES)}, "
+        f"got {_MIRROR_SOURCE_RAW!r}"
+    )
+MIRROR_SOURCE: str = _MIRROR_SOURCE_RAW
+MIRROR_CLAUDE_ROOT: Path | None = _optional_mirror_root("LIONAGI_STUDIO_MIRROR_CLAUDE_ROOT")
+MIRROR_CODEX_ROOT: Path | None = _optional_mirror_root("LIONAGI_STUDIO_MIRROR_CODEX_ROOT")
+MIRROR_IMPORT_AMBIENT: bool = _env_flag(
+    "LIONAGI_STUDIO_MIRROR_IMPORT_AMBIENT", default=_mirror_import_ambient_default()
 )
 # Bounded display preview stored in messages.content for mirror-ingested rows
 # (Unicode code points, not bytes). 0 is valid (empty preview + pointer only).

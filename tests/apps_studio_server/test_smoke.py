@@ -12,9 +12,7 @@ import pytest
 fastapi = pytest.importorskip("fastapi", reason="studio extra not installed")
 from fastapi.testclient import TestClient  # noqa: E402 — must follow importorskip
 
-# ---------------------------------------------------------------------------
 # Helpers / shared fixtures
-# ---------------------------------------------------------------------------
 
 
 def _make_client(
@@ -93,9 +91,7 @@ def _make_client(
     return TestClient(app, base_url="http://127.0.0.1:8765")
 
 
-# ---------------------------------------------------------------------------
 # Stats
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.integration
@@ -116,9 +112,7 @@ def test_stats_route(tmp_path, monkeypatch):
         assert isinstance(data[key], int)
 
 
-# ---------------------------------------------------------------------------
 # Shows
-# ---------------------------------------------------------------------------
 
 
 def test_shows_list(tmp_path, monkeypatch):
@@ -128,9 +122,7 @@ def test_shows_list(tmp_path, monkeypatch):
     assert isinstance(r.json(), list)
 
 
-# ---------------------------------------------------------------------------
 # Playbooks
-# ---------------------------------------------------------------------------
 
 
 def test_playbooks_list_returns_dict(tmp_path, monkeypatch):
@@ -151,9 +143,7 @@ def test_playbooks_list_empty(tmp_path, monkeypatch):
     assert r.json()["playbooks"] == []
 
 
-# ---------------------------------------------------------------------------
 # Runs
-# ---------------------------------------------------------------------------
 
 
 def test_runs_list_returns_dict(tmp_path, monkeypatch):
@@ -183,14 +173,16 @@ def test_runs_list_has_contract_fields(tmp_path, monkeypatch):
 def test_runs_list_filter_by_playbook(tmp_path, monkeypatch):
     """?playbook= filter replaces the old ?worker= param."""
     client = _make_client(tmp_path, monkeypatch, with_run=True)
-    # Correct param name; both should 200 with empty list (empty DB)
+    # The supported name serves normally with an empty database.
     r = client.get("/api/runs?playbook=some-playbook")
     assert r.status_code == 200
     assert r.json()["runs"] == []
 
-    # Old ?worker= param should still 200 (FastAPI ignores unknown query params)
+    # The removed spelling must not be silently ignored: a caller otherwise
+    # receives an unfiltered answer while believing the filter was applied.
     r2 = client.get("/api/runs?worker=my-worker")
-    assert r2.status_code == 200
+    assert r2.status_code == 422
+    assert r2.json()["detail"][0]["loc"] == ["query", "worker"]
 
 
 def test_runs_list_filter_by_status(tmp_path, monkeypatch):
@@ -263,9 +255,7 @@ def test_run_detail_contract_fields(tmp_path, monkeypatch):
     assert data["worker_name"] == "my-worker"
 
 
-# ---------------------------------------------------------------------------
 # Path traversal — runs (Fix 1)
-# ---------------------------------------------------------------------------
 
 
 def test_path_traversal_encoded_dotdot_runs(tmp_path, monkeypatch):
@@ -280,9 +270,7 @@ def test_path_traversal_encoded_slash_runs(tmp_path, monkeypatch):
     assert r.status_code == 404
 
 
-# ---------------------------------------------------------------------------
 # Agents (Fix 3)
-# ---------------------------------------------------------------------------
 
 
 def test_agents_list_returns_dict(tmp_path, monkeypatch):

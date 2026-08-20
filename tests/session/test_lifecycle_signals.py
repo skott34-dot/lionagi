@@ -15,6 +15,7 @@ from lionagi.session.signal import (
     GateDenied,
     MessageAdded,
     NodeAwaitingApproval,
+    NodeCancelled,
     NodeCompleted,
     NodeEscalated,
     NodeFailed,
@@ -30,9 +31,7 @@ from lionagi.session.signal import (
     lane_for,
 )
 
-# ---------------------------------------------------------------------------
 # lane_for unit tests
-# ---------------------------------------------------------------------------
 
 
 def test_lane_for_empty_stream():
@@ -181,9 +180,7 @@ def test_lane_for_full_happy_path_sequence():
         assert lane_for(sig) == expected, f"step {i}"
 
 
-# ---------------------------------------------------------------------------
 # New signal type tests
-# ---------------------------------------------------------------------------
 
 
 def test_node_queued_fields():
@@ -234,9 +231,7 @@ def test_node_escalated_request_not_payload_matched():
     assert not isinstance(sig.data, EscalationRequest)
 
 
-# ---------------------------------------------------------------------------
 # Engine bridge: NodeQueued emitted via run_dag
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -327,9 +322,7 @@ async def test_run_dag_calls_session_flow_once_with_same_graph():
     assert passed_graph is graph
 
 
-# ---------------------------------------------------------------------------
 # End-to-end projection: collect signals, project lanes, assert sequence
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -388,9 +381,7 @@ async def test_projection_contract_end_to_end():
     assert q_idx < r_idx < s_idx, f"Lane sequence wrong: {lanes_seen}"
 
 
-# ---------------------------------------------------------------------------
 # Reactive injection: injected children also get NodeQueued
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -439,9 +430,7 @@ async def test_reactive_injected_child_receives_node_queued():
         assert op_id in queued_ids, f"op {op_id} was started without a prior NodeQueued"
 
 
-# ---------------------------------------------------------------------------
 # Skipped nodes project to 'failed' lane
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -515,9 +504,7 @@ async def test_skipped_node_projects_to_skipped_lane():
     )
 
 
-# ---------------------------------------------------------------------------
 # execute_stream subscribes via the public observer property
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -576,9 +563,7 @@ async def test_execute_stream_subscribes_spawn_via_public_observer(monkeypatch):
     assert any(e.spawned for e in events)
 
 
-# ---------------------------------------------------------------------------
 # Export contract
-# ---------------------------------------------------------------------------
 
 
 def test_session_package_exports_new_symbols():
@@ -587,6 +572,7 @@ def test_session_package_exports_new_symbols():
 
     for name in (
         "NodeQueued",
+        "NodeCancelled",
         "NodeAwaitingApproval",
         "NodeEscalated",
         "NodeLifecycleState",
@@ -615,3 +601,102 @@ def test_lane_for_skipped_resets_on_a_genuine_retry():
     assert (
         lane_for([NodeSkipped(op_id="a", name="a"), NodeStarted(op_id="a", name="a")]) == "running"
     )
+
+
+def test_lane_for_cancelled_is_distinct_terminal_and_retryable():
+    cancelled = NodeCancelled(op_id="a", name="a")
+    assert lane_for([NodeQueued(op_id="a", name="a"), cancelled]) == "cancelled"
+    assert lane_for([cancelled, NodeCompleted(op_id="a", name="a")]) == "cancelled"
+    assert lane_for([cancelled, NodeStarted(op_id="a", name="a")]) == "running"
+
+
+# A second pass over an already-run graph must not replay its terminal events
+
+
+@pytest.mark.asyncio
+async def test_second_pass_does_not_replay_terminal_signals_for_finished_nodes():
+    """Synthesis adds a node to the executed graph and runs the graph again, because
+    the executor resolves the new node's dependencies from it. The finished nodes are
+    reported again by that pass, and signalling them a second time records work this
+    pass never did -- a resume rebuilt from those events treats the replay as completed.
+    """
+    from lionagi.engines import Engine
+    from lionagi.operations.builder import OperationGraphBuilder
+    from lionagi.session.branch import Branch
+    from lionagi.session.session import Session
+
+    async def work(**kw):
+        return "ok"
+
+    session = Session()
+    branch = Branch(name="root")
+    session.include_branches(branch)
+    session.default_branch = branch
+    session.register_operation("work", work)
+
+    completed: list[str] = []
+    session.observe(NodeCompleted, handler=lambda s, _: completed.append(s.op_id))
+
+    builder = OperationGraphBuilder()
+    worker = builder.add_operation("work")
+
+    run = Engine().new_run(session=session)
+    await run.run_dag(builder.get_graph())
+
+    assert completed == [str(worker)], "worker completes exactly once in the first pass"
+
+    # Second pass: a new node depending on the finished one, over the same graph.
+    synth = builder.add_operation("work", depends_on=[worker])
+    await run.run_dag(builder.get_graph(), skip_signal_ops={worker})
+
+    assert completed.count(str(worker)) == 1, (
+        f"the finished worker was signalled again by the second pass: {completed}"
+    )
+    assert str(synth) in completed, "the node this pass actually ran must still be signalled"
+
+
+@pytest.mark.asyncio
+async def test_skip_signal_ops_does_not_suppress_nodes_spawned_during_the_pass():
+    """A restricted pass names the work that already ran, which cannot name a node
+    that does not exist yet. A spawn is new work, not a replay, so it still signals."""
+    from lionagi.casts.emission import SpawnRequest
+    from lionagi.engines import Engine
+    from lionagi.operations.builder import OperationGraphBuilder
+    from lionagi.operations.node import create_operation
+    from lionagi.session.branch import Branch
+    from lionagi.session.session import Session
+
+    async def spawner(**kw):
+        return SpawnRequest(instruction="follow-up", independent=True)
+
+    async def follow_up(**kw):
+        return "child done"
+
+    session = Session()
+    branch = Branch(name="root")
+    session.include_branches(branch)
+    session.default_branch = branch
+    session.register_operation("spawner", spawner)
+    session.register_operation("follow_up", follow_up)
+
+    queued_ids: list[str] = []
+    session.observe(NodeQueued, handler=lambda s, _: queued_ids.append(s.op_id))
+
+    def node_builder(req: Any, emitter: Any) -> Any:
+        return create_operation("follow_up", parameters={})
+
+    builder = OperationGraphBuilder()
+    root = builder.add_operation("spawner")
+
+    run = Engine().new_run(session=session)
+    result = await run.run_dag(
+        builder.get_graph(),
+        reactive=True,
+        node_builder=node_builder,
+        max_spawn=1,
+        skip_signal_ops={root},
+    )
+
+    assert result["spawned_operations"] == 1
+    spawned = [op for op in queued_ids if op != str(root)]
+    assert spawned, f"the spawned node was suppressed by skip_signal_ops: {queued_ids}"

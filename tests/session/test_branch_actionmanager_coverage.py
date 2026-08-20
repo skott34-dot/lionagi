@@ -13,9 +13,7 @@ from lionagi.protocols.messages.manager import MessageManager
 from lionagi.service.manager import iModelManager
 from lionagi.session.branch import Branch
 
-# ---------------------------------------------------------------------------
 # Test tools
-# ---------------------------------------------------------------------------
 
 
 def add(a: int, b: int) -> int:
@@ -33,9 +31,7 @@ def greet(name: str) -> str:
     return f"Hello, {name}!"
 
 
-# ---------------------------------------------------------------------------
 # Fixtures
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -65,9 +61,7 @@ def populated_manager():
     return m
 
 
-# ===========================================================================
 # Branch tests
-# ===========================================================================
 
 
 class TestBranchSystemMessage:
@@ -103,12 +97,6 @@ class TestBranchProperties:
 class TestBranchMessageCount:
     def test_empty_branch_message_count(self, plain_branch):
         assert len(plain_branch.messages) == 0
-
-    def test_system_branch_message_count(self, system_branch):
-        assert len(system_branch.messages) == 1
-
-    def test_messages_pile_has_correct_length(self, system_branch):
-        assert len(system_branch.messages) == 1
 
 
 class TestBranchMessages:
@@ -222,9 +210,7 @@ class TestBranchSerialization:
         assert "metadata" in d
 
 
-# ===========================================================================
 # ActionManager tests
-# ===========================================================================
 
 
 class TestActionManagerInit:

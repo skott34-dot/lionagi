@@ -13,9 +13,7 @@ from lionagi.operations.fields import (
     get_default_field,
 )
 
-# ---------------------------------------------------------------------------
 # Instruct.handle — lines 119-137
-# ---------------------------------------------------------------------------
 
 
 class TestInstructHandle:
@@ -48,6 +46,16 @@ class TestInstructHandle:
         # None is a sentinel → excluded; original instruction is preserved
         assert result.instruction == "keep"
 
+    def test_handle_empty_overrides_are_omitted_but_false_is_explicit(self):
+        result = Instruct.handle(
+            instruct={"instruction": "keep", "reason": True},
+            instruction="",
+            reason=False,
+        )
+
+        assert result.instruction == "keep"
+        assert result.reason is False
+
     def test_handle_all_overrides_applied(self):
         """All non-sentinel overrides populate the returned Instruct."""
         result = Instruct.handle(
@@ -68,9 +76,7 @@ class TestInstructHandle:
         assert isinstance(result, Instruct)
 
 
-# ---------------------------------------------------------------------------
 # ActionRequestModel.create — lines 235-297
-# ---------------------------------------------------------------------------
 
 
 class TestActionRequestModelCreate:
@@ -148,9 +154,7 @@ class TestActionRequestModelCreate:
         assert result == []
 
 
-# ---------------------------------------------------------------------------
 # _get_default_fields listable/nullable chaining — lines 387-401
-# ---------------------------------------------------------------------------
 
 
 class TestGetDefaultFieldChaining:

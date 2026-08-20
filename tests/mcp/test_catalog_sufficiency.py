@@ -2,17 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 """The catalog has to be enough to write the call it describes.
 
-The tool tells a caller to start with ``help=true`` and says the answer is
-enough to make the common call. That promise is only kept if the entry carries
-everything the call is gated on, so these tests construct ops from the catalog
-reply and nothing else, and check that what refuses them is never the gate the
-catalog was supposed to have satisfied.
+``help=true`` promises its answer is enough to make the common call. That
+promise only holds if the entry carries everything the call is gated on, so
+these tests build ops from the catalog reply alone and check that nothing
+refuses them on a gate the catalog was supposed to have satisfied.
 
-The spawn verbs are the gated ones, and running one starts a background agent.
-So the ops here are steered into a refusal that lies *past* every gate — an
-unreadable prompt file — and the assertion is on which refusal comes back. A
-call rejected for its prompt is a call whose fingerprint was accepted, which is
-the fact under test; nothing is spawned to establish it.
+The spawn verbs are the gated ones, and running one starts a background
+agent, so the ops here are steered into a refusal that lies *past* every
+gate (an unreadable prompt file): a call rejected for its prompt is a call
+whose fingerprint was accepted, which is the fact under test -- nothing is
+actually spawned to establish it.
 """
 
 from __future__ import annotations
@@ -106,8 +105,12 @@ def test_a_positional_the_parser_will_not_enforce_is_still_reported(catalog: dic
 
 def test_the_unenforced_parameters_are_real_parameters(catalog: dict) -> None:
     """A name reported here has to be one the caller may actually pass."""
+    checked = 0
     for entry in catalog["verbs"]:
-        if not entry.get("available"):
+        # An available verb carries no "available" key; only an unavailable one
+        # says so. Reading it without the default skips every entry and leaves
+        # this test asserting nothing at all.
+        if not entry.get("available", True):
             continue
         named = entry.get("required_unenforced")
         if not named:
@@ -115,6 +118,8 @@ def test_the_unenforced_parameters_are_real_parameters(catalog: dict) -> None:
         schema = dispatch.verb_schema(dispatch.VERBS[entry["verb"]])
         for parameter in named:
             assert parameter in schema["properties"]
+            checked += 1
+    assert checked, "no unenforced parameter was checked; this test proved nothing"
 
 
 @pytest.mark.parametrize("verb", ["agent.submit", "flow.submit", "fanout.submit"])
@@ -157,7 +162,8 @@ def test_a_catalog_built_call_to_an_ordinary_read_verb_succeeds(tmp_path) -> Non
         client.initialize()
         catalog = client.request(help=True)
         entry = _entry(catalog, "job.list")
-        assert entry["required"] == []
+        # no required parameters is spelled by omitting the key
+        assert entry.get("required", []) == []
         assert "schema_fingerprint" not in entry
         result = client.op("job.list", {})
 

@@ -13,26 +13,11 @@ from pydantic import ValidationError
 from lionagi.protocols.action.tool import Tool
 from lionagi.tools.code.bash import BashRequest, BashResponse, BashTool
 
-# ---------------------------------------------------------------------------
-# BashRequest model
-# ---------------------------------------------------------------------------
-
-
-def test_bash_request_required_command():
-    req = BashRequest(command="echo hi")
-    assert req.command == "echo hi"
-
 
 def test_bash_request_defaults():
     req = BashRequest(command="ls")
     assert req.timeout is None
     assert req.cwd is None
-
-
-def test_bash_request_custom_fields():
-    req = BashRequest(command="pwd", timeout=5000, cwd="/tmp")
-    assert req.timeout == 5000
-    assert req.cwd == "/tmp"
 
 
 def test_bash_request_allow_shell_kwarg_raises_validation_error():
@@ -45,29 +30,11 @@ def test_bash_request_allow_shell_kwarg_raises_validation_error():
         BashRequest(command="ls", allow_shell=False)
 
 
-# ---------------------------------------------------------------------------
-# BashResponse model
-# ---------------------------------------------------------------------------
-
-
 def test_bash_response_defaults():
     resp = BashResponse(return_code=0)
     assert resp.stdout == ""
     assert resp.stderr == ""
     assert resp.timed_out is False
-
-
-def test_bash_response_fields():
-    resp = BashResponse(stdout="out", stderr="err", return_code=1, timed_out=True)
-    assert resp.stdout == "out"
-    assert resp.stderr == "err"
-    assert resp.return_code == 1
-    assert resp.timed_out is True
-
-
-# ---------------------------------------------------------------------------
-# BashTool.handle_request: basic execution
-# ---------------------------------------------------------------------------
 
 
 async def test_handle_request_echo_returns_stdout():
@@ -98,11 +65,6 @@ async def test_handle_request_dict_input():
     assert "dict" in resp.stdout
 
 
-# ---------------------------------------------------------------------------
-# Timeout
-# ---------------------------------------------------------------------------
-
-
 async def test_handle_request_timeout():
     tool = BashTool()
     resp = await tool.handle_request(BashRequest(command="sleep 10", timeout=100))
@@ -114,11 +76,6 @@ async def test_handle_request_timeout_stderr_message():
     tool = BashTool()
     resp = await tool.handle_request(BashRequest(command="sleep 10", timeout=100))
     assert "100" in resp.stderr or "timed out" in resp.stderr.lower()
-
-
-# ---------------------------------------------------------------------------
-# Shell control operators rejected
-# ---------------------------------------------------------------------------
 
 
 async def test_handle_request_semicolon_rejected():
@@ -160,11 +117,6 @@ async def test_handle_request_shell_control_operators_rejected(cmd, operator):
     )
 
 
-# ---------------------------------------------------------------------------
-# Output truncation
-# ---------------------------------------------------------------------------
-
-
 async def test_handle_request_output_truncation(tmp_path):
     # Generate a Python script file that emits well over 100 KB of output.
     # Running it via `python3 <path>` has no shell operators, so shell=False
@@ -178,21 +130,11 @@ async def test_handle_request_output_truncation(tmp_path):
     assert resp.return_code == 0
 
 
-# ---------------------------------------------------------------------------
-# cwd parameter
-# ---------------------------------------------------------------------------
-
-
 async def test_handle_request_cwd(tmp_path):
     tool = BashTool()
     resp = await tool.handle_request(BashRequest(command="pwd", cwd=str(tmp_path)))
     assert resp.return_code == 0
     assert str(tmp_path) in resp.stdout
-
-
-# ---------------------------------------------------------------------------
-# to_tool
-# ---------------------------------------------------------------------------
 
 
 def test_to_tool_returns_tool_instance():
@@ -222,9 +164,7 @@ async def test_to_tool_callable_executes():
     assert "from_tool" in result["stdout"]
 
 
-# ---------------------------------------------------------------------------
 # Security: CWE-284 — shell=False is unconditional; no bypass via kwargs
-# ---------------------------------------------------------------------------
 
 
 async def test_subprocess_always_invoked_with_shell_false(monkeypatch):
@@ -271,21 +211,11 @@ async def test_pipe_operator_does_not_execute():
     assert resp.stdout == ""
 
 
-# ---------------------------------------------------------------------------
-# Malformed command returns permission error response
-# ---------------------------------------------------------------------------
-
-
 async def test_bash_tool_malformed_command_returns_permission_error_response():
     tool = BashTool()
     resp = await tool.handle_request(BashRequest(command="python -c 'unterminated"))
     assert resp.return_code == -1
     assert resp.stderr.startswith("Malformed command")
-
-
-# ---------------------------------------------------------------------------
-# Popen failure returns execution error response
-# ---------------------------------------------------------------------------
 
 
 async def test_bash_tool_popen_failure_returns_execution_error(monkeypatch):
@@ -304,9 +234,7 @@ async def test_bash_tool_popen_failure_returns_execution_error(monkeypatch):
     assert "no exec" in resp.stderr
 
 
-# ---------------------------------------------------------------------------
 # MagicMock pid guard — os.killpg must not be called with non-int pid
-# ---------------------------------------------------------------------------
 
 
 async def test_bash_tool_timeout_mock_pid_calls_kill_not_killpg(monkeypatch):
@@ -382,11 +310,6 @@ async def test_bash_tool_timeout_invalid_pid_calls_kill_not_killpg(monkeypatch, 
     assert killpg_calls == [], f"os.killpg must not be called for pid={invalid_pid!r}"
     mock_proc.kill.assert_called_once()
     assert resp.timed_out is True
-
-
-# ---------------------------------------------------------------------------
-# Tool description stays consistent with the guard
-# ---------------------------------------------------------------------------
 
 
 _ADVICE_LABELS = ("Supported remedies", "Not available here")

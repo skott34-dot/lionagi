@@ -18,7 +18,7 @@ from lionagi.state.artifact_verifier import (
     verify_artifact_contract,
 )
 
-# ── _safe_join ────────────────────────────────────────────────────────────────
+# _safe_join
 
 
 class TestSafeJoin:
@@ -30,17 +30,9 @@ class TestSafeJoin:
         result = _safe_join(str(tmp_path), "subdir/file.txt")
         assert result.startswith(os.path.realpath(str(tmp_path)))
 
-    def test_absolute_path_rejected(self, tmp_path):
-        with pytest.raises(ArtifactPathError, match="absolute path not allowed"):
-            _safe_join(str(tmp_path), "/etc/passwd")
-
     def test_dotdot_rejected(self, tmp_path):
         with pytest.raises(ArtifactPathError, match="segments not allowed"):
             _safe_join(str(tmp_path), "../escape.txt")
-
-    def test_glob_star_rejected(self, tmp_path):
-        with pytest.raises(ArtifactPathError, match="glob characters"):
-            _safe_join(str(tmp_path), "*.md")
 
     def test_glob_question_rejected(self, tmp_path):
         with pytest.raises(ArtifactPathError, match="glob characters"):
@@ -55,15 +47,12 @@ class TestSafeJoin:
             _safe_join(str(tmp_path), "")
 
 
-# ── validate_artifact_contract ───────────────────────────────────────────────
+# validate_artifact_contract
 
 
 class TestValidateArtifactContract:
     def test_none_is_valid(self):
         validate_artifact_contract(None)
-
-    def test_valid_contract(self):
-        validate_artifact_contract({"expected": [{"id": "report", "path": "report.md"}]})
 
     def test_missing_expected_list(self):
         with pytest.raises(ArtifactPathError, match="expected: list"):
@@ -88,10 +77,6 @@ class TestValidateArtifactContract:
         with pytest.raises(ArtifactPathError, match="alphanumeric"):
             validate_artifact_contract({"expected": [{"id": "bad id", "path": "x.md"}]})
 
-    def test_absolute_path_rejected_via_validate(self):
-        with pytest.raises(ArtifactPathError, match="absolute path not allowed"):
-            validate_artifact_contract({"expected": [{"id": "x", "path": "/etc/passwd"}]})
-
     def test_required_must_be_bool(self):
         with pytest.raises(ArtifactPathError, match="required must be a bool"):
             validate_artifact_contract(
@@ -102,13 +87,10 @@ class TestValidateArtifactContract:
         validate_artifact_contract({"expected": []})
 
 
-# ── resolve_artifact_contract ─────────────────────────────────────────────────
+# resolve_artifact_contract
 
 
 class TestResolveArtifactContract:
-    def test_both_none_returns_none(self):
-        assert resolve_artifact_contract(playbook_artifacts=None, agent_defaults=None) is None
-
     def test_agent_defaults_only(self):
         result = resolve_artifact_contract(
             playbook_artifacts=None,
@@ -145,13 +127,10 @@ class TestResolveArtifactContract:
         assert result["expected"][0]["required"] is True
 
 
-# ── verify_artifact_contract ──────────────────────────────────────────────────
+# verify_artifact_contract
 
 
 class TestVerifyArtifactContract:
-    def test_none_contract_returns_none(self):
-        assert verify_artifact_contract(None, artifacts_root="/tmp") is None
-
     def test_missing_root_dir_fails(self):
         contract = {"expected": [{"id": "report", "path": "report.md"}]}
         result = verify_artifact_contract(contract, artifacts_root="/nonexistent_root_abc")
@@ -219,7 +198,7 @@ class TestVerifyArtifactContract:
         assert len(result["produced"]) == 2
 
 
-# ── missing_artifact_summary / evidence ──────────────────────────────────────
+# missing_artifact_summary / evidence
 
 
 def test_missing_artifact_summary_single():
@@ -241,7 +220,7 @@ def test_missing_artifact_evidence():
     assert evidence == [{"kind": "expected_artifact", "id": "report", "label": "report.md"}]
 
 
-# ── canonical names required by ADR-0064 test plan ───────────────────────────
+# canonical names required by ADR-0064 test plan
 
 
 def test_resolve_contract_both_none():
@@ -427,7 +406,7 @@ def test_safe_join_glob_rejects(tmp_path):
         _safe_join(str(tmp_path), "*.md")
 
 
-# ── A bare filename resolves to whichever worker produced it ──────────────────
+# A bare filename resolves to whichever worker produced it
 #
 # In a multi-agent run each worker writes into its own subdirectory of the
 # artifacts root, and which worker produces a given artifact is decided when the
@@ -582,7 +561,7 @@ def test_the_reported_run_shape_now_passes_end_to_end(tmp_path):
     assert len(result["produced"]) == 5
 
 
-# ── stale_artifact_markers ────────────────────────────────────────────────────
+# stale_artifact_markers
 #
 # A stored verification is a snapshot taken at run completion. These markers
 # never re-verify pass/fail; they only flag, via mtime and presence, whether

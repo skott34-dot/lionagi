@@ -200,14 +200,14 @@ export function resolveAuthToken(): string | undefined {
 async function fetchJson<T>(path: string, init?: RequestInit): Promise<T>;
 
 function sseSubscribe(
-  path: string,
+  path: string | (() => string),
   onData: (data: string) => void,
 ): () => void;
 ```
 
 `fetchJson()` attaches `Authorization: Bearer <token>` when the token exists and otherwise
-preserves caller headers. Mutation helpers explicitly set `Content-Type: application/json`
-and stringify their bodies, matching ADR-0076's body guard.
+preserves caller headers. It centrally defaults every unsafe method to
+`Content-Type: application/json`, including bodyless actions, matching ADR-0076's guard.
 
 The SSE helper uses `fetch` plus `ReadableStream`, not native `EventSource`. Exact semantics:
 
@@ -215,10 +215,12 @@ The SSE helper uses `fetch` plus `ReadableStream`, not native `EventSource`. Exa
 - It parses unnamed frames separated by `\n\n`, joins multiple `data:` lines, and passes
   the payload string to the endpoint-specific consumer.
 - The returned closer sets a closed flag and aborts the request.
-- EOF or network error reconnects after 2,000 ms unless closed.
+- EOF, network error, 5xx, 408, 425, or 429 reconnects after 2,000 ms unless closed.
+- Permanent 4xx responses close the subscription instead of retrying for the page lifetime.
 - The endpoint consumer is responsible for JSON parsing and closing on its `done` frame.
 - Parser errors thrown by the consumer are not converted into a durable cursor or replay.
 - There is no `Last-Event-ID`; reconnect starts according to the endpoint's server contract.
+  The signal endpoint advances an `after_seq` query cursor after each delivered signal.
 
 The two-second reconnect delay is a shipped inherited value. Its qualitative purpose is to
 avoid a tight retry loop while keeping local recovery responsive; no recorded measurement
@@ -329,6 +331,9 @@ Exact semantics:
 | 2 | Add shared daemon-contract tests for the web and VS Code clients covering response shapes, auth, trailing-slash redirects, and SSE parsing/reconnection. | M | (filled at issue-open time) |
 | 3 | Reduce retired route files to redirect-only adapters after Fleet, History, Library, Schedules, and System have parity; remove duplicated entity-page behavior. | L | (filled at issue-open time) |
 | 4 | Define cache invalidation and freshness behavior for operational screens before adding a server-state library; acceptance must show one status change propagating consistently to every visible consumer. | M | (filled at issue-open time) |
+| 5 | Define one bounded operational-data contract for list and history surfaces, including Operator history, run evidence/signals, Library catalogs, schedule firing history, and team messages: server-owned opaque cursors, explicit `windowed`/`has_next`/truncation metadata, tail-first initial load where recent state is primary, abortable selection changes, and windowed or virtualized rendering; acceptance: a 100,000-event run and a 10,000-item catalog trigger neither an unbounded fetch loop nor an unbounded DOM, while URL-addressable selection remains stable. | L | (filled at issue-open time) |
+| 6 | Define live-data freshness ownership for Fleet, Mission Control, and Run Detail: a coherent server-derived active snapshot or delta feed, healthy-stream suppression of redundant polling, bounded reconnect/backoff, and one terminal resynchronization; acceptance: healthy SSE performs no sub-second detail polling, truncation is explicit, and one status transition reaches every visible consumer without contradictory states. | L | (filled at issue-open time) |
+| 7 | Write and accept a Studio desktop WebView trust-boundary contract, then replace page-global privilege with a restrictive CSP, disabled global Tauri APIs unless explicitly justified, and a scoped bridge that does not expose a reusable daemon bearer token to page JavaScript; acceptance: unapproved script is blocked, ordinary page code cannot exfiltrate the bearer or reach unrelated native APIs, the renderer-compromise boundary is documented honestly, and JSON/SSE authentication still works. | M | (filled at issue-open time) |
 
 ## Alternatives considered
 

@@ -1,12 +1,11 @@
 # Copyright (c) 2023-2026, HaiyangLi <quantocean.li at gmail dot com>
 # SPDX-License-Identifier: Apache-2.0
 
-"""ADR-0071 D3: the admit() seam wired into the worker claim loop.
+"""ADR-0071: the admit() seam wired into the worker claim loop.
 
-Covers the convoy-incident regression (N jobs behind one holder, the
-(N+1)th over the waiter cap is rejected, not silently queued) and the
-requirement that a claim-time terminal rejection surfaces
-observably: the row lands on a terminal status carrying the reason, and a
+N jobs behind one holder: the (N+1)th over the waiter cap must be rejected,
+not silently queued, and a claim-time terminal rejection must surface
+observably -- the row lands on a terminal status carrying the reason, and a
 notify-carrying submission produces a dispatch_outbox row. Direct
 admit()-in-isolation unit tests live in test_admit.py.
 """
@@ -112,7 +111,7 @@ async def _reason_history(db: StateDB, run_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
-# ── 1. Convoy-shape regression ───────────────────────────────────────────
+# Convoy-shape regression
 
 
 async def test_convoy_third_waiter_over_cap_is_rejected_not_queued(db: StateDB) -> None:
@@ -229,7 +228,7 @@ async def test_duration_invalid_waiter_does_not_consume_cap_after_affinity_sort(
     assert (await _status_of(db, valid_id))["status"] == "queued"
 
 
-# ── 2. Claim-time rejection surfaces observably ──────────────────────────
+# Claim-time rejection surfaces observably
 
 
 async def test_claim_time_rejection_persists_reason_on_the_row(db: StateDB) -> None:
@@ -270,7 +269,7 @@ async def test_notify_carrying_submission_produces_outbox_row_on_claim_time_reje
         db,
         args={
             "admission": {
-                "notify": {"deliver_to": "lambda:leo", "dedup_key": "convoy-test-dedup"},
+                "notify": {"deliver_to": "notify-target", "dedup_key": "convoy-test-dedup"},
             }
         },
     )
@@ -289,7 +288,7 @@ async def test_notify_carrying_submission_produces_outbox_row_on_claim_time_reje
     matching = [d for d in dispatches if d["schedule_run_id"] == rejected_id]
     assert len(matching) == 1
     dispatch = matching[0]
-    assert dispatch["deliver_to"] == "lambda:leo"
+    assert dispatch["deliver_to"] == "notify-target"
     assert dispatch["kind"] == "terminal_notify"
     assert dispatch["dedup_key"] == "convoy-test-dedup"
     payload = dispatch["payload"]
@@ -351,7 +350,7 @@ async def test_notify_carrying_submission_produces_outbox_row_on_duration_guard_
         action_args={
             "admission": {
                 "max_duration_seconds": 99999,
-                "notify": {"deliver_to": "lambda:leo", "dedup_key": "duration-guard-dedup"},
+                "notify": {"deliver_to": "notify-target", "dedup_key": "duration-guard-dedup"},
             }
         },
     )
@@ -366,7 +365,7 @@ async def test_notify_carrying_submission_produces_outbox_row_on_duration_guard_
     matching = [d for d in dispatches if d["schedule_run_id"] == run_id]
     assert len(matching) == 1
     dispatch = matching[0]
-    assert dispatch["deliver_to"] == "lambda:leo"
+    assert dispatch["deliver_to"] == "notify-target"
     assert dispatch["kind"] == "terminal_notify"
     assert dispatch["dedup_key"] == "duration-guard-dedup"
     payload = dispatch["payload"]
@@ -428,7 +427,7 @@ async def test_enqueue_dispatch_failure_does_not_abort_claim_pass(
         action_args={
             "admission": {
                 "max_duration_seconds": 99999,
-                "notify": {"deliver_to": "lambda:leo"},
+                "notify": {"deliver_to": "notify-target"},
             }
         },
     )

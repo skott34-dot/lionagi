@@ -86,12 +86,14 @@ export interface RunSummary {
   show_play_name?: string | null;
   source_kind?: string;
   status: string;
-  // ADR-0024: derived health indicator computed at read time.
+  // ADR-0057: running-process health computed at read time. This is null for
+  // terminal rows; status + reason fields are the execution outcome.
   // - healthy / idle: alive and active (or quietly waiting).
   // - unresponsive: alive but past kind-aware threshold.
   // - stale: process dead, has produced output.
   // - orphaned: process dead, no output, no artifacts.
-  // - zombie: terminal status, but resources leaked (stale locks).
+  // - zombie: process/resource cleanup needs attention when supplied by a
+  //   health-specific surface (the runs projection currently has no lock signal).
   effective_health?: "healthy" | "idle" | "unresponsive" | "stale" | "orphaned" | "zombie" | null;
   last_message_at?: number | null;
   // ADR-0020: optional parent skill orchestration id (from `li invoke`).
@@ -138,6 +140,12 @@ export interface RunMessage {
   output?: string;
   status?: string;
   exit_code?: number | null;
+  /**
+   * The server refused this row's payload for being past its size ceiling. The
+   * turn still happened, so the row is kept and rendered as unread rather than
+   * dropped, blank, or serialized from the empty object left behind.
+   */
+  withheld?: boolean;
 }
 
 export interface RunStep {
@@ -146,34 +154,6 @@ export interface RunStep {
   result?: Record<string, unknown>;
   messages?: RunMessage[];
   timestamp: number | null;
-}
-
-// RunDetail comes from the filesystem run.json path (GET /api/runs/{id} →
-// services/runs.py get_run → _adapt_summary). Unlike RunSummary which maps
-// SQLite session rows, RunDetail reads the on-disk run manifest. The manifest
-// uses "worker_name" and "finished_at" as canonical field names (see
-// _adapt_summary in services/runs.py). ADR-0004 open design question:
-// long-term these should unify with the SQLite session fields.
-export interface RunDetail {
-  run_id: string;
-  state_root: string;
-  artifact_root: string;
-  // Filesystem run.json fields — distinct from SQLite session schema
-  worker_name?: string;
-  task?: string;
-  status: string;
-  error: string | null;
-  cwd: string | null;
-  started_at: number | null;
-  finished_at?: number | null;
-  ended_at?: number | null;
-  steps?: RunStep[];
-  graph: { nodes: WorkerStepNode[]; edges: WorkerLinkEdge[] };
-  manifest: Record<string, unknown>;
-  branches: unknown[];
-  // ADR-0029: artifact contract and verification result.
-  artifact_contract_json?: ArtifactContract | null;
-  artifact_verification_json?: ArtifactVerification | null;
 }
 
 // The checkpoint-replay kinds (play/flow/show-play) send neither
@@ -350,6 +330,8 @@ export interface AgentProfile {
   mode?: string;
   protected?: boolean;
   is_default?: boolean;
+  /** Hook assembly: named library hooks bound to provider-neutral events. */
+  hooks?: Array<{ hook: string; event: string; matcher?: string }>;
 }
 
 // ─── Model config ─────────────────────────────────────────────────────────────
@@ -431,13 +413,12 @@ export interface ScheduleSummary {
   poll_interval_sec: number | null;
   action_kind: "agent" | "flow" | "fanout" | "play";
   action_model: string | null;
-  action_prompt: string | null;
   action_agent: string | null;
   action_playbook: string | null;
   action_project: string | null;
-  on_success: Record<string, unknown> | null;
-  on_fail: Record<string, unknown> | null;
   last_fired_at: number | null;
+  /** Completed threshold checks, including checks that did not breach. */
+  last_evaluated_at?: number | null;
   next_fire_at: number | null;
   missed_fire_policy: string;
   overlap_policy: string;
@@ -445,8 +426,8 @@ export interface ScheduleSummary {
   github_filter?: { event?: string; base?: string; state?: string } | null;
   consecutive_failures?: number;
   last_status?: string | null;
-  /** Server-computed verdict from cadence + recorded schedule_runs, never
-   * from next_fire_at (a promise, not evidence). */
+  /** Server-computed verdict from cadence + execution/evaluation evidence,
+   * never from next_fire_at (a promise, not evidence). */
   health_state?: "healthy" | "failing" | "overdue" | "never-fired" | "no-evidence" | "disabled";
   health_last_outcome?: string | null;
   health_last_outcome_at?: number | null;
@@ -455,11 +436,22 @@ export interface ScheduleSummary {
   updated_at: number;
 }
 
+/** The reconciled failure reason for one run, and which layer reported it. */
+export interface RunOutcome {
+  code: number | null;
+  summary: string;
+  source: "session" | "invocation" | "occurrence" | "fallback";
+  /** False when `summary` is a status word this service generated rather than a
+   * reason a layer reported. */
+  summary_reported: boolean;
+}
+
+/** One run as the single-run route serves it. Wider than the slice row by the raw
+ * failure text; the trigger payload that produced the run is not served at all. */
 export interface ScheduleRunSummary {
   id: string;
   schedule_id: string;
   invocation_id: string | null;
-  trigger_context: Record<string, unknown>;
   action_kind: string;
   status: "running" | "completed" | "failed" | "skipped" | "cancelled";
   exit_code: number | null;
@@ -467,10 +459,35 @@ export interface ScheduleRunSummary {
   fired_at: number;
   ended_at: number | null;
   error_detail: string | null;
+  outcome?: RunOutcome | null;
+}
+
+/**
+ * A run as the /schedules/summary slice serves it. Narrower than ScheduleRunSummary on
+ * purpose: the summary surface carries no error_detail, only a translatable
+ * classification of the failure.
+ */
+export interface ScheduleRunSliceRow {
+  id: string;
+  schedule_id: string;
+  invocation_id: string | null;
+  action_kind: string;
+  status: "running" | "completed" | "failed" | "skipped" | "cancelled";
+  exit_code: number | null;
+  chain_depth: number;
+  fired_at: number;
+  ended_at: number | null;
+  error_class: string | null;
 }
 
 export interface ScheduleDetail extends ScheduleSummary {
-  recent_runs: ScheduleRunSummary[];
+  // Served by the single-schedule route only. The list surfaces withhold them:
+  // operator-authored prompt text and arbitrary policy objects that nothing
+  // rendering a list reads, only the edit form, which loads one schedule.
+  action_prompt: string | null;
+  on_success: Record<string, unknown> | null;
+  on_fail: Record<string, unknown> | null;
+  recent_runs: ScheduleRunSliceRow[];
 }
 
 // ─── Operator conversation protocol (ADR-0083 v1) ──────────────────────────
@@ -599,6 +616,11 @@ export interface OperatorResourceVersion {
 
 export interface OperatorCommandProposal {
   id: string;
+  /** What the command would do, e.g. "cancel" or "rename_session". Optional
+   * because a client may still be talking to a server that predates the frame
+   * carrying it; a caller checking a proposal against its own request must
+   * treat the absent case as unverifiable rather than as a match. */
+  commandType?: string;
   command: Record<string, unknown>;
   commandHash: string;
   risk: "mutate" | "execute" | "admin";

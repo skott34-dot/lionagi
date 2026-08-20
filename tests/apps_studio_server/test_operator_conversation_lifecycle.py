@@ -56,7 +56,7 @@ def _patch_state_db(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
     monkeypatch.setattr(runs_mod, "RUNS_ROOT", path.parent / "runs")
 
 
-# ─── Rename ──────────────────────────────────────────────────────────────
+# Rename
 
 
 @pytest.mark.asyncio
@@ -154,7 +154,7 @@ async def test_a_null_pinned_or_status_is_rejected_rather_than_acted_on(tmp_path
     await coordinator.shutdown()
 
 
-# ─── Organize: pin + archive ────────────────────────────────────────────
+# Organize: pin + archive
 
 
 @pytest.mark.asyncio
@@ -209,7 +209,7 @@ async def test_archiving_a_conversation_with_an_active_turn_conflicts(tmp_path, 
     await coordinator.shutdown()
 
 
-# ─── Fork ────────────────────────────────────────────────────────────────
+# Fork
 
 
 @pytest.mark.asyncio
@@ -368,7 +368,7 @@ async def test_forking_a_conversation_that_does_not_exist_raises_not_found(tmp_p
         await store.fork_conversation("does-not-exist")
 
 
-# ─── HTTP contract ──────────────────────────────────────────────────────
+# HTTP contract
 
 
 @pytest.mark.asyncio
@@ -426,13 +426,13 @@ async def test_http_patch_and_fork_routes(tmp_path, monkeypatch):
         assert submitted.status_code == 202
         await _wait_done(coordinator.store, cid)
 
-        forked = await client.post(f"/api/operator/conversations/{cid}/fork")
+        forked = await client.post(f"/api/operator/conversations/{cid}/fork", json={})
         assert forked.status_code == 201
         body = forked.json()
         assert body["conversation"]["id"] != cid
         assert body["conversation"]["title"] == "renamed via http (fork)"
         assert len(body["frames"]) > 0
 
-        fork_missing = await client.post("/api/operator/conversations/does-not-exist/fork")
+        fork_missing = await client.post("/api/operator/conversations/does-not-exist/fork", json={})
         assert fork_missing.status_code == 404
     await coordinator.shutdown()

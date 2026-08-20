@@ -6,6 +6,291 @@ Format follows [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Changed
+
+- `Params`, `Meta`, and `Spec` now compare through one exact-type structural projection instead of
+  generated dataclass equality, string fallback hashes, or hash-as-equality. Mutable nested
+  dict/list/set values remain structurally comparable but now raise
+  `UnhashableStructuralValueError` when hashed, preventing shallow-frozen objects from corrupting
+  set/dict membership after nested mutation. All production `Params` declarations explicitly use
+  the base `eq=False` authority. Field-layout, sentinel-policy/singleton, shared `Spec`/`FieldModel`
+  annotation, and Pydantic model caches now key classes by identity, distinguish typed values such
+  as `True` and `1`, preserve immutable `pathlib`/UUID value semantics, and bypass mutable or
+  receiver-bound metadata. Unsupported objects use identity semantics instead of trusting
+  arbitrary user equality/hash implementations. The two former 10,000-entry
+  annotation caches are one shared 10,000-entry cache under the same environment setting; a
+  separate stable-declaration projection cache is bounded by
+  `LIONAGI_STRUCTURAL_CACHE_SIZE` (10,000 by default) and, because each entry copies the projected
+  primitives in, by a summed projected-size ceiling `LIONAGI_STRUCTURAL_CACHE_VALUE_LIMIT` (8,192
+  by default) measured on the ordering token, above which a value is not retained but stays
+  comparable and hashable. A callable's token is its identity, which that ceiling cannot price, so
+  identity keys hold their target weakly wherever the runtime allows a weak reference: a cached key
+  cannot outlive the function, class, or declaration it stands for. The one instance that cannot be
+  keyed weakly is a frozen dataclass declared with `slots=True`, so those are admitted to the
+  declaration-projection cache only when every callable they reference is already reachable under
+  its own name, which keeps closures, lambdas, and `type()` results from being held by a cache
+  entry. Integers are projected as width-minimal two's complement instead of decimal digits,
+  so an integer wider than the interpreter's integer-to-string limit compares and hashes rather than
+  raising `ValueError`. Mappings other
+  than an exact `dict` are opaque and compare by identity, matching the existing treatment of
+  `tuple`, `frozenset`, `pathlib`, and UUID subclasses, since a `Mapping` implementation may carry
+  state that `items()` does not expose.
+- Lightweight `Params`, `DataClass`, `Role`, and `InstructionContent` projections now accept a
+  keyword-only `mode="json"` while preserving positional `exclude` and the existing shallow
+  Python-mode output. JSON mode delegates nested LionAGI/Pydantic/dataclass values to the internal
+  serializer, preserves explicit null and falsey values, and rejects unresolved sentinels in raw
+  containers, non-finite numbers, and unversioned bytes instead of coercing them to null or text.
+  `Spec()` now records an omitted base type as `Undefined`; explicit `Spec(None)` is rejected, while
+  the legacy `FieldModel(annotation=None)` adapter normalizes its input to `Unset` before creating a
+  `Spec`. Callers that previously handed an unresolved lightweight dataclass directly to
+  `json_dumps()` must use its owner projection first (`to_dict(mode="json")`); raw dataclass
+  traversal cannot omit a field and now fails rather than encoding absence as null. Resolved
+  Python types and callable metadata also remain fail-closed until a target adapter or versioned
+  snapshot reference supplies their wire identity.
+- ADR-0070 now records the shipped one-shot `at` schedule trigger alongside
+  `cron`, `interval`, and `github_poll`; a schema-parity guard keeps that
+  persisted vocabulary and the documented trigger set aligned. It also records
+  a gap it previously claimed was closed: `max_runs = 1` only guards a re-apply
+  once the single fire has run, so an `at` schedule whose fire was skipped as
+  missed can be resurrected by a later edit or re-enable.
+- Public-surface differential capture now crosses one shared clock boundary for
+  the full CLI case batch, and terminal-callback offload tests release their
+  worker explicitly instead of leaving a 30-second sleeper behind.
+- ADR-0120 Phase 0 now freezes the distinct HookBus, Broadcaster,
+  SessionObserver, message-callback, scheduler-signal, and terminal-callback
+  dispatch profiles before any shared-kernel migration. Service-hook invocation
+  and streaming are characterized alongside them, but that profile's matrix is
+  frozen in Phase 1, not here.
+- Sentinel identity is now three-state by default: the public `is_sentinel` and
+  `not_sentinel` helpers reject legacy `None`/empty collapse flags, and
+  `Params`/`DataClass` subclasses may enable those flags only through the
+  closed ADR-0119 compatibility inventory. Existing built-in compatibility
+  adapters keep their prior omission behavior. Third-party callers that set
+  either flag must replace it with an explicit domain adapter.
+- The lifecycle contract suite now pins the complete seven-entity transition
+  matrix independently of the production registry: every allowed edge, every
+  terminal status, dispatch recovery constraints, and the selected
+  same-status reason refresh have executable regression coverage.
+- Resuming a flow whose checkpoint recorded any operation as failed now refuses
+  and names those operations, instead of replaying them as terminal state.
+  Replaying a failed operation as terminal marks it failed without running it,
+  so the executor skipped it and everything downstream, and the resume finished
+  nothing. `--retry-failed` on `li o flow` (and `retry_failed` on the Studio
+  resume request and the Operator `resume_run` command) runs them again; it is
+  an opt-in because re-running re-executes whatever side effects the first
+  attempt already had. Reactive children recorded under a re-running operation
+  are dropped so the new attempt derives its own.
+- The notify hook's delivery timeout is derived from the handler budget, so a
+  delivery now fits inside the deadline that would otherwise terminate it.
+- A delivery stopped part way reports `notify_delivery_state` as `unknown`
+  rather than `failed`. Whether the notice already went out is exactly what
+  such a delivery cannot say, and `failed` tells a caller to send it again.
+  The value appears on every job listing row, so callers switching on
+  `failed` should handle `unknown` as well.
+- Delivery descendants are terminated through the shared process-group helper
+  on POSIX. Cross-platform descendant containment remains out of scope and is
+  tracked in #2576.
+
+### Fixed
+
+- The studio scheduler's tick loop is now supervised rather than merely guarded. It caught
+  `Exception`, which does not include `asyncio.CancelledError`, so a cancel escaping from anything
+  the tick awaited ended the loop permanently while the process and its HTTP surface kept
+  answering; startup recovery ran outside the guard, so one failing pass took the loop with it; and
+  the inter-tick sleep was unguarded. Only `stop()` ends the loop now: a cancel arriving at any
+  other time is absorbed in place, a failing recovery pass is logged and skipped, and any exit that
+  is not a stop restarts the loop on a bounded backoff with the reason and a restart count recorded
+  on the engine. Startup recovery absorbs a non-stop cancel the same way, so one cancelled pass no
+  longer costs the passes after it, and the inter-tick wait is measured against its own deadline so
+  a stream of cancels cannot drive the tick in a tight loop or skip the delay on the error path. A
+  cancel aimed at the loop itself no longer tears a recovery pass in half either: the pass in
+  flight is allowed to finish, because a pass interrupted after it has finalized a schedule_run has
+  no successor to complete the job, every later scan selecting rows that are still running. A stop
+  still interrupts it, since a shutdown that cannot interrupt recovery is one that hangs.
+- A GitHub-triggered schedule permanently lost the second of two events sharing a cursor
+  timestamp. The scheduler advances `github_cursor` per dispatched event, writing that event's
+  raw timestamp, and the poller drops anything at or below the stored value, so two pull
+  requests updated in the same second were indistinguishable to the filter and the one that
+  had not dispatched yet was dropped on every later poll. GitHub timestamps have one-second
+  resolution and a merge queue lands batches inside one, so this needed no race, only a single
+  interruption between the two dispatches. The cursor now carries the pull request's number
+  after its timestamp and is compared as a pair, and merged-mode paging goes on past a page
+  whose oldest item sits in the cursor's own second. A cursor stored before this change still
+  claims its whole second, so an upgrade re-dispatches nothing. The schedule PATCH validator
+  accepts the same grammar, imported from the poller rather than restated: it previously
+  spelled a form the engine had stopped writing, so the system persisted a cursor its own API
+  then refused, and an operator replaying a stored value got an error on the scheduler's own
+  output.
+  The number's width caps the writer as well as padding it. Lexical order matches numeric order
+  only at a fixed width, so a pull request number too large to fit the padding cannot be placed
+  within its second and is clamped instead of widening the value, which would have written a
+  cursor the same validator refuses.
+  The comparison that decides whether an event is already past the stored cursor clamps through
+  the same helper as the writer. A value one of them capped and the other did not would never
+  compare as past the cursor written for it, so the event would be offered again on every poll.
+- The schedule list surfaces no longer carry record content. They served every column of the
+  schedule row, including the command a schedule runs and its arguments, its authored spec, its
+  notify command and owner key, and they served `trigger_context`, which holds whole external
+  event payloads, and `error_detail`, which holds subprocess stderr and exception text, on an API
+  that answers without a token when `LIONAGI_STUDIO_AUTH_TOKEN` is unset. Each surface now serves
+  a named set of fields, so a column added later stays private until someone names it. The
+  schedule's prompt text and its success and failure policies are served by the single-schedule
+  route, which the edit form reads, and by no list surface. A failed run is described by
+  `error_class`, a translatable classification the client renders; a failure the server cannot
+  classify is reported as such rather than by falling back to the last line of its traceback.
+  Reconciled outcomes are classified whichever layer reported them, since a run's outcome summary
+  can come from its session, its invocation or the occurrence row, and the first two take
+  precedence over the third. `error_class` describes that same winning layer, on every surface
+  that serves a run including the slice nested in a schedule record, so it can no longer name a
+  different failure than the summary printed beside it. The full text stays available through the
+  run detail view, which reads a different endpoint and asks for it explicitly.
+- The rule keeping a declaration-projection cache entry from outliving what it references now
+  reaches through wrappers. It was applied to a callable a declaration held directly, but a
+  projection that rebuilt its key from a child value forwarded every other projected field and
+  dropped that one, so a closure, lambda, or `type()` result behind an `Enum` member value was
+  admitted and held alive by the entry. Mapping values, Pydantic model fields, and msgspec
+  struct fields rebuilt their keys the same way and now carry the flag as well.
+- The shared annotation and model caches now decline to key a declaration whose projection
+  reports that it holds a callable nothing else keeps alive under a name. Keying on the
+  projection rather than the instance does not bound those two on its own, because each entry
+  holds a built annotation or model that refers to the declaration's callables: the entry's own
+  value keeps its weak key resolvable, so a closure validator or a dynamically created type
+  stayed reachable through the cache after the name it was declared under was withdrawn, along
+  with whatever it captured. Such declarations are now rebuilt on each use instead of cached.
+
+- Two studio schedulers running against one database could each dispatch the same occurrence.
+  The tick selects due schedules and fires them in separate statements, and every admission gate
+  between the two lives in the firing process's own memory, so both processes committed, each with
+  its own run id and each launching a child. The occurrence write now claims the cursor it was
+  selected on: the advance runs first with a compare-and-swap on `next_fire_at`, the occurrence is
+  written only if the claim holds, and the scheduler that loses it writes nothing and cancels its
+  own invocation with a reason naming what happened. The same claim refuses a fire whose cursor an
+  operator moved between selection and dispatch. Fires that do not stand for a due instant, such as
+  chain children and manual triggers, say so explicitly and keep the guarantees they already had.
+  A GitHub poll batch claims `github_cursor` per event rather than `next_fire_at`, because every
+  event of one batch resolves to the same `next_fire_at` and a claim on an unchanging value matches
+  twice; `github_cursor` advances per event and is what separates them, so a second scheduler that
+  polls after this one commits an earlier event can no longer dispatch a later one twice.
+- `Params` subclasses now receive their declared dataclass defaults, including a fresh value
+  from each `default_factory`, instead of replacing every omitted field with `Unset`. `Params`
+  and `DataClass` now discover inherited instance fields through one ordered dataclass path,
+  exclude `ClassVar` declarations, expose immutable `allowed()` membership views, and preserve
+  `Unset`/explicit-null in-memory state across `with_updates()` instead of round-tripping it
+  through the omission-oriented wire projection.
+- `Operable` selection and legacy `OperableModel` materialization now retain declaration order
+  for every supported membership collection and across hash seeds. Multiple unnamed `Spec`
+  values no longer collide; concrete duplicate names still fail, and name-required Pydantic
+  materialization now rejects unnamed fields instead of silently dropping them. Legacy
+  `FieldModel` materialization uses the owning field key rather than emitting a second field.
+  An explicit empty `include` or `use_fields` collection now selects no fields, unknown
+  exclusions fail instead of being ignored, and `Operable.allowed()` returns an immutable
+  membership view.
+- Writable StateDB migration now fails closed when a table's columns cannot be
+  inspected, preserving the prior schema-version stamp instead of recording an
+  upgrade whose additive column reconciliation did not complete.
+- The single-run route `GET /api/schedules/runs/{run_id}` now serves an allow-list
+  instead of the joined row. It was the last schedule surface returning every column
+  the join carries, including the action arguments, resume packets, lease holders and
+  capability references the list surfaces already withhold, and its nested chain
+  children carried the same columns again. The raw failure text stays: reaching it is
+  the reason this route exists. The trigger payload that produced the run is no longer
+  served at all, and is dropped from the client's declared run type, since nothing read
+  it and it carries whole external event bodies.
+
+### Deprecated
+
+- `--resume-on-timeout` on `li o fanout` and `li o flow`. The flag is accepted
+  and listed in the help output of both commands but neither ever read it, so
+  passing it changes nothing. Both commands now say so at parse time instead of
+  accepting it silently, and will keep accepting it until it is removed in a
+  later release. It remains available and functional on `li agent`, which is
+  the surface that implements it.
+
+### Removed
+
+- `trigger_context` from every run object the schedule surfaces serve, and from the
+  run type the web client declares. It held the whole external event body that
+  produced a run, no client read it, and the single-run route was the last surface
+  still sending it.
+
+## [0.35.0] - 2026-08-12
+
+A broad correctness release across the orchestration engine, the MCP surface,
+CLI providers, and Studio, plus the first Rust workspace in the tree.
+
+### Added
+
+- The run detail page opens on its execution graph, the canvas shows live
+  per-node activity, and nodes are drawn at the ranks the rank function
+  assigns.
+- Run details show total token usage (input and output) for agents and
+  orchestrations.
+- Team coordination verbs are exposed over MCP.
+- Operator: fleet inspection and a run-detail read tool, with the execution
+  root resolved once at startup from a shipped default.
+- The Rust tree opens: a `lionrs` workspace importing lion-core 0.4.0, with
+  workspace checks gated in CI.
+- CLI runs record what an agent did, bounded and without quoting it.
+- Fleet's live list separates orchestrations from single agents.
+
+### Fixed
+
+- Orchestration engine: a failed fanout leg reads as a failure at every
+  surface; refused reactive spawns are surfaced and zero spawn capacity is
+  honored; escalation retries get unique references; assignment-shaped
+  synthesis is rejected; planner assignment contracts are delivered to
+  workers; emission repair failures are isolated to the op that failed; a
+  resumed run no longer reports a permanently-failed op as completed; a
+  gate-skipped node is announced as skipped, not failed; op budgets are sized
+  by sequential depth and dated from when their timeout starts.
+- MCP: detached agents are grounded against undeliverable notification waits
+  instead of waiting forever; declared and effective server sets are
+  distinguished; unselected servers are rejected before connection; terminal
+  notification attempt state is retained; degraded persistence carries its
+  reason.
+- Prompt admission: agent and scheduled prompts are bounded by the shared
+  character cap — inline, from files (reads capped at the bound), and after
+  schedule template rendering — with the cap disclosed in the MCP schema.
+- Codex CLI provider: emits `--sandbox workspace-write` in place of the
+  removed `--full-auto` flag, preserves approval modes via config, and grants
+  linked worktree git stores.
+- Agent runtime: MCP reachability is reported accurately, zero-rate peers no
+  longer skew heartbeat stall thresholds, and routing-pack role models are
+  honored.
+- Studio: Operator run targeting, terminal DAG reconciliation, and extra MCP
+  grants; terminal runs no longer show a `healthy` badge; runs without a
+  project can be renamed and cancelled, and an exact run id passes the
+  project fence; cron schedules report an overdue health state; branch
+  duration is measured from lifecycle timestamps; the playbook editor
+  preserves canonical fields it does not edit; engine-definition writes
+  reject unsupported stage overrides with a 422 instead of silently dropping
+  them; the dev proxy routes to the backend the CLI selected; a schedule
+  request that times out is reported as a timeout with unknown completion,
+  never as an unreachable daemon.
+- CLI: `li kill` confirms process identity before signalling, playbook specs
+  are validated before job creation (unknown fields rejected, real fields
+  accepted), and the daemon check reads the readiness endpoint so a serving
+  daemon stops reading as down.
+- Service layer: a vendor model id ending in an effort word is kept whole,
+  and the Opus line accepts `xhigh` instead of silently downgrading it.
+- State: mirrored provider refusals are recorded as failed, and an imported
+  session's role field no longer receives an engine label.
+- Protocols: Progression's permutation mutators are synchronized.
+- ReAct: the first analysis round receives the branch's tools.
+
+### Security
+
+- Raised the `gitpython` floor to 3.1.58.
+- The Operator no longer leaks credentials spelled with separators, and both
+  redaction layers read a field name the same way.
+
+### Changed
+
+- Inline prose across the tree was trimmed to working density, with rationale
+  relocated to `docs/internals/`.
+- Orchestration documentation explains playbooks, plans, and operations as
+  three distinct tiers, and ships play, fanout, and flow skills.
+
 ## [0.34.1] - 2026-08-07
 
 0.34.0 was tagged but never published to PyPI: its release build stopped on a

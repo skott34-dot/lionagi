@@ -43,7 +43,7 @@ export interface AgentRow {
   message_count: number;
   kind: "run" | "invocation";
   invocation_id: string | null;
-  // agent | play | flow | fanout | show-play (issue #2842) — the discriminator
+  // agent | play | flow | fanout | show-play — the discriminator
   // that says whether this row is a single agent or the root of a multi-agent
   // execution. `agentName`/label text alone never establishes that.
   invocationKind: string | null;
@@ -107,6 +107,7 @@ export type FleetAction =
       project?: string;
       projectNull?: boolean;
       search?: string;
+      kind?: string;
     }
   | { type: "DATA_ERROR"; message: string }
   | { type: "MARK_STALE" };
@@ -397,8 +398,8 @@ export function fleetReducer(state: FleetState, action: FleetAction): FleetState
       return { ...state, nowSec: action.nowSec };
 
     case "DATA_OK": {
-      const { invocations, runs, runsHasNext, nowSec, project, projectNull, search } = action;
-      const scoped = isScopeActive(project, projectNull, search);
+      const { invocations, runs, runsHasNext, nowSec, project, projectNull, search, kind } = action;
+      const scoped = isScopeActive(project, projectNull, search) || Boolean(kind);
       const orgUnits = buildOrgUnits(invocations, runs, nowSec, scoped, runsHasNext);
       const counts = deriveCounts(orgUnits, runs);
       return {

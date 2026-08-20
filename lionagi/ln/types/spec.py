@@ -3,22 +3,21 @@
 from __future__ import annotations
 
 import contextlib
-import os
-import threading
-from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Collection, Hashable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Annotated, Any
+from typing import Any, Literal, cast
 
-from ._sentinel import MaybeUndefined, Undefined, is_sentinel, not_sentinel
-from .base import Meta
-
-# Global cache for annotated types with bounded size
-_MAX_CACHE_SIZE = int(os.environ.get("LIONAGI_FIELD_CACHE_SIZE", "10000"))
-_annotated_cache: OrderedDict[tuple[type, tuple[Meta, ...]], type] = OrderedDict()
-_cache_lock = threading.RLock()
-
+from .._structural import _structural_hash, _structural_key
+from ._annotation import _materialize_annotation
+from ._sentinel import (
+    MaybeSentinel,
+    MaybeUndefined,
+    Undefined,
+    is_sentinel,
+    not_sentinel,
+)
+from .base import Meta, _apply_serialization_mode
 
 __all__ = ("Spec", "CommonMeta")
 
@@ -87,23 +86,27 @@ class CommonMeta(Enum):
         return tuple(metas)
 
 
-@dataclass(frozen=True, slots=True, init=False)
+# Slots are written out rather than generated so `__weakref__` is among them; see
+# Meta for why the projection cache needs that.
+@dataclass(frozen=True, init=False, eq=False)
 class Spec:
     """Framework-agnostic field type + metadata specification."""
 
-    base_type: type
+    __slots__ = ("base_type", "metadata", "__weakref__")
+
+    base_type: MaybeSentinel[type[Any]]
     metadata: tuple[Meta, ...]
 
     def __init__(
         self,
-        base_type: type | None = None,
+        base_type: MaybeSentinel[type[Any]] = Undefined,
         *args,
         metadata: tuple[Meta, ...] | None = None,
         **kw,
     ) -> None:
         metas = CommonMeta.prepare(*args, metadata=metadata, **kw)
 
-        if not_sentinel(base_type, True):
+        if not_sentinel(base_type):
             import types
             import typing
 
@@ -136,6 +139,17 @@ class Spec:
             if meta.key == key:
                 return meta.value
         raise KeyError(f"Metadata key '{key}' undefined in Spec.")
+
+    def _key(self) -> Hashable:
+        return _structural_key(self)
+
+    def __hash__(self) -> int:
+        return _structural_hash(self)
+
+    def __eq__(self, other: object) -> bool:
+        if self is other:
+            return True
+        return type(self) is type(other) and self._key() == cast(Spec, other)._key()
 
     def get(self, key: str, default: Any = Undefined) -> Any:
         with contextlib.suppress(KeyError):
@@ -204,6 +218,21 @@ class Spec:
         _metas = tuple(_filtered)
         return type(self)(self.base_type, metadata=_metas)
 
+    def to_dict(
+        self,
+        exclude: Collection[str] | None = None,
+        *,
+        mode: Literal["python", "json"] = "python",
+    ) -> dict[str, Any]:
+        """Project this neutral declaration without inventing a sentinel wire value."""
+        excluded = frozenset(exclude or ())
+        data: dict[str, Any] = {}
+        if "base_type" not in excluded and not_sentinel(self.base_type):
+            data["base_type"] = self.base_type
+        if "metadata" not in excluded:
+            data["metadata"] = self.metadata
+        return _apply_serialization_mode(data, mode)
+
     def as_nullable(self) -> Spec:
         return self.with_updates(nullable=True)
 
@@ -220,9 +249,9 @@ class Spec:
 
     @property
     def annotation(self) -> type[Any]:
-        if is_sentinel(self.base_type, none_as_sentinel=True):
+        if is_sentinel(self.base_type):
             return Any
-        t_ = self.base_type
+        t_: Any = self.base_type
         if self.is_listable:
             t_ = list[t_]
         if self.is_nullable:
@@ -230,41 +259,13 @@ class Spec:
         return t_
 
     def annotated(self) -> type[Any]:
-        """Materialize into an Annotated type (LRU-cached, thread-safe)."""
-        cache_key = (self.base_type, self.metadata)
-
-        with _cache_lock:
-            if cache_key in _annotated_cache:
-                _annotated_cache.move_to_end(cache_key)
-                return _annotated_cache[cache_key]
-
-            actual_type = (
-                Any if is_sentinel(self.base_type, none_as_sentinel=True) else self.base_type
-            )
-            current_metadata = (
-                () if is_sentinel(self.metadata, none_as_sentinel=True) else self.metadata
-            )
-
-            if any(m.key == "nullable" and m.value for m in current_metadata):
-                actual_type = actual_type | None  # type: ignore
-
-            if current_metadata:
-                args = [actual_type] + list(current_metadata)
-                # Subscription (not the __class_getitem__ attribute, which 3.14
-                # removed from special forms). Annotated[(a, b)] == Annotated[a, b].
-                result = Annotated[tuple(args)]  # type: ignore
-            else:
-                result = actual_type  # type: ignore[misc]
-
-            _annotated_cache[cache_key] = result  # type: ignore[assignment]
-
-            while len(_annotated_cache) > _MAX_CACHE_SIZE:
-                try:
-                    _annotated_cache.popitem(last=False)
-                except KeyError:
-                    break
-
-        return result  # type: ignore[return-value]
+        """Materialize through the shared identity-safe annotation cache."""
+        return _materialize_annotation(
+            owner=self,
+            base_type=self.base_type,
+            metadata=self.metadata,
+            sentinel_predicate=_spec_is_sentinel,
+        )
 
     def metadict(
         self, exclude: set[str] | None = None, exclude_common: bool = False
@@ -281,6 +282,11 @@ def _is_coro_func(obj: Any) -> bool:
     from lionagi.ln.concurrency.utils import is_coro_func
 
     return is_coro_func(obj)
+
+
+def _spec_is_sentinel(value: Any) -> bool:
+    """Keep the public sentinel helper on its direct-invocation contract."""
+    return is_sentinel(value)
 
 
 def _is_factory(obj: Any) -> tuple[bool, bool]:

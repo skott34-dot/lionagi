@@ -91,18 +91,17 @@ class UnparsedResponse(str):
         }
 
 
-@dataclass(slots=True, frozen=True, init=False)
+@dataclass(slots=True, frozen=True, init=False, eq=False)
 class MorphParam(Params):
-    """Frozen, hashable base for morphism parameters."""
+    """Shallow-frozen morphism parameters; hashable only when recursively immutable."""
 
     _config: ClassVar[ModelConfig] = ModelConfig(none_as_sentinel=True)
 
 
-@dataclass(slots=True, frozen=True, init=False)
+@dataclass(slots=True, frozen=True, init=False, eq=False)
 class ChatParam(MorphParam):
     """Parameters for the chat/communicate morphism (guidance, context, response format, tool schemas)."""
 
-    _config: ClassVar[ModelConfig] = ModelConfig(none_as_sentinel=True)
     guidance: JsonValue = None
     context: JsonValue = None
     sender: SenderRecipient = None
@@ -138,18 +137,17 @@ class ChatParam(MorphParam):
         return cls(**defaults)
 
 
-@dataclass(slots=True, frozen=True, init=False)
+@dataclass(slots=True, frozen=True, init=False, eq=False)
 class RunParam(ChatParam):
     stream_persist: bool = False
     persist_dir: str | Path = LIONAGI_HOME / "logs" / "runs"
     snapshot_dir: str | Path | None = None
 
 
-@dataclass(slots=True, frozen=True, init=False)
+@dataclass(slots=True, frozen=True, init=False, eq=False)
 class InterpretParam(MorphParam):
     """Parameters for the interpret morphism (style, domain, sample writing)."""
 
-    _config: ClassVar[ModelConfig] = ModelConfig(none_as_sentinel=True)
     domain: str = None
     style: str = None
     sample_writing: str = None
@@ -157,11 +155,10 @@ class InterpretParam(MorphParam):
     imodel_kw: dict = None
 
 
-@dataclass(slots=True, frozen=True, init=False)
+@dataclass(slots=True, frozen=True, init=False, eq=False)
 class ParseParam(MorphParam):
     """Parameters for the parse morphism (response format, fuzzy matching, error handling)."""
 
-    _config: ClassVar[ModelConfig] = ModelConfig(none_as_sentinel=True)
     response_format: type[BaseModel] | dict = None
     structure: Structure | None = None
     fuzzy_match_params: FuzzyMatchKeysParams | dict = None
@@ -171,11 +168,10 @@ class ParseParam(MorphParam):
     imodel_kw: dict = None
 
 
-@dataclass(slots=True, frozen=True, init=False)
+@dataclass(slots=True, frozen=True, init=False, eq=False)
 class ActionParam(MorphParam):
     """Parameters for the action/tool execution morphism (strategy, error handling, verbosity)."""
 
-    _config: ClassVar[ModelConfig] = ModelConfig(none_as_sentinel=True)
     action_call_params: AlcallParams = None
     tools: ToolRef = None
     strategy: Literal["concurrent", "sequential"] = "concurrent"

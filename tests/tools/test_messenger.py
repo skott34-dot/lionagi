@@ -60,14 +60,10 @@ class TestMessengerRequestModel:
         assert req.to is None
         assert req.content is None
 
-    def test_send_request(self):
-        req = MessengerRequest(action="send", to="alice", content="hi")
-        assert req.to == "alice"
-        assert req.content == "hi"
-
-    def test_send_request_list_to(self):
-        req = MessengerRequest(action="send", to=["alice", "bob"], content="hi")
-        assert req.to == ["alice", "bob"]
+    def test_to_accepts_one_recipient_or_many(self):
+        """Both shapes are advertised in the tool schema, so both must load."""
+        assert MessengerRequest(action="send", to="alice").to == "alice"
+        assert MessengerRequest(action="send", to=["alice", "bob"]).to == ["alice", "bob"]
 
 
 class TestLionMessengerBasics:
@@ -455,11 +451,6 @@ class TestMessengerBindUnknownAction:
         tool = m.bind(branch, roster={})
         result = tool.func_callable(action="bogus")
         assert "Unknown action: bogus" in result
-
-
-# ---------------------------------------------------------------------------
-# Tool description stays consistent with wakeup's recipient handling
-# ---------------------------------------------------------------------------
 
 
 class TestMessengerWakeupDescription:

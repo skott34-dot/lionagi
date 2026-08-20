@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -100,7 +100,10 @@ _TERMINAL_SESSION_STATUSES = (
     "aborted",
     "cancelled",
 )
-_TERMINAL_RUN_STATUSES = ("completed", "failed", "skipped", "cancelled")
+# Not db.TERMINAL_RUN_STATUSES: that set answers whether a fire consumed
+# budget, so it excludes "skipped". A skipped run never fired and is still
+# finished, so it is still prunable.
+_TERMINAL_RUN_STATUSES = ("completed", "failed", "skipped", "cancelled", "timed_out")
 
 
 def _run_retention_predicate(cutoff: float) -> tuple[str, tuple[Any, ...]]:
@@ -139,21 +142,11 @@ def _dispatch_retention_predicate(
 
 
 def _session_retention_predicate(cutoff: float) -> tuple[str, tuple[Any, ...]]:
-    """What makes a session prunable, as a SQL fragment and its parameters.
-
-    Two conditions, both required: the session is in a terminal status, and it
-    has had no activity since *cutoff*. Returned as a fragment rather than a
-    whole statement because the prune asks the same question in two different
-    shapes -- once to select candidates, and once with an id restriction after
-    those rows are locked.
-
-    It comes from one place because the second read has to test exactly what the
-    first one did. Either condition can stop holding in between: a resume
-    returns a session to running, and any write moves ``updated_at`` forward. The
-    recheck exists to narrow the candidate set, so a second spelling that drifted
-    even slightly could widen it instead, and the row it wrongly admitted would
-    be one the selection had already decided to spare.
-    """
+    """What makes a session prunable (terminal status AND no activity since
+    *cutoff*), as a reusable SQL fragment + params -- the prune selects
+    candidates with it, then rechecks under lock with an id restriction
+    using the exact same fragment, so a drifted second spelling can't widen
+    the set past what selection already decided to spare."""
     placeholders = ", ".join("?" * len(_TERMINAL_SESSION_STATUSES))
     return (
         f"status IN ({placeholders}) AND updated_at <= ?",
@@ -188,30 +181,13 @@ async def checkpoint_state_db(
     actor: str = "studio_db_maintenance",
 ) -> dict[str, Any]:
     """Run ``PRAGMA wal_checkpoint(<mode>)`` and write an audit event.
-
-    Returns the PRAGMA result (busy, log_pages, checkpointed) plus the size of
-    the WAL going in and how long the whole thing took.
-
-    Those last two are here because the PRAGMA counters cannot answer the
-    question an operator brings to this record. For TRUNCATE a successful
-    checkpoint reports busy, log_pages and checkpointed all zero by
-    definition, whether it drained one page or a hundred thousand: the frames
-    are gone and the log has been reset, so there is nothing left for the
-    counters to describe. All zeros is the success signature, not evidence
-    that there was nothing to do, and reading it as the latter is the natural
-    mistake. Four consecutive rows of zeros say only that four checkpoints
-    succeeded.
-
-    ``wal_bytes_before`` is read before the connection is opened, so it is the
-    WAL this checkpoint was actually asked to deal with rather than whatever
-    is left after opening did its own work. ``elapsed_ms`` covers opening the
-    connection as well as the PRAGMA, because a checkpoint that waits can wait
-    in either place and the split cannot be recovered from the row afterwards.
-
-    Both are bounded by the same limit: the event is written after the
-    checkpoint returns, so this records a slow checkpoint and can never record
-    a hung one. A stall that never ends leaves no row at all.
-    """
+    Returns the PRAGMA result (busy, log_pages, checkpointed) plus
+    ``wal_bytes_before`` (read before the connection opens) and
+    ``elapsed_ms`` (covers opening the connection too). For TRUNCATE, all
+    three PRAGMA counters read zero on success regardless of how much was
+    drained -- that is the success signature, not evidence of nothing to do.
+    Written only after the checkpoint returns, so a hung checkpoint leaves no
+    row at all rather than a slow one. See studio.md."""
     if state_db_known_absent():
         return {
             "mode": mode,
@@ -254,6 +230,22 @@ async def get_last_checkpoint_at() -> float | None:
     return None
 
 
+async def get_last_prune_at() -> float | None:
+    """Return the ``created_at`` of the most recent prune event, or None if a
+    prune has never been recorded.
+
+    Unlike ``get_last_checkpoint_at`` this does not swallow read failures. Its
+    caller uses the answer to decide when the next automatic prune is due, and
+    a failed read reported as None is indistinguishable from "never pruned",
+    which would anchor the schedule to the failure instead of retrying.
+    """
+    if state_db_known_absent():
+        return None
+    async with StateDB() as db:
+        events = await db.list_admin_events(action="prune", limit=1)
+    return events[0].get("created_at") if events else None
+
+
 def get_db_size_alert(size_bytes: int) -> tuple[bool, int]:
     """Return ``(size_alert, threshold_bytes)`` given the current DB size."""
     from lionagi.studio.config import DB_SIZE_ALERT_BYTES
@@ -262,9 +254,60 @@ def get_db_size_alert(size_bytes: int) -> tuple[bool, int]:
     return size_bytes >= threshold, threshold
 
 
-def _row_chunks(ids: Sequence[str], size: int) -> list[list[str]]:
-    """Split *ids* (already sorted) into stable, bounded, non-overlapping chunks."""
-    return [list(ids[i : i + size]) for i in range(0, len(ids), size)]
+async def _candidate_chunks(
+    db: StateDB,
+    *,
+    table: str,
+    where_sql: str,
+    params: Sequence[Any],
+    size: int,
+) -> AsyncIterator[list[str]]:
+    """Yield ids eligible under *where_sql* in bounded, ascending-id chunks.
+
+    The scan reads one chunk at a time instead of every eligible id at once,
+    so a pass holds at most *size* ids however far the aged backlog has grown.
+    Each chunk is read in its own short transaction, which keeps the selection
+    off the write lock the chunk deletes then take.
+
+    The cursor advances by id rather than by "what is still eligible", because
+    a chunk can legitimately delete nothing: `_prune_session_chunk` re-checks
+    each row under the write lock and skips one that stopped being terminal.
+    Re-asking the same question would hand that row back forever.
+
+    The primary key index is named explicitly because leaving the choice to the
+    planner makes this loop quadratic. Left alone, and with no collected
+    statistics -- which is the permanent state here, since nothing runs ANALYZE
+    -- SQLite prefers the narrower status/time index and then sorts for the
+    ORDER BY, so every page re-reads and re-sorts the whole remaining eligible
+    backlog instead of seeking past the ids it already returned. Measured on a
+    240k-row store, walking the backlog took 43.8s that way against 0.12s
+    seeking the primary key. Naming the index turns each page back into a
+    forward seek, and asking for one that does not exist is a prepare-time
+    error, so a schema change that removes it fails loudly rather than
+    silently restoring the quadratic plan.
+
+    The hint is SQLite's syntax and SQLite's problem, so it is only emitted for
+    that dialect. PostgreSQL keeps its own table statistics and plans this as a
+    forward seek without being told, and it has no `INDEXED BY` clause at all --
+    emitting one unconditionally would turn every prune pass on a Postgres-backed
+    store into a syntax error at prepare time.
+    """
+    # Built once rather than per page: `table` and the dialect are both fixed
+    # for the life of the scan.
+    indexed_by = f" INDEXED BY sqlite_autoindex_{table}_1" if db.dialect == "sqlite" else ""
+    after = ""
+    while True:
+        sql = (
+            f"SELECT id FROM {table}{indexed_by} "  # noqa: S608
+            f"WHERE ({where_sql}) AND id > ? ORDER BY id LIMIT ?"
+        )
+        async with db.transaction() as conn:
+            rows = (await conn.execute(*_q(sql, (*params, after, size)))).fetchall()
+        ids = sorted({r[0] for r in rows})
+        if not ids:
+            return
+        yield ids
+        after = ids[-1]
 
 
 async def _after_prune_chunk_committed(*, chunk_index: int, chunk_ids: list[str]) -> None:
@@ -287,17 +330,14 @@ async def _prune_session_chunk(
     archive_destination: Path | None,
     archive_id: str,
 ) -> int:
-    """Archive-then-delete one chunk of candidate session ids in the caller's transaction.
-
-    Runs the same lock/recheck/soft-FK-nullify/delete/orphan-cleanup sequence
-    ``prune_old_data`` always had, scoped to this chunk only. When
-    *archive_destination* is set, the chunk's doomed rows (sessions, branches,
-    progressions, messages) are durably archived before any DELETE statement
-    runs; a failed archive write raises and the caller's transaction rolls
-    back, so this chunk's rows are refused rather than lost. Returns the
-    number of sessions actually deleted (0 if the chunk raced empty on
-    recheck).
-    """
+    """Archive-then-delete one chunk of candidate session ids in the
+    caller's transaction, running the same lock/recheck/soft-FK-nullify/
+    delete/orphan-cleanup sequence ``prune_old_data`` always had, scoped to
+    this chunk. When *archive_destination* is set, doomed rows are durably
+    archived before any DELETE runs; a failed archive write raises and the
+    caller's transaction rolls back, so this chunk's rows are refused
+    rather than lost. Returns sessions actually deleted (0 if the chunk
+    raced empty on recheck)."""
     if not session_ids:
         return 0
 
@@ -627,6 +667,49 @@ async def _prune_dispatch_chunk(
     )
 
 
+async def prune_terminal_sessions_by_id(session_ids: Sequence[str]) -> int:
+    """Safely prune only terminal sessions from an explicit ID selection.
+
+    Uses the same row-lock/recheck and lineage-scoped cleanup as retention
+    pruning. Running or otherwise non-terminal rows are refused even when an
+    administrator names them explicitly, and unrelated orphan rows elsewhere
+    in the database are never swept as a side effect.
+    """
+    from lionagi.studio.config import PRUNE_ARCHIVE_DIR, PRUNE_CHUNK_ROWS
+
+    ids = sorted(set(session_ids))
+    if not ids or state_db_known_absent():
+        return 0
+
+    sess_ph = ", ".join("?" * len(_TERMINAL_SESSION_STATUSES))
+    retention_sql = f"status IN ({sess_ph})"
+    retention_params: tuple[Any, ...] = _TERMINAL_SESSION_STATUSES
+    prune_started_at = time.time()
+    pruned = 0
+
+    chunks = [ids[i : i + PRUNE_CHUNK_ROWS] for i in range(0, len(ids), PRUNE_CHUNK_ROWS)]
+
+    async with StateDB() as db:
+        for chunk_index, chunk_ids in enumerate(chunks):
+            archive_id = archive_chunk_id(
+                cutoff=prune_started_at,
+                chunk_index=chunk_index,
+                kind="session-explicit",
+            )
+            async with db.transaction() as conn:
+                pruned += await _prune_session_chunk(
+                    conn,
+                    chunk_ids,
+                    sess_ph=sess_ph,
+                    retention_sql=retention_sql,
+                    retention_params=retention_params,
+                    archive_destination=PRUNE_ARCHIVE_DIR,
+                    archive_id=archive_id,
+                )
+
+    return pruned
+
+
 async def prune_old_data(
     *,
     keep_days: int | None = None,
@@ -634,21 +717,18 @@ async def prune_old_data(
     dispatch_dead_letter_keep_days: int | None = None,
     actor: str = "studio_db_maintenance",
 ) -> dict[str, int]:
-    """Archive-then-prune terminal sessions/runs/dispatches older than their keep windows.
+    """Archive-then-prune terminal sessions/runs/dispatches older than their
+    keep windows. All three root kinds are pruned in chunks of at most
+    ``PRUNE_CHUNK_ROWS`` ids, each archived (if ``PRUNE_ARCHIVE_DIR`` is set)
+    and deleted in its own short transaction, so an interrupted run keeps
+    every chunk that already committed; a failed archive write aborts the
+    remainder of the pass. Soft-FK children are nullified before DELETE
+    since they lack CASCADE. See studio.md.
 
-    All three root kinds -- sessions, schedule_runs, dispatch_outbox -- are
-    pruned the same way: each group of at most ``PRUNE_CHUNK_ROWS`` candidate
-    ids is archived (if ``PRUNE_ARCHIVE_DIR`` is set) and deleted in its own
-    short transaction, so the write lock is released between chunks and an
-    interrupted run keeps every chunk that already committed. No monolithic
-    retention transaction remains for any of the three. A chunk's archive
-    write is durably committed before that chunk's DELETE runs; a failed
-    archive write raises and aborts the remainder of the whole prune pass
-    (later chunks, and later root kinds, are never attempted), while every
-    chunk that already committed stays deleted. FK safety: soft-FK children
-    (artifacts/plays/team_messages/dispatch_outbox) are nullified before
-    DELETE since they lack CASCADE.
-    """
+    Candidate ids are read one chunk at a time as well, so the pass holds
+    ``PRUNE_CHUNK_ROWS`` ids at a time rather than every id an aged backlog
+    made eligible. Total work still scales with that backlog; what is bounded
+    is the memory a pass occupies and the length of any one lock it takes."""
     from lionagi.studio.config import (
         DISPATCH_RETENTION_DEAD_LETTER_DAYS,
         DISPATCH_RETENTION_SUCCESS_DAYS,
@@ -679,14 +759,17 @@ async def prune_old_data(
     dispatch_archive_ids: list[str] = []
 
     async with StateDB() as db:
-        # ── find session IDs to prune (read-only candidate selection) ──────
-        async with db.transaction() as conn:
-            sql = f"SELECT id FROM sessions WHERE {retention_sql}"  # noqa: S608
-            rows = (await conn.execute(*_q(sql, retention_params))).fetchall()
-            session_ids = sorted({r[0] for r in rows})
-
         # ── archive-then-delete in bounded, independently committed chunks ─
-        for chunk_index, chunk_ids in enumerate(_row_chunks(session_ids, PRUNE_CHUNK_ROWS)):
+        # Candidate ids arrive one chunk at a time; see _candidate_chunks.
+        chunk_index = -1
+        async for chunk_ids in _candidate_chunks(
+            db,
+            table="sessions",
+            where_sql=retention_sql,
+            params=retention_params,
+            size=PRUNE_CHUNK_ROWS,
+        ):
+            chunk_index += 1
             archive_id = archive_chunk_id(cutoff=cutoff, chunk_index=chunk_index)
             async with db.transaction() as conn:
                 chunk_pruned = await _prune_session_chunk(
@@ -715,12 +798,15 @@ async def prune_old_data(
         # ── schedule_run retention: archive-then-delete in bounded, ────────
         # independently committed chunks (ADR-R3 shape, applied to runs).
         run_retention_sql, run_retention_params = _run_retention_predicate(cutoff)
-        async with db.transaction() as conn:
-            sql = f"SELECT id FROM schedule_runs WHERE {run_retention_sql}"  # noqa: S608
-            rows = (await conn.execute(*_q(sql, run_retention_params))).fetchall()
-            run_ids = sorted({r[0] for r in rows})
-
-        for chunk_index, chunk_ids in enumerate(_row_chunks(run_ids, PRUNE_CHUNK_ROWS)):
+        chunk_index = -1
+        async for chunk_ids in _candidate_chunks(
+            db,
+            table="schedule_runs",
+            where_sql=run_retention_sql,
+            params=run_retention_params,
+            size=PRUNE_CHUNK_ROWS,
+        ):
+            chunk_index += 1
             archive_id = archive_chunk_id(cutoff=cutoff, chunk_index=chunk_index, kind="run")
             async with db.transaction() as conn:
                 chunk_pruned = await _prune_run_chunk(
@@ -747,13 +833,16 @@ async def prune_old_data(
         dispatch_retention_sql, dispatch_retention_params = _dispatch_retention_predicate(
             dispatch_success_cutoff, dispatch_dead_letter_cutoff
         )
-        async with db.transaction() as conn:
-            sql = f"SELECT id FROM dispatch_outbox WHERE {dispatch_retention_sql}"  # noqa: S608
-            rows = (await conn.execute(*_q(sql, dispatch_retention_params))).fetchall()
-            dispatch_ids = sorted({r[0] for r in rows})
-
         dispatch_purged = 0
-        for chunk_index, chunk_ids in enumerate(_row_chunks(dispatch_ids, PRUNE_CHUNK_ROWS)):
+        chunk_index = -1
+        async for chunk_ids in _candidate_chunks(
+            db,
+            table="dispatch_outbox",
+            where_sql=dispatch_retention_sql,
+            params=dispatch_retention_params,
+            size=PRUNE_CHUNK_ROWS,
+        ):
+            chunk_index += 1
             archive_id = archive_chunk_id(
                 cutoff=dispatch_success_cutoff, chunk_index=chunk_index, kind="dispatch"
             )

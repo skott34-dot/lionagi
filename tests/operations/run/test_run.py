@@ -34,9 +34,7 @@ from lionagi.service.imodel import iModel
 from lionagi.service.types.stream_chunk import StreamChunk
 from lionagi.session.branch import Branch
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 
 def _make_fake_cli_model(chunks: list[StreamChunk], session_id: str | None = None):
@@ -87,9 +85,7 @@ def _fail_on_next_checkpoint(_delay: float):
         raise TimeoutError
 
 
-# ---------------------------------------------------------------------------
 # P0 tests — run()
-# ---------------------------------------------------------------------------
 
 
 async def test_run_rejects_non_cli_chat_model():
@@ -533,9 +529,7 @@ async def test_write_branch_snapshot_failed_replace_keeps_prior_snapshot(tmp_pat
     assert target.read_text() == v1
 
 
-# ---------------------------------------------------------------------------
 # P0/P1 tests — run_and_collect()
-# ---------------------------------------------------------------------------
 
 
 async def test_run_and_collect_clears_messages_and_joins_assistant_text(monkeypatch):
@@ -615,13 +609,11 @@ async def test_run_and_collect_parses_when_response_format_is_set(monkeypatch):
     assert parse_calls[0] == '{"value": 42}'
 
 
-# ---------------------------------------------------------------------------
 # Timeout enforcement tests — regression for the "timeout silently ignored"
 # bug where ``branch.operate(timeout=N)`` / ``li agent --timeout N`` flowed
 # through ``imodel_kw`` into ``model.create_event(**kw)`` but the streaming
 # loop never wrapped the consumer with ``anyio.fail_after``, so CLI
 # subprocesses (codex, claude_code) ran unbounded.
-# ---------------------------------------------------------------------------
 
 
 def _make_slow_cli_model(chunk_delay: float, n_chunks: int = 100):
@@ -926,9 +918,7 @@ async def test_gemini_timeout_arms_produce_distinct_caps():
     assert await captured_cap({"timeout": 1200}) != await captured_cap({})
 
 
-# ---------------------------------------------------------------------------
 # Regression: Branch.operate() must flatten **kwargs so timeout reaches run()
-# ---------------------------------------------------------------------------
 
 
 async def test_branch_operate_forwards_timeout_to_run(monkeypatch):
@@ -979,9 +969,7 @@ async def test_branch_operate_forwards_extra_kwargs_to_run(monkeypatch):
     assert received_kw.get("repo") == "/tmp/test"
 
 
-# ---------------------------------------------------------------------------
 # Regression: iModel.stream() must not yield in finally (swallows cancellation)
-# ---------------------------------------------------------------------------
 
 
 async def test_imodel_stream_propagates_cancellation():
@@ -1045,12 +1033,10 @@ async def test_imodel_stream_propagates_cancellation():
     )
 
 
-# ---------------------------------------------------------------------------
 # Worker-liveness watchdog — regression for a CLI subprocess that dies at/near
 # spawn (or otherwise produces no first output): the leg must retry once and
 # then fail loud with WorkerLivenessError instead of hanging as a zombie
 # "running" operation forever.
-# ---------------------------------------------------------------------------
 
 
 def _make_hanging_cli_model(create_event_calls: list, streams_first_output_early: bool = True):
@@ -1145,6 +1131,44 @@ def _make_buffered_delay_cli_model(create_event_calls: list, delay: float):
     return m
 
 
+def _make_scheduled_cli_model(
+    create_event_calls: list,
+    schedule: list[tuple[float, StreamChunk]],
+    *,
+    hang_after: bool = False,
+    streams_first_output_early: bool = True,
+):
+    """A CLI iModel that emits chunks after controlled per-chunk delays."""
+    import anyio
+
+    m = iModel(provider="openai", model="gpt-4.1-mini", api_key="test_key")
+    endpoint_ns = types.SimpleNamespace(
+        is_cli=True,
+        session_id=None,
+        streams_first_output_early=streams_first_output_early,
+        to_dict=lambda: {"type": "fake_cli", "session_id": None},
+    )
+    m.endpoint = endpoint_ns
+    m.streaming_process_func = None
+
+    async def create_event(**kw):
+        create_event_calls.append(kw)
+        return object()
+
+    m.create_event = create_event
+    m.executor = types.SimpleNamespace(append=AsyncMock(), config={})
+
+    async def stream(api_call=None):
+        for delay, chunk in schedule:
+            await anyio.sleep(delay)
+            yield chunk
+        if hang_after:
+            await anyio.sleep(999)
+
+    m.stream = stream
+    return m
+
+
 async def test_run_liveness_watchdog_raises_after_exhausting_retries():
     """A worker that never produces a first chunk is retried once, then
     fails loud with WorkerLivenessError — the operation must be able to
@@ -1164,6 +1188,75 @@ async def test_run_liveness_watchdog_raises_after_exhausting_retries():
     assert len(create_event_calls) == 2, (
         f"expected exactly 2 create_event calls (1 initial + 1 retry), got {len(create_event_calls)}"
     )
+
+
+def test_the_stall_context_names_the_call():
+    """A burst of stalls must be tellable from one worker retrying."""
+    from lionagi.operations.run.run import _stalled_worker_context
+
+    assert _stalled_worker_context(types.SimpleNamespace(id="call-123")) == "call=call-123"
+
+
+def test_the_stall_context_survives_an_object_that_answers_nothing():
+    """Built on the failure path, so it must not raise there."""
+    from lionagi.operations.run.run import _stalled_worker_context
+
+    assert _stalled_worker_context(object()) == "worker unidentified"
+
+
+async def test_the_liveness_error_names_the_worker_that_stalled(monkeypatch):
+    """The identity has to reach the raised message, not merely be computable.
+
+    Diagnosis reads the error text. A helper that is correct but never wired
+    in leaves every log line exactly as unattributed as before, and that
+    failure looks identical to a working one from the helper's own tests.
+    """
+    from lionagi.providers._provider_errors import WorkerLivenessError
+
+    class NeverYields:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await asyncio.Event().wait()
+            raise StopAsyncIteration  # pragma: no cover
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "lionagi.operations.run.run._stream_with_deadline",
+        lambda model, api_call, deadline: NeverYields(),
+    )
+
+    # A key in the caller-configured fields, which is why they are not logged.
+    secret = "01234567-89ab-cdef-0123-456789abcdef"
+    model = types.SimpleNamespace(
+        endpoint=types.SimpleNamespace(config=types.SimpleNamespace(provider=secret)),
+        model_name=secret,
+        create_event=AsyncMock(return_value=types.SimpleNamespace(id="call-abc")),
+        executor=types.SimpleNamespace(append=AsyncMock()),
+    )
+
+    stream = _stream_with_liveness(
+        model,
+        {},
+        stream_deadline=None,
+        liveness_timeout=0.05,
+        api_call_holder=[],
+        max_attempts=1,
+    )
+    with pytest.raises(WorkerLivenessError) as excinfo:
+        async for _ in stream:
+            pass
+
+    message = str(excinfo.value)
+    assert "call=call-abc" in message, message
+    # The prefix external log greps key on must survive the addition.
+    assert "no first stream output within" in message, message
+    # Pins the context to the generated id, so a masked field back reddens too.
+    assert "[call=call-abc]" in message, message
+    assert secret not in message, message
 
 
 async def test_liveness_cancel_during_first_chunk_wait_closes_inner_stream(monkeypatch):
@@ -1356,3 +1449,153 @@ async def test_run_liveness_watchdog_explicit_timeout_enforced_on_buffered_endpo
             pass
 
     assert len(create_event_calls) == 2
+
+
+async def test_run_idle_watchdog_fails_after_partial_output_without_retry(monkeypatch):
+    """A worker that emits once then stalls fails distinctly and is not rerun."""
+    import lionagi.config as config_module
+    from lionagi.providers._provider_errors import WorkerLivenessError
+
+    create_event_calls: list[dict] = []
+    model = _make_scheduled_cli_model(
+        create_event_calls,
+        [(0, StreamChunk(type="text", content="partial"))],
+        hang_after=True,
+    )
+    branch = Branch()
+    branch.chat_model = model
+    fast_settings = config_module.AppSettings(LIONAGI_WORKER_IDLE_TIMEOUT=0.03)
+    monkeypatch.setattr(config_module, "settings", fast_settings)
+
+    with pytest.raises(WorkerLivenessError) as exc_info:
+        await _collect(
+            run(
+                branch,
+                "go",
+                RunParam(
+                    imodel_kw={
+                        "timeout": 0.2,
+                        "liveness_timeout": 0.1,
+                    }
+                ),
+            )
+        )
+
+    assert exc_info.value.reason == "worker.stream_idle"
+    assert len(create_event_calls) == 1
+    assert "idle_timeout" not in create_event_calls[0]
+
+
+async def test_run_idle_watchdog_resets_after_every_chunk():
+    """Total stream time may exceed the idle window when each gap stays below it."""
+    create_event_calls: list[dict] = []
+    model = _make_scheduled_cli_model(
+        create_event_calls,
+        [
+            (0, StreamChunk(type="text", content="a")),
+            (0.03, StreamChunk(type="text", content="b")),
+            (0.03, StreamChunk(type="text", content="c")),
+            (0.03, StreamChunk(type="text", content="d")),
+        ],
+    )
+    branch = Branch()
+    branch.chat_model = model
+
+    results = await _collect(
+        run(
+            branch,
+            "go",
+            RunParam(
+                imodel_kw={
+                    "timeout": 0.5,
+                    "liveness_timeout": 0.1,
+                    "idle_timeout": 0.08,
+                }
+            ),
+        )
+    )
+
+    text_msgs = [r for r in results if isinstance(r, AssistantResponse)]
+    assert [msg.response for msg in text_msgs] == ["abcd"]
+    assert len(create_event_calls) == 1
+    assert "idle_timeout" not in create_event_calls[0]
+
+
+async def test_run_idle_watchdog_yields_to_tighter_overall_deadline():
+    """The caller's total-stream budget retains ownership when it expires first."""
+    from lionagi.providers._provider_errors import WorkerLivenessError
+
+    create_event_calls: list[dict] = []
+    model = _make_scheduled_cli_model(
+        create_event_calls,
+        [(0, StreamChunk(type="text", content="partial"))],
+        hang_after=True,
+    )
+    branch = Branch()
+    branch.chat_model = model
+
+    with pytest.raises(TimeoutError) as exc_info:
+        await _collect(
+            run(
+                branch,
+                "go",
+                RunParam(
+                    imodel_kw={
+                        "timeout": 0.04,
+                        "liveness_timeout": 0.1,
+                        "idle_timeout": 0.2,
+                    }
+                ),
+            )
+        )
+
+    assert not isinstance(exc_info.value, WorkerLivenessError)
+    assert len(create_event_calls) == 1
+    assert "idle_timeout" not in create_event_calls[0]
+
+
+async def test_run_idle_watchdog_allows_normal_completion():
+    """The run-only idle setting is stripped and a healthy stream completes."""
+    create_event_calls: list[dict] = []
+    model = _make_scheduled_cli_model(
+        create_event_calls,
+        [
+            (0, StreamChunk(type="text", content="hello")),
+            (0.01, StreamChunk(type="text", content=" world")),
+        ],
+    )
+    branch = Branch()
+    branch.chat_model = model
+
+    results = await _collect(run(branch, "go", RunParam(imodel_kw={"idle_timeout": 0.1})))
+
+    text_msgs = [r for r in results if isinstance(r, AssistantResponse)]
+    assert [msg.response for msg in text_msgs] == ["hello world"]
+    assert len(create_event_calls) == 1
+    assert "idle_timeout" not in create_event_calls[0]
+
+
+async def test_run_idle_watchdog_default_skips_buffered_endpoint(monkeypatch):
+    """Buffered transports remain exempt from the default mid-stream bound."""
+    import lionagi.config as config_module
+
+    create_event_calls: list[dict] = []
+    model = _make_scheduled_cli_model(
+        create_event_calls,
+        [
+            (0, StreamChunk(type="text", content="buffered")),
+            (0.08, StreamChunk(type="text", content=" result")),
+        ],
+        streams_first_output_early=False,
+    )
+    branch = Branch()
+    branch.chat_model = model
+
+    fast_settings = config_module.AppSettings(LIONAGI_WORKER_IDLE_TIMEOUT=0.02)
+    monkeypatch.setattr(config_module, "settings", fast_settings)
+
+    results = await _collect(run(branch, "go", RunParam()))
+
+    text_msgs = [r for r in results if isinstance(r, AssistantResponse)]
+    assert [msg.response for msg in text_msgs] == ["buffered result"]
+    assert len(create_event_calls) == 1

@@ -116,7 +116,8 @@
       "busyPlaceholder": "Operator is working…",
       "hint": "Enter to send · Shift+Enter for a new line",
       "send": "Send",
-      "sending": "Sending…"
+      "sending": "Sending…",
+      "autoAllow": "Auto-allow proposals"
     },
     "message": {
       "you": "You",
@@ -169,7 +170,12 @@
     "model": {
       "label": "Model",
       "default": "Mặc định",
-      "unavailable": "{model} (unavailable)"
+      "unavailable": "{model} (unavailable)",
+      "recommendedGroup": "{provider} · đề xuất",
+      "legacyGroup": "Lựa chọn cũ",
+      "efforts": "Nỗ lực: {efforts}",
+      "effortInModel": "Mức nỗ lực được mã hóa trong ID mô hình",
+      "effortAsSetting": "Mức nỗ lực được gửi dưới dạng cài đặt nhà cung cấp"
     },
     "effort": {
       "label": "Nỗ lực",
@@ -239,7 +245,7 @@
       "createWorkflow": "quy trình làm việc mới",
       "createAgent": "tác nhân mới",
       "allSkill": "Không tìm thấy skill nào.",
-      "allSkillHint": "Thêm SKILL.md vào ~/.lionagi/skills/<name>/ để hiển thị ở đây.",
+      "allSkillHint": "Thêm SKILL.md vào ~/.lionagi/skills/NAME/ để hiển thị ở đây.",
       "allPlugin": "Không tìm thấy plugin nào.",
       "allPluginHint": "Cài đặt plugin vào ~/.claude/plugins/ để hiển thị ở đây."
     },
@@ -376,6 +382,38 @@
       "creating": "Creating…",
       "create": "Create",
       "createError": "Could not create this server."
+    },
+    "filterHooks": "Hooks",
+    "hooks": {
+      "title": "Hooks",
+      "description": "Named, reusable hooks defined once here, then assembled per agent: each agent binds hooks from this library to events (before a tool call, on prompt submit, after a response). The same assembly runs on any provider CLI.",
+      "libraryTitle": "Hook library",
+      "newHook": "New hook",
+      "emptyLibrary": "No hooks defined yet. Create one to make it assemblable by every agent.",
+      "emptyLibraryHint": "Define hooks in the library first — attachments bind library hooks to events.",
+      "operatorTitle": "Operator assembly",
+      "operatorDescription": "Hooks the Studio Operator runs. The Operator inherits no user or project settings, so hooks attached here are the only ones its turns load.",
+      "enabled": "Enabled",
+      "save": "Save",
+      "saving": "Saving…",
+      "savedNotice": "Saved — applies from the next turn.",
+      "cancel": "Cancel",
+      "delete": "Delete",
+      "fieldName": "Name",
+      "fieldDescription": "Description",
+      "fieldCommand": "Command",
+      "fieldTimeout": "Timeout (seconds)",
+      "nameRequired": "A hook needs a name.",
+      "timeoutInvalid": "Timeout must be a number.",
+      "noAttachments": "No hooks attached.",
+      "attachmentHook": "Hook",
+      "attachmentOn": "on",
+      "attachmentEvent": "Event",
+      "attachmentMatcher": "Matcher",
+      "matcherPlaceholder": "matcher (optional)",
+      "removeAttachment": "Remove attachment",
+      "addAttachment": "Attach hook",
+      "agentSectionTitle": "Hooks"
     }
   },
   "history": {
@@ -445,6 +483,8 @@
       "statMessages": "tin nhắn",
       "statToolCalls": "lệnh gọi công cụ",
       "statErrors": "lỗi",
+      "statTokensIn": "Token đầu vào",
+      "statTokensOut": "Token đầu ra",
       "statTopic": "chủ đề",
       "statPlay": "Play",
       "statPlaybook": "quy trình làm việc",
@@ -468,6 +508,7 @@
       "statErrorsRecent": "lỗi (gần đây)",
       "noBranchErrorsPartial": "không có lỗi trong các tin nhắn đã tải.",
       "noFilesPartial": "không phát hiện thao tác tệp trong các tin nhắn đã tải.",
+      "filesUnionBounded": "Một số thao tác tệp không được liệt kê: lần chạy này đã chạm vào nhiều tệp hơn mức một khung hiển thị thu thập.",
       "olderUnavailable": "Không thể tải lịch sử cũ hơn — cuộc trò chuyện này đã tiếp tục trước khi yêu cầu hoàn tất.",
       "reloadConversation": "Tải lại cuộc trò chuyện",
       "graphEdgeCount": "{count} cạnh",
@@ -481,17 +522,51 @@
       "graphNodeStatusDone": "xong",
       "graphNodeStatusFailed": "thất bại",
       "graphNodeStatusSkipped": "đã bỏ qua",
+      "graphNodeStatusCancelled": "đã hủy",
       "graphNodeStatusEscalated": "đã leo thang",
       "progressTotal": "Tổng",
       "progressCompleted": "Hoàn tất",
       "progressRunning": "Đang chạy",
       "progressFailed": "Thất bại",
       "progressPending": "Đang chờ",
+      "progressEscalated": "Đã leo thang",
       "progressElapsed": "Thời gian trôi qua",
       "expandGraph": "Mở rộng biểu đồ thực thi",
       "collapseGraph": "Thu gọn biểu đồ thực thi",
       "closeExpandedGraph": "Đóng",
-      "nodeNoBranch": "Không tìm thấy nhánh cho “{node}” — bước này chưa bắt đầu."
+      "nodeNoBranch": "Không tìm thấy nhánh cho “{node}” — bước này chưa bắt đầu.",
+      "viewGraph": "Graph",
+      "viewList": "List",
+      "viewToggleLabel": "Graph or list view",
+      "selectedNode": "Selected: {node}",
+      "controls": {
+        "pause": "Pause",
+        "pausePhasePausing": "Pausing…",
+        "pausePhasePaused": "Paused",
+        "resume": "Resume gate",
+        "steer": "Steer",
+        "steerSend": "Send",
+        "steerPlaceholder": "Message to steer the run…",
+        "confirmYes": "Confirm",
+        "confirmCancel": "Cancel",
+        "proposeFailed": "Could not propose the command.",
+        "confirmFailed": "Could not confirm the command.",
+        "confirm": {
+          "pause": "Confirm pause?",
+          "resume": "Confirm resume?",
+          "message": "Confirm sending this message?"
+        },
+        "reason": {
+          "run-terminal": "This run has ended.",
+          "agent-no-pause-seam": "An agent run has no pause seam inside a single turn — steer instead.",
+          "no-live-consumer": "This run is a mirrored or imported session, so no runner would deliver a control.",
+          "already-pause-requested": "A pause has already been requested.",
+          "not-paused": "The run is not paused.",
+          "still-pausing": "Still finishing in-flight operations.",
+          "no-executable-path": "Chưa có lệnh nào để thực hiện thao tác này.",
+          "no-project-scope": "Lần chạy này không có dự án, nên không thể ủy quyền điều khiển."
+        }
+      }
     },
     "masterAria": "danh sách lịch sử",
     "detailAria": "chi tiết mục"
@@ -758,6 +833,9 @@
       "noRuns": "chưa có lần chạy",
       "ago": " trước",
       "cancel": "hủy",
+      "discardWarning": "Bạn có thay đổi chưa lưu.",
+      "keepEditing": "Tiếp tục chỉnh sửa",
+      "discardChanges": "Bỏ thay đổi",
       "save": "lưu thay đổi",
       "saving": "đang lưu…",
       "saveFailed": "lưu thất bại.",
@@ -796,6 +874,7 @@
       "permission": "từ chối quyền truy cập",
       "missingDependency": "thiếu phụ thuộc",
       "notFound": "không tìm thấy tệp",
+      "unclassified": "lỗi chưa phân loại",
       "showDetails": "hiện lỗi đầy đủ",
       "hideDetails": "ẩn lỗi đầy đủ"
     }
@@ -837,7 +916,7 @@
     "stale": {
       "error": "lỗi · {message}",
       "unreachable": "không kết nối được API",
-      "lastUpdated": "cũ · cập nhật lần cuối {age} giây trước"
+      "lastUpdated": "cập nhật lần cuối {age} giây trước"
     },
     "detail": {
       "hint": "chọn một phiên để kiểm tra",
@@ -853,8 +932,7 @@
       "updated": "đã cập nhật",
       "branchesTitle": "nhánh ({count})",
       "noBranches": "không có nhánh.",
-      "msgs": " tin nhắn",
-      "engineRuns": "Lượt chạy engine"
+      "msgs": " tin nhắn"
     },
     "split": {
       "master": "danh sách phiên",
@@ -1000,7 +1078,7 @@
     "stale": {
       "error": "lỗi · {message}",
       "unreachable": "không kết nối được API",
-      "lastUpdated": "cũ · cập nhật lần cuối {age} giây trước"
+      "lastUpdated": "cập nhật lần cuối {age} giây trước"
     },
     "zeroState": {
       "heading": "bắt đầu",
@@ -1089,6 +1167,7 @@
     "showEarlier": "hiển thị {count, number} tin nhắn trước đó",
     "noArgs": "(không có đối số)",
     "noOutput": "(không có đầu ra)",
+    "outputWithheld": "chưa đọc",
     "roleUser": "người dùng",
     "roleThinking": "đang nghĩ",
     "roleResponse": "phản hồi",

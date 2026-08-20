@@ -58,32 +58,38 @@ def _svc_validate_identifier(value: str | None, field_name: str) -> None:
     _validate_identifier(value, field_name)
 
 
-_GITHUB_CURSOR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
-
-
 def _svc_validate_github_cursor(cursor: str | None) -> None:
-    """Service-boundary check: a github_cursor must be a UTC ISO-8601 instant
-    spelled exactly as GitHub spells it, ``YYYY-MM-DDTHH:MM:SSZ``.
+    """Service-boundary check: a github_cursor must be spelled the way the poller
+    writes one -- a UTC ISO-8601 instant as GitHub spells it, optionally followed
+    by the pull request that instant belongs to.
 
     The poller compares cursors as STRINGS against the API's own timestamps, so
     the format is a correctness contract rather than a presentation choice: a
     space separator, a fractional part, or a ``+00:00`` offset all denote the
     right instant and all order wrongly against ``2026-07-20T15:21:57Z``, which
-    silently makes the poller skip or replay events.
+    silently makes the poller skip or replay events. The trailing number is
+    fixed-width for that same reason.
+
+    The grammar is the poller's own, imported rather than restated: this
+    validator previously spelled a form the engine had stopped writing, so the
+    system succeeded at persisting a cursor its API then refused to accept, and
+    an operator replaying a stored value got an error on the scheduler's own
+    output.
 
     ``None`` is allowed and clears the cursor, meaning "no bookmark". That is a
     legitimate operator action and a consequential one -- an unbookmarked
-    merged-mode poll dispatches everything its scan reaches.
+    merged-mode poll dispatches everything its scan reaches -- and widening the
+    accepted spellings above does not widen it.
     """
     if cursor is None:
         return
-    if not isinstance(cursor, str) or not _GITHUB_CURSOR_RE.match(cursor):
-        raise ValueError(
-            "github_cursor must be a UTC ISO-8601 timestamp of the form "
-            f"YYYY-MM-DDTHH:MM:SSZ (got {cursor!r})"
-        )
+    from lionagi.studio.scheduler.github import CURSOR_FORM, CURSOR_RE
+
+    matched = CURSOR_RE.match(cursor) if isinstance(cursor, str) else None
+    if matched is None:
+        raise ValueError(f"github_cursor must be of the form {CURSOR_FORM} (got {cursor!r})")
     try:
-        datetime.strptime(cursor, "%Y-%m-%dT%H:%M:%SZ")
+        datetime.strptime(matched.group("instant"), "%Y-%m-%dT%H:%M:%SZ")
     except ValueError as exc:
         raise ValueError(f"github_cursor is not a real timestamp: {cursor!r}") from exc
 
@@ -324,11 +330,12 @@ def _validate_flow_yaml_spec(yaml_text: str) -> str | None:
     return validate_flow_spec_fields(normalize_flow_spec_keys(data))
 
 
-# Health severity is computed from cadence + observed schedule_runs rows,
-# never from next_fire_at -- next_fire_at is a promise the scheduler made,
-# not evidence that anything happened. A missed-fire/overlap/capacity skip
-# advances the cursor while recording no execution, so silence hidden behind
-# a pile of skips must still read as overdue, not healthy.
+# Health severity is computed from cadence + observed schedule_runs rows and,
+# for threshold alerts, the completed-evaluation watermark. It is never based
+# on next_fire_at -- next_fire_at is a promise the scheduler made, not evidence
+# that anything happened. A missed-fire/overlap/capacity skip advances the
+# cursor while recording no execution, so silence hidden behind a pile of skips
+# must still read as overdue, not healthy.
 _HEALTH_OVERDUE_MULTIPLIER = 3
 _HEALTH_OVERDUE_GRACE_FLOOR_SEC = 300  # 5 minutes
 
@@ -341,14 +348,40 @@ _HEALTH_FAILING_THRESHOLD = 1
 _HEALTH_FAILING_OUTCOMES = ("failed", "timed_out")
 
 
-def _schedule_cadence_seconds(row: dict[str, Any]) -> float | None:
-    # Shares the scheduler's own cadence resolution rather than retyping its
-    # fallback chain -- cron/at have no fixed period and resolve to None,
-    # which skips overdue detection for them rather than guessing from
-    # next_fire_at.
-    from ..scheduler.engine import resolve_schedule_cadence_seconds
+def _schedule_cadence_seconds(row: dict[str, Any], *, reference_at: float) -> float | None:
+    """Return the schedule's expected occurrence gap at ``reference_at``.
 
-    return resolve_schedule_cadence_seconds(row)
+    Fixed-period triggers share the scheduler's cadence resolver. Cron is not
+    fixed-period, so derive its local expected gap from two consecutive
+    occurrences after ``reference_at`` -- the newest liveness evidence the
+    caller has, which is the last execution for most schedules and the last
+    threshold evaluation for a detector that evaluates without firing. This
+    uses the same timezone resolver as the scheduler and never trusts
+    ``next_fire_at`` -- a stored cursor is a promise, not evidence of work.
+    """
+    from ..scheduler.engine import resolve_schedule_cadence_seconds, resolve_schedule_timezone
+
+    cadence = resolve_schedule_cadence_seconds(row)
+    if cadence is not None or row.get("trigger_type") != "cron":
+        return cadence
+
+    expr = row.get("cron_expr")
+    if not expr:
+        return None
+    try:
+        from croniter import croniter
+
+        start = datetime.fromtimestamp(reference_at, tz=resolve_schedule_timezone(row).tzinfo)
+        occurrences = croniter(expr, start_time=start)
+        first = occurrences.get_next(float)
+        second = occurrences.get_next(float)
+        gap = second - first
+        return gap if math.isfinite(gap) and gap > 0 else None
+    except Exception:
+        # Creation/update validation prevents this for current rows. Preserve
+        # list/detail availability for malformed legacy rows instead of making
+        # a read-only health badge take the whole schedules endpoint down.
+        return None
 
 
 def compute_schedule_health(
@@ -365,9 +398,12 @@ def compute_schedule_health(
     its schedule_runs history was pruned by retention; this table cannot
     distinguish those shapes from each other, so it reports "cannot tell"
     rather than guessing either way), overdue (enabled, cadence known, and
-    no execution evidence within grace of the expected cadence), failing
-    (the single latest executed run's outcome was failed/timed_out -- see
-    _HEALTH_FAILING_THRESHOLD), healthy (otherwise).
+    no liveness evidence within grace of the expected cadence), failing (the
+    single latest executed run's outcome was failed/timed_out -- see
+    _HEALTH_FAILING_THRESHOLD), healthy (otherwise). For a threshold alert,
+    ``last_evaluated_at`` is liveness evidence even when the metric did not
+    breach and therefore no schedule_run was created. It does not replace the
+    latest executed outcome used for the failing verdict.
 
     ``schedules.last_fired_at`` is a retained per-schedule column written by
     the normal occurrence paths -- it survives schedule_runs retention
@@ -383,20 +419,26 @@ def compute_schedule_health(
     last_executed_status = evidence.get("last_executed_status")
     last_recorded_at = evidence.get("last_recorded_run_at")
     last_fired_at = row.get("last_fired_at")
+    last_evaluated_at = row.get("last_evaluated_at") if row.get("threshold_config") else None
 
     if not row.get("enabled"):
         state = "disabled"
-    elif last_executed_at is None:
+    elif last_executed_at is None and last_evaluated_at is None:
         state = (
             "never-fired" if last_recorded_at is None and last_fired_at is None else "no-evidence"
         )
     else:
-        cadence_seconds = _schedule_cadence_seconds(row)
+        liveness_at = max(
+            timestamp
+            for timestamp in (last_executed_at, last_evaluated_at)
+            if timestamp is not None
+        )
+        cadence_seconds = _schedule_cadence_seconds(row, reference_at=liveness_at)
         overdue = (
             cadence_seconds is not None
             and cadence_seconds > 0
             and (
-                now - last_executed_at
+                now - liveness_at
                 > max(
                     cadence_seconds * _HEALTH_OVERDUE_MULTIPLIER,
                     cadence_seconds + _HEALTH_OVERDUE_GRACE_FLOOR_SEC,
@@ -445,6 +487,217 @@ async def list_schedules(
     return rows
 
 
+# The schedule_runs columns the run-summary surfaces serve. The table also carries
+# operational columns no client reads: action arguments, resume packets, lease holders,
+# capability and library references. The API answers without a token when
+# LIONAGI_STUDIO_AUTH_TOKEN is unset, so rows are projected onto this list rather than
+# passed through, which also means a column added to the table later stays private until
+# someone names it here.
+#
+# trigger_context and error_detail are content-bearing and are not on it. trigger_context
+# carries whole external event payloads; error_detail carries subprocess stderr and
+# exception text. Neither is a summary fact, so this surface serves a classification of
+# the failure instead of the text that produced it.
+_RUN_SUMMARY_FIELDS = (
+    "id",
+    "schedule_id",
+    "invocation_id",
+    "action_kind",
+    "status",
+    "exit_code",
+    "chain_depth",
+    "fired_at",
+    "ended_at",
+)
+
+# Ordered, so the first match wins. Keys are translated by the client; no text from the
+# error itself reaches this surface, including when nothing matches.
+_ERROR_CLASS_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"failed to spawn", re.I), "spawnFailed"),
+    (
+        re.compile(r"econnrefused|connection refused|connectionerror|network is unreachable", re.I),
+        "network",
+    ),
+    (re.compile(r"timed out|timeouterror", re.I), "timeout"),
+    (re.compile(r"permissionerror|permission denied", re.I), "permission"),
+    (re.compile(r"modulenotfounderror|importerror", re.I), "missingDependency"),
+    (re.compile(r"filenotfounderror|no such file or directory", re.I), "notFound"),
+)
+
+_UNCLASSIFIED_ERROR = "unclassified"
+
+
+def _error_class(detail: str | None) -> str | None:
+    """Classify a run's error text into a translatable key, or None when there is none."""
+    if not detail or not detail.strip():
+        return None
+    for pattern, key in _ERROR_CLASS_PATTERNS:
+        if pattern.search(detail):
+            return key
+    return _UNCLASSIFIED_ERROR
+
+
+def _error_class_for(row: dict[str, Any]) -> str | None:
+    """The classification a surface serves for one run.
+
+    Caller-reported outcome text wins: it is the layer the row's own `outcome`
+    reports, and classifying a layer that lost produces a class contradicting the
+    summary printed beside it. A generated summary makes no competing claim -- it is
+    a status word this module wrote -- so a row whose winning layer reported nothing
+    falls through to the occurrence's own error text, which is empty exactly when
+    there was no error. Suppressing the class there instead would leave a genuinely
+    failed run with no classification and no path to its detail.
+    """
+    reported = _reported_summary_class(row.get("outcome"))
+    if reported is not None:
+        return reported
+    return _error_class(row.get("error_detail"))
+
+
+def _run_summary(row: dict[str, Any]) -> dict[str, Any]:
+    summary = {name: row[name] for name in _RUN_SUMMARY_FIELDS if name in row}
+    summary["error_class"] = _error_class_for(row)
+    return summary
+
+
+# A run view adds the reconciled outcome and the joined session facts on top of the
+# occurrence row. These are the additions any list surface serves; the rest of the join
+# (leases, capabilities, library references, resume packets) stays private.
+#
+# `artifacts` and `session_ids` carry host paths and raw session ids, and they are here
+# because `li schedule runs` and `li schedule status` print them (studio/cli.py). They
+# reach the wire on these routes either way -- before this list existed the routes
+# returned the joined row verbatim -- so naming them is what turns a pass-through into
+# a decision, and what makes withholding them later a one-line change in one place.
+_RUN_VIEW_FIELDS = _RUN_SUMMARY_FIELDS + ("duration_ms", "artifacts", "session_ids")
+
+
+def _reported_summary_class(outcome: Any) -> str | None:
+    """The classification of an outcome summary that is caller-reported text, else None.
+
+    Keyed on the builder's own declaration, not on which branch produced the outcome:
+    the two branches that outrank the occurrence one carry `status_reason_summary`
+    verbatim, so a source test covers the lowest-precedence case and misses the two
+    that win.
+
+    An outcome that declares nothing is classified. A missing declaration and a
+    False one would otherwise be the same value, and they mean opposite things
+    here: only False says the text was generated and is safe to serve. Defaulting
+    the other way would let a builder added later ship caller text by forgetting a
+    key, which is the failure this classification exists to prevent.
+    """
+    if not isinstance(outcome, dict):
+        return None
+    summary = outcome.get("summary")
+    if not isinstance(summary, str) or outcome.get("summary_reported", True) is False:
+        return None
+    return _error_class(summary)
+
+
+def _run_view(row: dict[str, Any]) -> dict[str, Any]:
+    view = {name: row[name] for name in _RUN_VIEW_FIELDS if name in row}
+    view["error_class"] = _error_class_for(row)
+    if "outcome" in row:
+        outcome = row["outcome"]
+        classified = _reported_summary_class(outcome)
+        view["outcome"] = outcome if classified is None else {**outcome, "summary": classified}
+    return view
+
+
+# The single-run route is the documented reader of the raw failure text -- the list
+# surfaces serve a classification instead -- which is why error_detail is here and off
+# _RUN_SUMMARY_FIELDS. trigger_context stays private on the list surfaces' reasoning:
+# whole external event payloads, and no client reads it.
+_RUN_RECORD_FIELDS = _RUN_VIEW_FIELDS + ("error_detail",)
+
+
+def _run_record(row: dict[str, Any]) -> dict[str, Any]:
+    """One run as the single-run route serves it.
+
+    Built directly rather than on top of _run_view, because that one sanitises a
+    reported outcome summary and this surface must not. error_detail is the raw text
+    only when the occurrence is the layer that won; when a session or invocation
+    reported the failure instead, the summary IS the text, and replacing it with a
+    class would leave this route -- the one place raw text is reachable -- with no text
+    at all for exactly those runs.
+
+    chain_children is a list surface nested inside a record, so it takes the run-list
+    projection; absent rather than empty on a run that is itself a child.
+    """
+    record = {name: row[name] for name in _RUN_RECORD_FIELDS if name in row}
+    record["error_class"] = _error_class_for(row)
+    if "outcome" in row:
+        record["outcome"] = row["outcome"]
+    if "chain_children" in row:
+        record["chain_children"] = [_run_summary(child) for child in row["chain_children"]]
+    return record
+
+
+# The schedule columns the list surfaces serve. The table carries roughly twice this
+# many: authored specs, flow YAML, shell commands and their arguments, notification
+# targets, poll cursors, ownership keys and lease bookkeeping. None of those has a
+# reader in the app, and the API answers without a token when LIONAGI_STUDIO_AUTH_TOKEN
+# is unset, so records are projected onto this list rather than passed through -- which
+# also means a column added to the table later stays private until someone names it here.
+_SCHEDULE_SUMMARY_FIELDS = (
+    "id",
+    "name",
+    "description",
+    "enabled",
+    "trigger_type",
+    "cron_expr",
+    "interval_sec",
+    "github_repo",
+    "github_filter",
+    "poll_interval_sec",
+    "action_kind",
+    "action_model",
+    "action_agent",
+    "action_playbook",
+    "action_project",
+    "last_fired_at",
+    "last_evaluated_at",
+    "next_fire_at",
+    "missed_fire_policy",
+    "overlap_policy",
+    "project",
+    # Not read by any web view, so the allow-list is not derivable from the client's
+    # declared shape alone: `li schedule list` renders the remaining-runs counter, and
+    # `li schedule get` is the only surface an operator can read spend from. These are
+    # counters and totals, not the authored payload the record fields below hold.
+    "max_runs",
+    "remaining_runs",
+    "budget_usd",
+    "budget_tokens",
+    "spend_usd",
+    "spend_tokens",
+    "unreported_sessions",
+    "spend_is_partial",
+    "consecutive_failures",
+    "last_status",
+    "health_state",
+    "health_last_outcome",
+    "health_last_outcome_at",
+    "health_since",
+    "created_at",
+    "updated_at",
+)
+
+
+# Served by the record view and by no list surface. The prompt text and the two policy
+# objects are read back only to prefill the edit form, which loads one schedule.
+# `action_cwd` is an absolute path on the daemon's host, and `li schedule create
+# --machine` reads it back from this route to report the execution root that was
+# actually persisted, which it resolves from its own environment when the caller
+# named neither a cwd nor a project.
+_SCHEDULE_RECORD_FIELDS = ("action_prompt", "on_success", "on_fail", "action_cwd")
+
+
+def _schedule_summary(row: dict[str, Any], *, record: bool = False) -> dict[str, Any]:
+    names = _SCHEDULE_SUMMARY_FIELDS + (_SCHEDULE_RECORD_FIELDS if record else ())
+    return {name: row[name] for name in names if name in row}
+
+
 async def _attach_spend(db: StateDB, row: dict[str, Any]) -> None:
     """Attach the spend rollup to *row* in place, for schedules with a configured budget.
 
@@ -468,6 +721,10 @@ async def get_schedule(schedule_id: str) -> dict[str, Any] | None:
         if not row:
             return None
         runs = await db.list_schedule_runs(schedule_id, limit=10)
+        # Reconciled here, not in the route: the nested slice is served beside the
+        # top-level run lists and would otherwise classify the occurrence row while
+        # they classify the session or invocation that outranks it.
+        runs = [{**run, **await run_view.build_run_view_for(db, run)} for run in runs]
         if row.get("max_runs"):
             used = await db.count_schedule_runs(schedule_id, chain_depth=0)
             row["remaining_runs"] = max(row["max_runs"] - used, 0)
@@ -874,7 +1131,7 @@ async def list_schedules_route(
     project: str | None = Query(default=None),
 ) -> dict[str, Any]:
     rows = await list_schedules(enabled=enabled, trigger_type=trigger_type, project=project)
-    return {"schedules": rows}
+    return {"schedules": [_schedule_summary(row) for row in rows]}
 
 
 @studio_route("/schedules/limits", method="GET", area="schedules", name="schedule_limits")
@@ -902,7 +1159,11 @@ async def get_schedule_route(schedule_id: str) -> dict[str, Any]:
     data = await get_schedule(schedule_id)
     if data is None:
         raise HTTPException(status_code=404, detail=f"Schedule '{schedule_id}' not found")
-    return data
+    # recent_runs is a list surface nested inside a record, so it takes the same
+    # projection the top-level run lists take rather than inheriting the record's.
+    detail = _schedule_summary(data, record=True)
+    detail["recent_runs"] = [_run_summary(run) for run in data.get("recent_runs", [])]
+    return detail
 
 
 @studio_route(
@@ -914,7 +1175,7 @@ async def get_schedule_route(schedule_id: str) -> dict[str, Any]:
 )
 async def create_schedule_route(body: CreateScheduleRequest) -> dict[str, Any]:
     try:
-        return await create_schedule(body.model_dump(exclude_none=True))
+        return _schedule_summary(await create_schedule(body.model_dump(exclude_none=True)))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except NameConflictError as exc:
@@ -1018,7 +1279,12 @@ async def list_schedule_runs_route(
     # RunView-enriched rows (adds outcome/duration_ms/session_ids/artifacts
     # additively) — status is repeatable (?status=failed&status=timed_out).
     rows = await list_schedule_run_views(schedule_id, status=status, limit=limit, offset=offset)
-    return {"runs": rows, "limit": limit, "offset": offset, "has_next": len(rows) == limit}
+    return {
+        "runs": [_run_view(row) for row in rows],
+        "limit": limit,
+        "offset": offset,
+        "has_next": len(rows) == limit,
+    }
 
 
 # Top-level schedule-runs endpoint for looking up a single run by ID
@@ -1033,7 +1299,9 @@ async def get_schedule_run_route(run_id: str) -> dict[str, Any]:
     data = await get_schedule_run(run_id)
     if data is None:
         raise HTTPException(status_code=404, detail=f"Schedule run '{run_id}' not found")
-    return data
+    # The service returns the joined row; the wire gets the projection. Applying it here
+    # rather than in the service keeps the in-process readers of the full row whole.
+    return _run_record(data)
 
 
 @studio_route(
@@ -1046,4 +1314,9 @@ async def get_schedule_status_route(schedule_id: str) -> dict[str, Any]:
     data = await get_schedule_status(schedule_id)
     if data is None:
         raise HTTPException(status_code=404, detail=f"Schedule '{schedule_id}' not found")
-    return data
+    latest = data.get("latest_run")
+    return {
+        **data,
+        "schedule": _schedule_summary(data["schedule"]),
+        "latest_run": _run_view(latest) if latest else latest,
+    }

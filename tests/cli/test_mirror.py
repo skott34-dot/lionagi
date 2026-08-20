@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -38,7 +39,7 @@ from lionagi.state.db import StateDB
 SID = "11111111-2222-3333-4444-555555555555"
 
 
-# ── Event builders (verified Claude JSONL shapes) ────────────────────────────
+# Event builders (verified Claude JSONL shapes)
 
 
 def _user_text(uuid: str, text: str, *, ts: str = "2026-06-20T00:00:00.000Z") -> dict:
@@ -86,7 +87,7 @@ def _db_content(msg) -> dict:
     return json.loads(c) if isinstance(c, str) else c
 
 
-# ── messages_for_event: mapping + ordering + linkage ─────────────────────────
+# messages_for_event: mapping + ordering + linkage
 
 
 def test_user_text_maps_to_single_instruction() -> None:
@@ -211,7 +212,7 @@ def test_deterministic_ids_are_idempotent() -> None:
     assert ids1 == ids2
 
 
-# ── mirror_session: idempotent write + status lifecycle ──────────────────────
+# mirror_session: idempotent write + status lifecycle
 
 
 def _conversation() -> list[dict]:
@@ -404,7 +405,7 @@ async def test_mirror_session_is_idempotent(temp_db_path: Path) -> None:
     assert first == second  # no duplicate appends
 
 
-# ── link_escalation_session: escalation-leg mirror attribution ──────────────
+# link_escalation_session: escalation-leg mirror attribution
 
 
 @pytest.mark.asyncio
@@ -450,6 +451,55 @@ async def test_link_escalation_session_overwrites_orphan_attribution(
     assert after["project_source"] == "escalation_parent"
     assert after["name"] == "escalation of gate-runner-4"
     assert after["node_metadata"]["escalated_from_session"] == "parent-op-1"
+
+
+@pytest.mark.asyncio
+async def test_link_engine_child_session_stamps_marker_and_name(
+    temp_db_path: Path,
+) -> None:
+    """An engine-backed actor's CLI transcript is mirrored with a name derived
+    from its first prompt (the actor's own system prompt). The link write must
+    replace that name and stamp the flat parent marker listings filter on."""
+    from lionagi.state.claude_mirror import link_engine_child_session
+
+    async with StateDB() as db:
+        await mirror_session(
+            db,
+            session_uid=SID,
+            events=_conversation(),
+            tool_names={},
+            name="You are the resident Operator for Lion Studio. Be concise",
+            status="running",
+        )
+        linked = await link_engine_child_session(
+            db,
+            session_uid=SID,
+            parent_run_id="parent-canonical-run",
+            name="Operator · engine transcript",
+        )
+        after = await db.get_session(session_db_id(SID))
+
+    assert linked is True
+    assert after["name"] == "Operator · engine transcript"
+    assert after["node_metadata"]["engine_parent_run_id"] == "parent-canonical-run"
+
+
+@pytest.mark.asyncio
+async def test_link_engine_child_session_missing_row_returns_false(
+    temp_db_path: Path,
+) -> None:
+    """Before the mirror mints the row there is nothing to stamp; the caller
+    retries on False rather than treating it as done."""
+    from lionagi.state.claude_mirror import link_engine_child_session
+
+    async with StateDB() as db:
+        linked = await link_engine_child_session(
+            db,
+            session_uid=SID,
+            parent_run_id="parent-canonical-run",
+            name="Operator · engine transcript",
+        )
+    assert linked is False
 
 
 @pytest.mark.asyncio
@@ -601,11 +651,14 @@ async def test_reconcile_flips_running_to_completed_when_idle(temp_db_path: Path
         )
         before = await db.get_session(session_db_id(SID))
         # Wall-clock well past the last message -> idle -> completed.
-        await reconcile_session_status(db, SID, now=before["updated_at"] + 10_000, live_window=300)
+        settled = await reconcile_session_status(
+            db, SID, now=before["updated_at"] + 10_000, live_window=300
+        )
         after = await db.get_session(session_db_id(SID))
     assert before["status"] == "running"
     assert after["status"] == "completed"
     assert after["status_reason_code"] == RunReasons.COMPLETED_OK
+    assert settled is True
 
 
 @pytest.mark.asyncio
@@ -687,10 +740,38 @@ async def test_reconcile_reactivates_completed_when_fresh(temp_db_path: Path) ->
         )
         before = await db.get_session(session_db_id(SID))
         # "now" within the live window of the last message -> running.
-        await reconcile_session_status(db, SID, now=before["updated_at"] + 1, live_window=300)
+        settled = await reconcile_session_status(
+            db, SID, now=before["updated_at"] + 1, live_window=300
+        )
         after = await db.get_session(session_db_id(SID))
     assert before["status"] == "completed"
     assert after["status"] == "running"
+    assert settled is False
+
+
+@pytest.mark.asyncio
+async def test_reconcile_reactivation_clears_terminal_stamps(temp_db_path: Path) -> None:
+    """A reactivated session is running again: its terminal ended_at and
+    duration_ms must not survive the flip, or listings read "running yet
+    ended days ago" and elapsed-time surfaces keep growing off the stale
+    end mark."""
+    async with StateDB() as db:
+        await mirror_session(
+            db, session_uid=SID, events=_conversation(), tool_names={}, status="running"
+        )
+        row = await db.get_session(session_db_id(SID))
+        lm = row["last_message_at"]
+        # Go idle far past the window: terminal write stamps ended_at.
+        await reconcile_session_status(db, SID, now=lm + 10_000, live_window=300)
+        ended = await db.get_session(session_db_id(SID))
+        assert ended["status"] == "completed"
+        assert ended["ended_at"] is not None
+        # Transcript resumes within the window of the last message.
+        await reconcile_session_status(db, SID, now=lm + 1, live_window=300)
+        after = await db.get_session(session_db_id(SID))
+    assert after["status"] == "running"
+    assert after["ended_at"] is None
+    assert after["duration_ms"] is None
 
 
 @pytest.mark.asyncio
@@ -856,7 +937,7 @@ async def test_mirror_session_empty_no_session(temp_db_path: Path) -> None:
     assert row is None
 
 
-# ── watcher passes: session-level liveness across multiple files ─────────────
+# watcher passes: session-level liveness across multiple files
 
 
 def _iso(dt: datetime) -> str:
@@ -922,6 +1003,257 @@ async def test_multifile_session_completes_when_all_files_idle(
         row = await db.get_session(session_db_id(uid))
     assert row is not None
     assert row["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_idle_transcript_status_reconciliation_quiesces_after_cold_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Idle history costs one cold reconciliation, not one DB read per poll forever.
+
+    This models Studio's default five-second ambient-mirror poll with a bounded
+    but non-trivial transcript population.  Every file is already at EOF and
+    older than the liveness window, so the first pass must still repair stale
+    ``running`` rows after a daemon restart.  Once that check succeeds, another
+    unchanged pass has no new liveness fact to ask StateDB about.
+    """
+    import lionagi.cli.mirror as mirror_mod
+
+    root = tmp_path / "projects"
+    now = 1_800_000_000.0
+    states: dict[str, _FileState] = {}
+    expected_uids: list[str] = []
+    for index in range(64):
+        uid = f"idle-{index:04d}"
+        path = root / "-work-acme" / f"{uid}.jsonl"
+        _write_session_file(path, uid, age_secs=3600)
+        os.utime(path, (now - 600, now - 600))
+        states[str(path)] = _FileState(
+            session_uid=uid,
+            offset=path.stat().st_size,
+            project="acme",
+            attr_peeked=True,
+        )
+        expected_uids.append(uid)
+
+    calls: list[str] = []
+
+    async def _record_reconcile(_db, uid, **_kwargs):
+        calls.append(uid)
+        return True
+
+    monkeypatch.setattr(mirror_mod.time, "time", lambda: now)
+    monkeypatch.setattr(
+        "lionagi.state.claude_mirror.reconcile_session_status",
+        _record_reconcile,
+    )
+
+    await _one_pass(None, root, states, {}, since=None, live_window=300)
+    await _one_pass(None, root, states, {}, since=None, live_window=300)
+
+    assert calls == expected_uids
+
+
+@pytest.mark.asyncio
+async def test_live_transcript_reconciles_until_one_final_idle_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The DB liveness verdict, not file mtime, controls the final idle check."""
+    import lionagi.cli.mirror as mirror_mod
+
+    root = tmp_path / "projects"
+    uid = "live-then-idle"
+    path = root / "-work-acme" / f"{uid}.jsonl"
+    _write_session_file(path, uid, age_secs=10)
+    modified_at = 1_800_000_000.0
+    # A copied/restored transcript can have an old filesystem timestamp while
+    # the event timestamp persisted in StateDB is still live.  File mtime is a
+    # scan hint, never the liveness source of truth.
+    os.utime(path, (modified_at - 600, modified_at - 600))
+    states = {
+        str(path): _FileState(
+            session_uid=uid,
+            offset=path.stat().st_size,
+            project="acme",
+            attr_peeked=True,
+        )
+    }
+    calls: list[str] = []
+    settled = {"value": False}
+
+    async def _record_reconcile(_db, reconciled_uid, **_kwargs):
+        calls.append(reconciled_uid)
+        return settled["value"]
+
+    monkeypatch.setattr(mirror_mod.time, "time", lambda: modified_at)
+    monkeypatch.setattr(
+        "lionagi.state.claude_mirror.reconcile_session_status",
+        _record_reconcile,
+    )
+
+    # Still live according to the persisted message clock: keep observing even
+    # though the file itself already looks old.
+    await _one_pass(None, root, states, {}, since=None, live_window=300)
+    await _one_pass(None, root, states, {}, since=None, live_window=300)
+    # The DB reports the final idle transition as settled.  Later unchanged
+    # polls are quiescent.
+    settled["value"] = True
+    await _one_pass(None, root, states, {}, since=None, live_window=300)
+    await _one_pass(None, root, states, {}, since=None, live_window=300)
+
+    assert calls == [uid, uid, uid]
+
+
+@pytest.mark.asyncio
+async def test_an_unwindowed_pass_does_not_stat_for_a_window_it_will_not_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`li mirror` defaults to no window, and mtime has no consumer but the
+    window check. Reading it anyway costs one syscall per transcript per pass,
+    on the loop whose whole purpose is not to touch settled files."""
+    import lionagi.cli.mirror as mirror_mod
+
+    root = tmp_path / "projects"
+    uid = "unwindowed"
+    path = root / "-work-acme" / f"{uid}.jsonl"
+    _write_session_file(path, uid, age_secs=10)
+    now = 1_800_000_000.0
+    os.utime(path, (now - 600, now - 600))
+
+    real_stat = Path.stat
+    stats: list[Path] = []
+
+    def _counting_stat(self: Path, *args, **kwargs):
+        if self == path:
+            stats.append(self)
+        return real_stat(self, *args, **kwargs)
+
+    async def _settled_reconcile(_db, _uid, **_kwargs):
+        return True
+
+    monkeypatch.setattr(mirror_mod.time, "time", lambda: now)
+    monkeypatch.setattr(
+        "lionagi.state.claude_mirror.reconcile_session_status",
+        _settled_reconcile,
+    )
+
+    async def _count(since: float | None) -> int:
+        states = {
+            str(path): _FileState(
+                session_uid=uid,
+                offset=path.stat().st_size,
+                project="acme",
+                attr_peeked=True,
+            )
+        }
+        stats.clear()
+        monkeypatch.setattr(Path, "stat", _counting_stat)
+        try:
+            await _one_pass(None, root, states, {}, since=since, live_window=300)
+        finally:
+            monkeypatch.setattr(Path, "stat", real_stat)
+        return len(stats)
+
+    # One stat either way for the cursor's size check, plus the window's own
+    # when there is a window to enforce.
+    assert await _count(None) == 1
+    assert await _count(3600.0) == 2
+
+
+@pytest.mark.asyncio
+async def test_an_unwindowed_codex_pass_does_not_stat_for_the_window_either(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same rule on the Codex sweep, which carries its own copy of the check."""
+    import lionagi.cli.mirror as mirror_mod
+
+    now = 1_800_000_000.0
+    uid = "0199cccc-0000-0000-0000-0000000000cc"
+    path = tmp_path / "2026" / "08" / "16" / "rollout-unwindowed.jsonl"
+    path.parent.mkdir(parents=True)
+    path.write_text("{}\n")
+    os.utime(path, (now - 600, now - 600))
+
+    real_stat = Path.stat
+    stats: list[Path] = []
+
+    def _counting_stat(self: Path, *args, **kwargs):
+        if self == path:
+            stats.append(self)
+        return real_stat(self, *args, **kwargs)
+
+    async def _settled_reconcile(_db, _uid, **_kwargs):
+        return True
+
+    monkeypatch.setattr(mirror_mod.time, "time", lambda: now)
+    monkeypatch.setattr(
+        "lionagi.state.codex_mirror.reconcile_session_status",
+        _settled_reconcile,
+    )
+
+    async def _count(since: float | None) -> int:
+        states = {
+            str(path): _FileState(
+                session_uid=uid,
+                offset=path.stat().st_size,
+                head_checked=True,
+                codex_provenance_peeked=True,
+            )
+        }
+        stats.clear()
+        monkeypatch.setattr(Path, "stat", _counting_stat)
+        try:
+            await mirror_mod._codex_pass(
+                None, tmp_path, states, {}, since=since, live_window=300, threads={}
+            )
+        finally:
+            monkeypatch.setattr(Path, "stat", real_stat)
+        return len(stats)
+
+    windowed = await _count(3600.0)
+    assert await _count(None) == windowed - 1
+
+
+@pytest.mark.asyncio
+async def test_idle_codex_rollout_status_reconciliation_also_quiesces(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bounded polling rule covers Studio's default Codex tree too."""
+    import lionagi.cli.mirror as mirror_mod
+
+    now = 1_800_000_000.0
+    uid = "0199bbbb-0000-0000-0000-000000000099"
+    path = tmp_path / "2026" / "08" / "11" / "rollout-idle.jsonl"
+    path.parent.mkdir(parents=True)
+    path.write_text("{}\n")
+    os.utime(path, (now - 600, now - 600))
+    state = _FileState(
+        session_uid=uid,
+        offset=path.stat().st_size,
+        head_checked=True,
+        codex_provenance_peeked=True,
+    )
+    states = {str(path): state}
+    calls: list[str] = []
+
+    async def _record_reconcile(_db, reconciled_uid, **_kwargs):
+        calls.append(reconciled_uid)
+        return True
+
+    monkeypatch.setattr(mirror_mod.time, "time", lambda: now)
+    monkeypatch.setattr(
+        "lionagi.state.codex_mirror.reconcile_session_status",
+        _record_reconcile,
+    )
+
+    await mirror_mod._codex_pass(
+        None, tmp_path, states, {}, since=None, live_window=300, threads={}
+    )
+    await mirror_mod._codex_pass(
+        None, tmp_path, states, {}, since=None, live_window=300, threads={}
+    )
+
+    assert calls == [uid]
 
 
 @pytest.mark.asyncio
@@ -1012,7 +1344,7 @@ async def test_mirror_forever_retries_after_connection_open_failure(
     assert alive, "tail died on a transient open failure instead of retrying"
 
 
-# ── watcher helpers: tailing + parsing ───────────────────────────────────────
+# watcher helpers: tailing + parsing
 
 
 def test_read_new_events_buffers_partial_line(tmp_path: Path) -> None:
@@ -1103,7 +1435,7 @@ def test_since_window_argparse_type() -> None:
         _since_window("")  # empty is rejected at the CLI boundary (default=None handles "all")
 
 
-# ── project attribution fallback ─────────────────────────────────────────────
+# project attribution fallback
 
 
 def test_fallback_project_uses_folder_name_when_dir_exists(tmp_path: Path) -> None:
@@ -1137,7 +1469,7 @@ def test_derive_metadata_others_when_cwd_gone() -> None:
 
 
 def test_derive_metadata_captures_raw_cwd_as_artifact_root(tmp_path: Path) -> None:
-    # issue #2848: the raw cwd (not the bucketed project name) is the session's
+    # the raw cwd (not the bucketed project name) is the session's
     # artifact root -- every file the CLI touched lives under it.
     work = tmp_path / "my-workspace"
     work.mkdir()
@@ -1175,7 +1507,7 @@ async def test_mirror_session_backfills_missing_project(temp_db_path: Path) -> N
 
 @pytest.mark.asyncio
 async def test_mirror_session_writes_artifacts_path_from_cwd(temp_db_path: Path) -> None:
-    # issue #2848: a mirrored CLI session's cwd is its artifact root -- the run
+    # a mirrored CLI session's cwd is its artifact root -- the run
     # file viewer is otherwise structurally dead for every mirrored session.
     events = _conversation()
     async with StateDB() as db:
@@ -1204,7 +1536,7 @@ async def test_mirror_session_does_not_clobber_an_existing_artifacts_path(
     assert row["artifacts_path"] == "/work/first-guess"
 
 
-# ── conversation-lineage detector ────────────────────────────────────────────
+# conversation-lineage detector
 
 
 def _lineage_event(uid: str, euid: str, parent: str | None, role: str, text: str) -> dict:
@@ -1342,7 +1674,7 @@ async def test_idle_session_backfilled_with_project(temp_db_path: Path, tmp_path
 async def test_idle_session_backfilled_with_artifacts_path_even_when_project_already_set(
     temp_db_path: Path, tmp_path: Path
 ) -> None:
-    # issue #2848: the dominant NULL-artifacts_path population is sessions the
+    # the dominant NULL-artifacts_path population is sessions the
     # mirror already attributed a project to (in an earlier process) before this
     # fix existed -- artifacts_path must backfill on its own, not only when
     # project is also missing.
@@ -1447,7 +1779,7 @@ async def test_peek_head_skips_non_dict_head_line(temp_db_path: Path, tmp_path: 
     assert row["status"] == "completed"
 
 
-# ── restart durability: derived state persisted with the cursor ──────────────
+# restart durability: derived state persisted with the cursor
 
 
 @pytest.mark.asyncio
@@ -1574,7 +1906,7 @@ async def test_codex_file_that_mirrors_nothing_is_reported_not_skipped(tmp_path,
     assert state.barren_reported
 
 
-# ── Orchestrated codex rollouts (headless `codex exec`) ──────────────────────
+# Orchestrated codex rollouts (headless `codex exec`)
 
 
 def _codex_rollout_lines(uid: str, originator: str) -> str:
@@ -1727,7 +2059,7 @@ async def test_interactive_rollout_still_mirrors(tmp_path):
 
 
 async def test_interactive_rollout_records_artifacts_path_from_header_cwd(tmp_path):
-    # issue #2848: the session_meta header's cwd is the rollout's artifact root,
+    # the session_meta header's cwd is the rollout's artifact root,
     # the same gap claude_mirror had.
     from lionagi.cli.mirror import _FileState, _mirror_one_codex
     from lionagi.state.codex_mirror import session_db_id as codex_sid
@@ -2248,7 +2580,7 @@ async def test_a_failed_prior_stem_absorption_also_leaves_the_file_eligible(tmp_
     assert calls == [uid, stem, uid, stem], f"absorption ids across both passes: {calls}"
 
 
-# ── Bounded preview + source pointer codec (mirror_spec.md) ──────────────────
+# Bounded preview + source pointer codec (mirror_spec.md)
 
 
 def _source_line_for(raw: bytes, path: Path) -> SourceLine:
@@ -2609,12 +2941,12 @@ def test_config_omitted_preview_chars_defaults_to_500(monkeypatch):
     assert config_mod.MIRROR_PREVIEW_CHARS == 500
 
 
-# ── Live-path mirror bounding: oversized ingestion through the three real
+# Live-path mirror bounding: oversized ingestion through the three real
 # writers (claude_mirror.py, codex_mirror.py, cli/mirror.py). A unit test on
 # the codec alone (above) does not prove these are wired; each test here
 # writes an oversized transcript to disk and reads the row back out of a real
 # StateDB after it went through the module's own tailer, never constructing
-# the pointer by hand. ──────────────────────────────────────────────────────
+# the pointer by hand.
 
 _OVERSIZED_TEXT = "z" * 5000  # far beyond MIRROR_PREVIEW_CHARS default (500)
 
@@ -2852,10 +3184,7 @@ async def test_live_cli_mirror_run_once_relative_root_produces_resolvable_pointe
 
 
 def test_grep_evidence_live_mirror_paths_call_bound_mirror_content() -> None:
-    """Regression guard for the round-1 gate finding ("zero callers"): the two
-    writers must call the bounding codec directly, and the CLI tailer that
-    feeds them must thread the source-pointer data (byte offsets + the
-    preview-chars budget) into every live write."""
+    """The bounding codec must not end up with zero callers: both writers call it directly and the CLI tailer threads the source-pointer data into every live write."""
     root = Path(__file__).resolve().parents[2] / "lionagi"
     codec_callers = {
         root / "state" / "claude_mirror.py": "claude_mirror.py",
@@ -2913,3 +3242,105 @@ async def test_an_imported_rollout_leaves_the_role_field_empty(tmp_path):
 
     # The point of clearing the field: the prompt now reaches the display name.
     assert resolve_display_name(dict(session)) == "q"
+
+
+# Mirror configuration refuses values it does not recognize. The flags below
+# decide whether Studio reads the user's own transcript trees, so a value the
+# parser cannot classify must stop startup rather than pick a side. Deciding by
+# exclusion picked the reading side: anything that was not a known false
+# spelling counted as true.
+
+
+def _reload_config():
+    import importlib
+
+    from lionagi.studio import config as config_mod
+
+    return importlib.reload(config_mod), config_mod
+
+
+def _restore_config(monkeypatch):
+    for var in (
+        "LIONAGI_STUDIO_MIRROR_IMPORT_AMBIENT",
+        "LIONAGI_STUDIO_MIRROR_CLAUDE",
+        "LIONAGI_STUDIO_MIRROR_SOURCE",
+        "LIONAGI_HOME",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    _reload_config()
+
+
+@pytest.mark.parametrize("value", ["disabled", "none", "of", "off ,", "2", "yes please"])
+def test_an_unrecognized_ambient_import_value_is_refused(monkeypatch, value):
+    """The flagged case: these all read as ON under an exclusion test."""
+    monkeypatch.setenv("LIONAGI_STUDIO_MIRROR_IMPORT_AMBIENT", value)
+    try:
+        with pytest.raises(ValueError, match="LIONAGI_STUDIO_MIRROR_IMPORT_AMBIENT"):
+            _reload_config()
+    finally:
+        _restore_config(monkeypatch)
+
+
+def test_an_unrecognized_mirror_enable_value_is_refused(monkeypatch):
+    """Same construct, one flag over: the outer gate on the whole mirror."""
+    monkeypatch.setenv("LIONAGI_STUDIO_MIRROR_CLAUDE", "disabled")
+    try:
+        with pytest.raises(ValueError, match="LIONAGI_STUDIO_MIRROR_CLAUDE"):
+            _reload_config()
+    finally:
+        _restore_config(monkeypatch)
+
+
+def test_an_unrecognized_mirror_source_is_refused(monkeypatch):
+    """Same defect, different shape: this one fell back to the widest choice."""
+    monkeypatch.setenv("LIONAGI_STUDIO_MIRROR_SOURCE", "cladue")
+    try:
+        with pytest.raises(ValueError, match="LIONAGI_STUDIO_MIRROR_SOURCE"):
+            _reload_config()
+    finally:
+        _restore_config(monkeypatch)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("0", False),
+        ("false", False),
+        ("no", False),
+        ("off", False),
+        ("", False),
+        ("1", True),
+        ("true", True),
+        ("yes", True),
+        ("on", True),
+        ("ON", True),
+        (" 1 ", True),
+    ],
+)
+def test_recognized_spellings_still_decide_both_ways(monkeypatch, value, expected):
+    """Regression guard, not a defect detector: these passed before the change too."""
+    monkeypatch.setenv("LIONAGI_STUDIO_MIRROR_IMPORT_AMBIENT", value)
+    try:
+        config_mod, _ = _reload_config()
+        assert config_mod.MIRROR_IMPORT_AMBIENT is expected
+    finally:
+        _restore_config(monkeypatch)
+
+
+def test_an_unset_flag_still_takes_the_computed_default(monkeypatch, tmp_path):
+    """An isolated LIONAGI_HOME opts out of ambient trees unless asked back in.
+
+    This is the path the helper must not swallow: with the variable absent the
+    default is computed, not parsed.
+    """
+    monkeypatch.delenv("LIONAGI_STUDIO_MIRROR_IMPORT_AMBIENT", raising=False)
+    monkeypatch.setenv("LIONAGI_HOME", str(tmp_path / "isolated"))
+    try:
+        config_mod, _ = _reload_config()
+        assert config_mod.MIRROR_IMPORT_AMBIENT is False
+        # and an explicit opt-in still overrides that default
+        monkeypatch.setenv("LIONAGI_STUDIO_MIRROR_IMPORT_AMBIENT", "1")
+        config_mod, _ = _reload_config()
+        assert config_mod.MIRROR_IMPORT_AMBIENT is True
+    finally:
+        _restore_config(monkeypatch)

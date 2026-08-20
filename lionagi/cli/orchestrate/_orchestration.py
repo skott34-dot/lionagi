@@ -4,11 +4,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import logging
 import os
 import re
+import sqlite3
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -256,10 +258,19 @@ def role_config(role: str, pack: Pack | None = None) -> Any:
 
 
 def resolve_modes(
-    role: str, override: list[str] | None = None, pack: Pack | None = None
+    role: str,
+    override: list[str] | None = None,
+    pack: Pack | None = None,
+    *,
+    reject_invalid: bool = False,
 ) -> list[str]:
     """Cognitive modes for *role*: validated per-task override, else pack
-    defaults. Invalid/disallowed modes are dropped with a warning."""
+    defaults.
+
+    Invalid/disallowed modes retain the historical warning-and-drop behavior
+    unless ``reject_invalid`` is set. Planning surfaces use the strict form so
+    an executor never silently weakens a plan it already accepted.
+    """
     import logging
 
     from lionagi.casts.pattern import Mode
@@ -272,13 +283,18 @@ def resolve_modes(
     out: list[str] = []
     for m in requested:
         if gated and allow is not None and m not in allow:
+            message = f"mode {m!r} not permitted for role {role!r} (allow={sorted(allow)})"
+            if reject_invalid:
+                raise ValueError(message)
             log.warning(
                 "mode %r not permitted for role %r (allow=%s); dropping", m, role, sorted(allow)
             )
             continue
         try:
             Mode.load(m)
-        except ValueError:
+        except ValueError as exc:
+            if reject_invalid:
+                raise ValueError(f"unknown mode {m!r} for role {role!r}") from exc
             log.warning("unknown mode %r for role %r; dropping", m, role)
             continue
         out.append(m)
@@ -533,6 +549,10 @@ class OrchestrationEnv:
     budget_deadline_epoch: float | None = None
     _live_persist: dict | None = field(default=None, repr=False)
     _run_manifest: dict[str, Any] = field(default_factory=dict, repr=False)
+    # Capacity-refused reactive work, populated after DAG execution and
+    # consumed by terminal persistence. Kept on the run env so it survives
+    # the phase boundary without being confused with operation failures.
+    _spawn_refusal_evidence: list[dict[str, Any]] = field(default_factory=list, repr=False)
     _name_counts: dict[str, int] = field(default_factory=dict)
     _all_names: list[str] = field(default_factory=list)
 
@@ -574,20 +594,9 @@ class OrchestrationEnv:
 def _hand_mcp_servers(imodel, servers: dict | None, *, label: str) -> None:
     """Give one worker's model the run's server set, or say it could not be given.
 
-    A caller who named a set for this run gets that set applied to every worker
-    whose provider has a transport for one, and is told about every worker whose
-    provider has none. Which providers those are is not decided here — the
-    request is where the set lands, so the function that writes it is the one
-    that answers whether it landed.
-
-    An empty set and no set are different requests. ``{}`` is the caller having
-    asked for no servers, so it is applied as the whole set rather than as
-    nothing to add. ``None`` is there being nothing to hand over, and the model
-    keeps whatever it would have used.
-
-    *label* names the worker, because a run's workers can resolve different
-    providers and a caller reading the warning needs to know which leg lost
-    what.
+    ``{}`` (apply no servers) and ``None`` (nothing to hand over, keep
+    whatever the model already had) are different requests. See
+    ``docs/internals/cli.md`` (`_orchestration.py`).
     """
     if servers is None:
         return
@@ -786,8 +795,14 @@ def _resolve_worker_model_spec(
     model_override: str | None = None,
 ) -> tuple[str, AgentProfile | None, Any]:
     """Resolve which model spec a worker with this role/override would use,
-    without building anything. Shared by `build_worker_branch` and
-    `worker_is_cli` so the resolution logic lives in exactly one place."""
+    without building anything.
+
+    Explicit ``--workers`` routing wins, then the selected pack's per-role
+    model, then the role profile's model. The profile is still returned when a
+    pack selects the model so its prompt and behavior remain attached. Shared
+    by `build_worker_branch` and `worker_is_cli` so the resolution logic lives
+    in exactly one place.
+    """
     # Pack per-role config (ADR-0043): model/effort/modes defaults for casts
     # roles. Ignored in bare mode (workers are the raw CLI spec there).
     w_cfg = None if env.bare else role_config(role, env.pack)
@@ -799,10 +814,10 @@ def _resolve_worker_model_spec(
         resolved_model, w_profile = resolve_worker_spec(role)
         if model_override:
             w_model = model_override
-        elif w_profile:
-            w_model = resolved_model
         elif w_cfg and w_cfg.model:
             w_model = w_cfg.model
+        elif w_profile:
+            w_model = resolved_model
         else:
             w_model = env.default_model_spec
 
@@ -1247,23 +1262,11 @@ def make_team_lifecycle_coordinator(
 def collect_worker_artifacts(env: OrchestrationEnv) -> list[dict]:
     """List what each worker actually wrote, one entry per worker the run expected.
 
-    The roster comes from the directories the run handed out, not a scan for
-    non-empty ones, so a worker that wrote nothing is still an entry (empty
-    ``files``) rather than an absence. A worker the run expected but never
-    registered a directory for is emitted as ``unregistered`` rather than
-    dropped, since that failure looks identical to "fewer workers" if omitted.
-
-    ``status`` per entry:
-
-    ``unreadable``
-        traversal raised — could not look.
-    ``missing``
-        the registered path is gone (removed after registration, not a worker
-        declining to write).
-    ``unregistered``
-        expected but no directory was ever recorded.
-    ``reported``
-        looked, and ``files`` is what was there, empty or not.
+    ``status``: ``unreadable`` (traversal raised), ``missing`` (registered
+    path gone), ``unregistered`` (expected, no directory recorded),
+    ``reported`` (looked, ``files`` is what was there). See
+    ``docs/internals/cli.md`` (`_orchestration.py`) for why every expected
+    worker gets an entry rather than being dropped when empty/absent.
     """
     entries: list[dict] = []
     registered = env.worker_artifact_dirs
@@ -1418,6 +1421,69 @@ def finalize_orchestration(
 
 _log_orch = logging.getLogger("lionagi.cli")
 
+# SQLite already waits for its configured busy_timeout on every admission
+# attempt.  Two short, bounded retries cover the common case where another CLI
+# process is finishing its transaction without turning setup into an unbounded
+# global transaction retry policy.
+_SQLITE_ADMISSION_RETRY_DELAYS: tuple[float, ...] = (0.05, 0.15)
+
+
+async def _sleep_before_sqlite_admission_retry(delay: float) -> None:
+    await asyncio.sleep(delay)
+
+
+def _is_sqlite_writer_contention(exc: BaseException) -> bool:
+    """Return whether *exc* is SQLite's BUSY/LOCKED admission signal.
+
+    SQLAlchemy wraps the driver exception in ``OperationalError`` while some
+    migration/open paths surface ``sqlite3.OperationalError`` directly.  Match
+    the SQLite result code when available, with the driver's canonical message
+    as a fallback.  Generic runtime errors and other operational failures must
+    retain the existing fail/degrade behavior.
+    """
+    from sqlalchemy.exc import OperationalError as SAOperationalError
+
+    pending: list[BaseException] = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+
+        is_sqlite_error = isinstance(current, sqlite3.OperationalError)
+        is_sa_operational = isinstance(current, SAOperationalError)
+        if is_sqlite_error:
+            error_code = getattr(current, "sqlite_errorcode", None)
+            if isinstance(error_code, int) and error_code & 0xFF in {
+                sqlite3.SQLITE_BUSY,
+                sqlite3.SQLITE_LOCKED,
+            }:
+                return True
+
+        if is_sqlite_error or is_sa_operational:
+            message = str(current).lower()
+            if any(
+                marker in message
+                for marker in (
+                    "database is locked",
+                    "database is busy",
+                    "database table is locked",
+                    "database schema is locked",
+                )
+            ):
+                return True
+
+        for nested in (
+            getattr(current, "orig", None),
+            current.__cause__,
+            current.__context__,
+        ):
+            if isinstance(nested, BaseException):
+                pending.append(nested)
+
+    return False
+
 
 async def setup_orchestration_persist(
     session: Any,
@@ -1439,14 +1505,10 @@ async def setup_orchestration_persist(
 ) -> dict | None:
     db = None
     try:
-        db = await _open_shared_db()
-
         session_id = str(session.id)
         session_dict = session.to_dict(mode="db")
 
         session_prog_id = str(uuid.uuid4())
-        await db.create_progression(session_prog_id)
-
         _proj, _proj_src = _resolve_project(project)
         from lionagi.cli.kill import current_pid_markers as _pid_markers
 
@@ -1456,33 +1518,66 @@ async def setup_orchestration_persist(
             **_identity_markers,
             **(extra_node_metadata or {}),
         }
-        await db.create_session(
-            {
-                "id": session_id,
-                "run_id": _active_run_id(),
-                "created_at": session_dict["created_at"],
-                "node_metadata": _node_meta,
-                "name": session_dict.get("name"),
-                "user": session_dict.get("user"),
-                "progression_id": session_prog_id,
-                "first_msg_id": None,
-                "last_msg_id": None,
-                "invocation_kind": invocation_kind,
-                "playbook_name": playbook_name,
-                "agent_name": agent_name,
-                "artifacts_path": artifacts_path,
-                "artifact_contract_json": artifact_contract,
-                "status": "running",
-                "started_at": time.time(),
-                "invocation_id": invocation_id,
-                "model": _provenance.resolve_model_spec(provider, model),
-                "provider": provider,
-                "effort": effort,
-                "agent_hash": _provenance.agent_definition_hash(agent_name),
-                "project": _proj,
-                "project_source": _proj_src,
-            }
-        )
+        session_record = {
+            "id": session_id,
+            "run_id": _active_run_id(),
+            "created_at": session_dict["created_at"],
+            "node_metadata": _node_meta,
+            "name": session_dict.get("name"),
+            "user": session_dict.get("user"),
+            "progression_id": session_prog_id,
+            "first_msg_id": None,
+            "last_msg_id": None,
+            "invocation_kind": invocation_kind,
+            "playbook_name": playbook_name,
+            "agent_name": agent_name,
+            "artifacts_path": artifacts_path,
+            "artifact_contract_json": artifact_contract,
+            "status": "running",
+            "started_at": time.time(),
+            "invocation_id": invocation_id,
+            "model": _provenance.resolve_model_spec(provider, model),
+            "provider": provider,
+            "effort": effort,
+            "agent_hash": _provenance.agent_definition_hash(agent_name),
+            "project": _proj,
+            "project_source": _proj_src,
+        }
+
+        # Resolve the configured dialect without opening a second connection so
+        # an SQLITE_BUSY raised by _open_shared_db() itself can take the same
+        # bounded retry path as the two admission writes below.
+        from lionagi.state.db import StateDB
+
+        configured_dialect = StateDB().dialect
+        for attempt in range(len(_SQLITE_ADMISSION_RETRY_DELAYS) + 1):
+            try:
+                if db is None:
+                    db = await _open_shared_db()
+                # Both writes are idempotent on their stable IDs.  A retry after
+                # progression committed but session lost the writer therefore
+                # fills the missing row without creating a second progression or
+                # initial lifecycle event.
+                await db.create_progression(session_prog_id)
+                await db.create_session(session_record)
+                break
+            except Exception as admission_exc:
+                dialect = getattr(db, "dialect", configured_dialect)
+                exhausted = attempt >= len(_SQLITE_ADMISSION_RETRY_DELAYS)
+                if (
+                    dialect != "sqlite"
+                    or not _is_sqlite_writer_contention(admission_exc)
+                    or exhausted
+                ):
+                    raise
+                delay = _SQLITE_ADMISSION_RETRY_DELAYS[attempt]
+                _log_orch.warning(
+                    "live persist SQLite admission busy (attempt %d/%d); retrying in %.3fs",
+                    attempt + 1,
+                    len(_SQLITE_ADMISSION_RETRY_DELAYS) + 1,
+                    delay,
+                )
+                await _sleep_before_sqlite_admission_retry(delay)
 
         ctx: dict[str, Any] = {
             "db": db,
@@ -1675,6 +1770,7 @@ async def stop_live_persist(
     extras = getattr(env, "_finalize_extras", None)
     escalated_evidence = getattr(env, "_escalated_evidence", None)
     failed_operation_evidence = getattr(env, "_failed_operation_evidence", None)
+    spawn_refusal_evidence = getattr(env, "_spawn_refusal_evidence", None)
     finalize_error = getattr(env, "_finalize_error", None)
     artifact_write_error = getattr(env, "_artifact_write_error", None)
     gate_rejected_evidence = getattr(env, "_gate_rejected_evidence", None)
@@ -1685,6 +1781,7 @@ async def stop_live_persist(
         extras=extras,
         escalated_evidence=escalated_evidence,
         failed_operation_evidence=failed_operation_evidence,
+        spawn_refusal_evidence=spawn_refusal_evidence,
         finalize_error=finalize_error,
         artifact_write_error=artifact_write_error,
         gate_rejected_evidence=gate_rejected_evidence,

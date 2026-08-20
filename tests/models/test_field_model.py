@@ -1,8 +1,12 @@
 """Tests for FieldModel class."""
 
+import math
+from typing import Any
+
 import pytest
 from pydantic.fields import FieldInfo
 
+from lionagi.ln.types import Undefined, Unset
 from lionagi.models import FieldModel
 
 
@@ -159,6 +163,85 @@ class TestFieldModel:
         field_info = field.create_field()
         assert field_info.description == "Test description"
 
+    def test_with_updates_preserves_unset_metadata(self):
+        field = FieldModel(base_type=int)
+
+        updated = field.with_updates(base_type=str)
+
+        assert updated.base_type is str
+        assert updated._is_sentinel(updated.metadata)
+
+    def test_init_delegation_validates_exactly_once(self):
+        class CountingFieldModel(FieldModel):
+            validation_calls = 0
+
+            def _validate(self):
+                type(self).validation_calls += 1
+                super()._validate()
+
+        CountingFieldModel(base_type=int)
+
+        assert CountingFieldModel.validation_calls == 1
+
+    def test_annotated_cache_distinguishes_bool_and_int_metadata(self):
+        boolean = FieldModel(int, cache_probe=True).annotated()
+        integer = FieldModel(int, cache_probe=1).annotated()
+
+        assert boolean is not integer
+        assert boolean.__metadata__[0].value is True
+        assert integer.__metadata__[0].value == 1
+        assert type(integer.__metadata__[0].value) is int
+
+    def test_annotated_cache_distinguishes_signed_zero_metadata(self):
+        positive = FieldModel(int, cache_probe=0.0).annotated()
+        negative = FieldModel(int, cache_probe=-0.0).annotated()
+
+        assert positive is not negative
+        assert math.copysign(1.0, positive.__metadata__[0].value) == 1.0
+        assert math.copysign(1.0, negative.__metadata__[0].value) == -1.0
+
+    def test_mutable_metadata_opts_out_of_annotated_cache(self):
+        field = FieldModel(int, payload={"value": 1})
+
+        assert field.annotated() is not field.annotated()
+
+    def test_annotated_cache_keys_base_types_by_identity(self):
+        class EqualType(type):
+            def __eq__(cls, other):
+                return isinstance(other, EqualType)
+
+            def __hash__(cls):
+                return 1
+
+        class Alpha(metaclass=EqualType):
+            pass
+
+        class Beta(metaclass=EqualType):
+            pass
+
+        alpha = FieldModel(Alpha, marker="same").annotated()
+        beta = FieldModel(Beta, marker="same").annotated()
+
+        assert alpha is not beta
+        assert alpha.__origin__ is Alpha
+        assert beta.__origin__ is Beta
+
+    def test_annotated_cache_uses_effective_subclass_sentinel_policy(self):
+        class UnresolvedField(FieldModel):
+            @classmethod
+            def _is_sentinel(cls, value):
+                return value is int or super()._is_sentinel(value)
+
+        class ConcreteField(FieldModel):
+            pass
+
+        unresolved = UnresolvedField(int, marker="same").annotated()
+        concrete = ConcreteField(int, marker="same").annotated()
+
+        assert unresolved is not concrete
+        assert unresolved.__origin__ is Any
+        assert concrete.__origin__ is int
+
 
 def test_both_default_and_default_factory():
     """Both default and default_factory at the same time must raise ValueError."""
@@ -246,6 +329,29 @@ def test_to_spec_preserves_explicit_none_default():
     """An explicit default=None must survive to_spec() (not treated as absent)."""
     spec = FieldModel(base_type=int, default=None).to_spec()
     assert spec.default is None
+
+
+def test_to_spec_normalizes_legacy_none_annotation_to_unset():
+    """FieldModel owns its legacy None-as-unspecified adapter behavior."""
+    spec = FieldModel(annotation=None).to_spec()
+
+    assert spec.base_type is Unset
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"base_type": None},
+        {"base_type": Undefined},
+        {"base_type": Unset},
+        {"annotation": None},
+    ],
+)
+def test_to_spec_preserves_the_legacy_unspecified_base_type_matrix(kwargs):
+    spec = FieldModel(**kwargs).to_spec()
+
+    assert spec.base_type is Unset
 
 
 def test_to_spec_does_not_flatten_json_schema_extra():

@@ -26,6 +26,7 @@ from lionagi.cli.monitor import (
     _format_table,
     _gather_table_rows,
     _invocation_to_row,
+    _machine_entity,
     _parse_json_field,
     _pid_alive,
     _play_to_row,
@@ -57,7 +58,7 @@ class _FakeStdout:
         return self._is_tty
 
 
-# ── Fixtures ──────────────────────────────────────────────────────────────────
+# Fixtures
 
 
 @pytest.fixture
@@ -173,7 +174,7 @@ async def _make_play(
     return play_id
 
 
-# ── Unit: formatting helpers ──────────────────────────────────────────────────
+# Unit: formatting helpers
 
 
 def test_elapsed_none_start():
@@ -190,6 +191,49 @@ def test_elapsed_minutes():
 
 def test_elapsed_hours():
     assert _elapsed(100.0, ended_at=7300.0) == "2h00m"
+
+
+def test_elapsed_marks_a_reconstructed_end_and_leaves_a_measured_one_bare():
+    """The same two timestamps must not print the same way when one end was
+    reconstructed. Rows repaired from leftover evidence carry a guessed end,
+    and printed identically to a measured run there is nothing in the output
+    that could tell a reader which one they are looking at."""
+    measured = _elapsed(100.0, ended_at=145.0)
+    reconstructed = _elapsed(100.0, ended_at=145.0, approximate=True)
+
+    assert measured == "45s"
+    assert reconstructed == "~45s"
+    assert measured != reconstructed
+
+
+def test_elapsed_does_not_mark_a_still_running_row():
+    """A row with no end is measured up to now, so the flag must not leak a
+    tilde onto a span whose end has not been guessed at all."""
+    assert not _elapsed(time.time() - 45, approximate=True).startswith("~")
+
+
+def test_elapsed_reports_unknown_for_a_finished_row_that_recorded_no_end():
+    """A session that stopped, with no end on the row, has no span to report.
+
+    Measuring it up to now is what the running case does, and doing it here
+    produces a duration that is larger every time the table is redrawn for a
+    session that has been over for months. Legacy rows are exactly the
+    population with a terminal status and no recorded end, so this is not a
+    hypothetical shape.
+    """
+    long_ago = time.time() - 86_400
+
+    assert _elapsed(long_ago, ended_at=None, terminal=True) == "-"
+
+
+def test_elapsed_still_measures_a_running_row_that_recorded_no_end():
+    """Control for the test above: the terminal flag is what suppresses the
+    span, not the missing end. A running row has no end either, and its
+    elapsed time genuinely is measured up to now."""
+    running = _elapsed(time.time() - 45, ended_at=None, terminal=False)
+
+    assert running != "-"
+    assert running.endswith("s")
 
 
 def test_trunc_short():
@@ -257,7 +301,7 @@ def test_pid_alive_nonexistent():
     assert result is False or result is None  # platform-dependent
 
 
-# ── Unit: table formatting ────────────────────────────────────────────────────
+# Unit: table formatting
 
 
 def test_format_table_empty():
@@ -426,7 +470,7 @@ def test_format_table_non_tty_caps_pathological_width(monkeypatch: pytest.Monkey
     assert len(short_line) < 10 * _NON_TTY_MAX_COL_WIDTH
 
 
-# ── Unit: row builders ────────────────────────────────────────────────────────
+# Unit: row builders
 
 
 def test_session_to_row():
@@ -444,6 +488,63 @@ def test_session_to_row():
     assert row["project"] == "lionagi"
     assert row["status"] == "running"
     assert row["phase"] == "coder"
+
+
+def test_session_to_row_carries_end_provenance_into_the_elapsed_column():
+    """The elapsed column is where a reader meets the reconstructed end, so the
+    flag has to survive the trip from the row into the rendered cell."""
+    common = {
+        "id": "abc123def456",
+        "invocation_kind": "agent",
+        "project": "lionagi",
+        "status": "completed",
+        "started_at": 100.0,
+        "ended_at": 145.0,
+    }
+    measured = _session_to_row({**common, "ended_at_is_approximate": 0})
+    reconstructed = _session_to_row({**common, "ended_at_is_approximate": 1})
+
+    assert measured["elapsed"] == "45s"
+    assert reconstructed["elapsed"] == "~45s"
+
+
+def test_session_to_row_reports_unknown_elapsed_for_a_terminal_row_with_no_end():
+    """The whole path, not just the formatter: a terminal session carrying no
+    end must reach the table as unknown rather than as a span still growing."""
+    row = _session_to_row(
+        {
+            "id": "abc123def456",
+            "invocation_kind": "agent",
+            "project": "lionagi",
+            "status": "completed",
+            "started_at": time.time() - 86_400,
+            "ended_at": None,
+        }
+    )
+
+    assert row["elapsed"] == "-"
+
+
+def test_machine_session_entity_carries_end_provenance():
+    """`li monitor --machine` hands out `ended_at` for sessions, so it has to
+    hand out the field saying whether that end was observed. A consumer given
+    the timestamp alone cannot tell a reconstructed end from a measured one,
+    and nothing else in the payload answers it."""
+    from lionagi.cli.monitor import _machine_entity
+
+    entity = _machine_entity(
+        "session",
+        {
+            "id": "abc123def456",
+            "status": "completed",
+            "started_at": 100.0,
+            "ended_at": 145.0,
+            "ended_at_is_approximate": 1,
+        },
+    )
+
+    assert "ended_at_is_approximate" in entity
+    assert entity["ended_at_is_approximate"] == 1
 
 
 def test_session_to_row_no_optional():
@@ -600,7 +701,7 @@ def test_play_to_row_orphan_no_session_project_falls_back():
     assert row["project"] == "-"
 
 
-# ── Integration: DB-backed list_running ───────────────────────────────────────
+# Integration: DB-backed list_running
 
 
 @pytest.mark.asyncio
@@ -933,7 +1034,7 @@ async def test_gather_table_rows_since_filter(temp_db_path: Path) -> None:
     assert not any(sid_old[:16] in i for i in ids)
 
 
-# ── Regression: --since widens the status filter to terminal states ───────────
+# Regression: --since widens the status filter to terminal states
 #
 # `--since` used to only ever AND a time bound on top of a running-only
 # filter, so a session that finished (however recently) could never appear
@@ -1021,7 +1122,7 @@ async def test_since_shows_terminal_show(temp_db_path: Path) -> None:
     assert show_id[:16] not in [r["id"] for r in rows_default]
 
 
-# ── Integration: _find_entity ─────────────────────────────────────────────────
+# Integration: _find_entity
 
 
 @pytest.mark.asyncio
@@ -1088,7 +1189,7 @@ async def test_find_entity_not_found(temp_db_path: Path) -> None:
     assert result is None
 
 
-# ── Integration: _run_table and _run_detail ───────────────────────────────────
+# Integration: _run_table and _run_detail
 
 
 @pytest.mark.asyncio
@@ -1272,7 +1373,7 @@ async def test_run_detail_show(temp_db_path: Path) -> None:
     assert "implement-auth" in output
 
 
-# ── Show detail: how a play's status is classified into a marker ──────────────
+# Show detail: how a play's status is classified into a marker
 
 
 class _PlayRowsDB:
@@ -1374,7 +1475,7 @@ async def test_run_detail_not_found(temp_db_path: Path) -> None:
     assert "not found" in output.lower() or "error" in output.lower()
 
 
-# ── Regression: detail view shows playbook name ───────────────────────────────
+# Regression: detail view shows playbook name
 
 
 @pytest.mark.asyncio
@@ -1400,7 +1501,7 @@ async def test_run_detail_session_no_playbook_name_omits_line(temp_db_path: Path
     assert "playbook:" not in output
 
 
-# ── Regression: branch (agent leg) sub-step visibility ────────────────────────
+# Regression: branch (agent leg) sub-step visibility
 
 
 async def _add_branch(db: StateDB, session_id: str, *, name: str, status: str = "running") -> str:
@@ -1463,7 +1564,7 @@ async def test_run_detail_no_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     assert "state.db" in output or "not found" in output.lower() or "error" in output.lower()
 
 
-# ── Integration: argparse wiring ─────────────────────────────────────────────
+# Integration: argparse wiring
 
 
 def test_add_monitor_subparser():
@@ -1521,10 +1622,10 @@ def test_main_registers_monitor():
     assert "monitor" in result.stdout.lower() or "observe" in result.stdout.lower()
 
 
-# ── Watch mode: SIGINT terminates cleanly ─────────────────────────────────────
+# Watch mode: SIGINT terminates cleanly
 
 
-# ── Regression: --type play filter ───────────────────────────────────────────
+# Regression: --type play filter
 
 
 @pytest.mark.asyncio
@@ -1562,7 +1663,7 @@ async def test_type_play_filter_includes_both_sessions_and_plays(temp_db_path: P
     assert play_row_id[:16] in ids, "play table row not in --type play results"
 
 
-# ── Regression: direct `li play` runs (no plays-table row) via --since ────────
+# Regression: direct `li play` runs (no plays-table row) via --since
 #
 # `create_play` has no production caller on the direct `li play NAME` path —
 # a completed direct play exists only as a session row with
@@ -1630,7 +1731,7 @@ async def test_since_no_double_listing_in_all_view(temp_db_path: Path) -> None:
     assert play_sess_id[:16] not in ids
 
 
-# ── Regression: dedup must not hide sessions from views without a play section ─
+# Regression: dedup must not hide sessions from views without a play section
 #
 # The play-vs-session dedup lives in _gather_table_rows and applies only when
 # the plays section is actually being rendered. A SQL-level exclusion would
@@ -1741,7 +1842,7 @@ def test_watch_loop_recomputes_since_every_tick(monkeypatch: pytest.MonkeyPatch)
     assert captured == [100.0, 200.0], "each tick must use a freshly derived cutoff"
 
 
-# ── Regression: AGENTS column ────────────────────────────────────────────────
+# Regression: AGENTS column
 
 
 @pytest.mark.asyncio
@@ -1810,7 +1911,7 @@ async def test_play_agents_column_reflects_branch_count(temp_db_path: Path) -> N
     assert play_rows[0]["agents"] == "1", f"expected agents='1', got {play_rows[0]['agents']!r}"
 
 
-# ── Regression: background correlation handle ─────────────────────────────────
+# Regression: background correlation handle
 
 
 def test_session_id_env_var_used_as_session_id(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1873,7 +1974,7 @@ def test_background_hint_includes_session_id(
     assert "li monitor" in combined, f"Expected 'li monitor <id>' hint in output, got:\n{combined}"
 
 
-# ── Watch mode: SIGINT terminates cleanly ─────────────────────────────────────
+# Watch mode: SIGINT terminates cleanly
 
 
 def test_watch_mode_sigint_clean(temp_db_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1908,7 +2009,7 @@ def test_watch_mode_sigint_clean(temp_db_path: Path, monkeypatch: pytest.MonkeyP
     assert exit_code == 0
 
 
-# ── Ambiguous short-id prefixes ───────────────────────────────────────────────
+# Ambiguous short-id prefixes
 
 
 async def _make_session_with_id(db: StateDB, sid: str) -> str:
@@ -2025,7 +2126,7 @@ def test_watch_loop_ambiguous_prefix_exits_unknown(
     assert exit_code == EXIT_UNKNOWN
 
 
-# ── Watch mode: SIGTERM during a refresh ──────────────────────────────────────
+# Watch mode: SIGTERM during a refresh
 #
 # run_async installs its own signal handlers for the duration of the call, so a
 # signal delivered inside a refresh surfaces as SigtermInterrupt/KeyboardInterrupt
@@ -2119,7 +2220,7 @@ def test_watch_loop_leaves_unrestorable_handlers_alone(monkeypatch: pytest.Monke
     assert installed == []
 
 
-# ── Regression: a play awaiting a gate decision is not running ────────────────
+# Regression: a play awaiting a gate decision is not running
 
 
 @pytest.mark.asyncio
@@ -2207,3 +2308,70 @@ async def test_show_detail_marks_blocked_play_as_done(temp_db_path: Path) -> Non
     assert "[done]" in blocked_line
     assert "[wait]" not in blocked_line
     assert "[wait]" in gated_line, "an undecided play is unfinished, not done"
+
+
+def test_terminal_invocation_and_play_rows_with_no_recorded_end_report_unknown():
+    """Sessions are not the only population with this shape.
+
+    Invocations and plays reach a terminal status with no recorded end too, in
+    real stores and not just in principle, so fixing the session row alone
+    leaves these two rendering a span that grows on every redraw. The session
+    case has its own test above; this one exists because the sibling tables
+    were the part it was tempting to reason about instead of check.
+    """
+    from lionagi.cli.monitor import _invocation_to_row, _play_to_row
+
+    long_ago = time.time() - 86_400
+
+    inv = _invocation_to_row(
+        {"id": "inv123def456", "status": "completed", "started_at": long_ago, "ended_at": None}
+    )
+    # Plays carry their own terminal vocabulary, disjoint from the session one
+    # -- "completed" is not a play status at all.
+    play = _play_to_row(
+        {"id": "ply123def456", "status": "merged", "started_at": long_ago, "ended_at": None}
+    )
+
+    assert inv["elapsed"] == "-"
+    assert play["elapsed"] == "-"
+
+
+def test_running_rows_of_every_entity_are_still_measured():
+    """Control: the terminal status suppresses the span, not the missing end.
+    A running row of either kind is still measured up to now."""
+    from lionagi.cli.monitor import _invocation_to_row, _play_to_row
+
+    recent = time.time() - 45
+
+    inv = _invocation_to_row(
+        {"id": "inv123def456", "status": "running", "started_at": recent, "ended_at": None}
+    )
+    play = _play_to_row(
+        {"id": "ply123def456", "status": "running", "started_at": recent, "ended_at": None}
+    )
+
+    assert inv["elapsed"] != "-"
+    assert play["elapsed"] != "-"
+
+
+def test_machine_entity_emits_a_json_boolean_for_the_approximate_end_flag():
+    """SQLite returns 0/1; the lifecycle summary endpoint returns true/false.
+
+    Same field name on two machine-readable surfaces, so a caller that reads
+    both should not have to branch on which one produced the payload.
+    """
+    entity = _machine_entity("session", {"id": "s1", "ended_at_is_approximate": 1})
+    assert entity["ended_at_is_approximate"] is True
+
+    entity = _machine_entity("session", {"id": "s1", "ended_at_is_approximate": 0})
+    assert entity["ended_at_is_approximate"] is False
+
+
+def test_machine_entity_leaves_an_absent_approximate_flag_as_null():
+    """Absent is unknown, which is a different answer from measured.
+
+    Coercing a missing column with bare bool() would report every row the query
+    did not select as carrying a measured end.
+    """
+    entity = _machine_entity("session", {"id": "s1"})
+    assert entity["ended_at_is_approximate"] is None

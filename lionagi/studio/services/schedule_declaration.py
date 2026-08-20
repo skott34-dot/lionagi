@@ -391,18 +391,14 @@ def _digest_of(obj: Any) -> str:
 
 
 def _resolve_path(raw: str, manifest_dir: Path) -> Path:
-    """Resolve a manifest-relative path to an absolute one.
-
-    A manifest is allowed to write relative paths, unlike a stored schedule
-    row: they mean "relative to this manifest", which is a location that
-    exists, rather than "relative to wherever the daemon started", which is
-    not. That is why the declarative path does not consult
-    ``_is_usable_execution_root`` before writing ``action_cwd`` -- it converts
-    the relative form into an absolute one here instead, so what reaches
-    storage already satisfies the predicate. ``Path.resolve()`` always returns
-    an absolute path, so this holds even when ``manifest_dir`` is itself
-    relative.
-    """
+    """Resolve a manifest-relative path to an absolute one. A manifest may
+    write relative paths, unlike a stored schedule row: they mean "relative
+    to this manifest", a location that exists, not "relative to wherever the
+    daemon started". The declarative path converts to absolute here instead
+    of consulting ``_is_usable_execution_root`` before writing
+    ``action_cwd``, so what reaches storage already satisfies the
+    predicate; ``Path.resolve()`` always returns absolute even when
+    *manifest_dir* is itself relative."""
     p = Path(raw)
     if not p.is_absolute():
         p = manifest_dir / p
@@ -605,10 +601,15 @@ def _to_db_fields(
         fields["cron_expr"] = None
         # The fire-time engine has no notion of "at" beyond a single due
         # instant: persist the resolved epoch so the row is due exactly
-        # once, and force max_runs=1 so the existing claim-before-fire gate
-        # (SchedulerEngine._reserve_max_runs_budget) refuses any further
-        # fire -- including one a later re-apply of an unchanged/edited
-        # member would otherwise resurrect by resetting next_fire_at again.
+        # once, and force max_runs=1 so the claim-before-fire gate
+        # (SchedulerEngine._reserve_max_runs_budget) refuses a second fire
+        # after the first one runs.
+        #
+        # It does not cover a fire that never ran: a miss under
+        # missed_fire_policy=skip records "skipped", which is neither status.
+        # apply_schedule_set closes that by declining to write a past instant
+        # back. Counting "skipped" would not: capacity and overlap skips share
+        # the status and are meant to retry. See ADR-0070 D2.
         fields["next_fire_at"] = resolved_trigger["epoch"]
         fields["max_runs"] = 1
     elif trigger_kind == "github":
@@ -886,6 +887,13 @@ async def apply_schedule_set(
             )
         elif entry.action == "UPDATE":
             resolved = entry.resolved
+            fields = dict(resolved.db_fields)
+            # An instant that has passed cannot recur, so writing the declared
+            # epoch back would run the schedule after the moment it named. A
+            # re-apply happens for unrelated reasons: an edited sibling, a
+            # member re-enabled after omission. Moving it forward still lands.
+            if fields.get("trigger_type") == "at" and (fields.get("next_fire_at") or 0.0) <= now:
+                fields.pop("next_fire_at", None)
             updates.append(
                 (
                     entry.existing_id,
@@ -895,7 +903,7 @@ async def apply_schedule_set(
                         "resolved_target": resolved.resolved,
                         "resolved_digest": resolved.digest,
                         "resolved_timezone": resolved.timezone,
-                        **resolved.db_fields,
+                        **fields,
                     },
                 )
             )

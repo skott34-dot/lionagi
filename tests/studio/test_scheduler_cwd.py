@@ -19,13 +19,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from tests._scheduler_claims import fire_with_claim
+
 # _resolve_action_cwd's action_project branch imports lionagi.studio.services.projects,
 # which requires fastapi (the `studio` extra); skip gracefully in a bare-core install.
 pytest.importorskip("fastapi", reason="studio extra not installed")
 
-# ---------------------------------------------------------------------------
 # spawn_and_wait: cwd passthrough to create_subprocess_exec
-# ---------------------------------------------------------------------------
 
 
 def _exited_proc(returncode: int = 0) -> MagicMock:
@@ -90,9 +90,7 @@ async def test_spawn_and_wait_default_cwd_is_none():
     assert captured.get("cwd") is None
 
 
-# ---------------------------------------------------------------------------
 # _resolve_action_cwd
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -292,10 +290,8 @@ async def test_resolve_action_cwd_env_fallback_still_serves_ownerless_rows(monke
     assert await _resolve_action_cwd(schedule) == str(env_dir)
 
 
-# ---------------------------------------------------------------------------
 # _resolve_action_cwd: action_cwd (persisted execution root) outranks
 # action_project (ADR-0070 delta 1)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -574,10 +570,8 @@ async def test_resolve_action_cwd_pre_migration_row_warns_deprecated(monkeypatch
     )
 
 
-# ---------------------------------------------------------------------------
 # The refusal names both the configured root and the daemon directory it
 # declined to substitute, so the failure is diagnosable from the message.
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -611,9 +605,7 @@ async def test_refusal_names_configured_root_and_daemon_cwd(tmp_path, monkeypatc
     assert str(daemon_dir) in message
 
 
-# ---------------------------------------------------------------------------
 # _fire() threads the resolved cwd into spawn_and_wait
-# ---------------------------------------------------------------------------
 
 
 def _minimal_schedule(**overrides) -> dict:
@@ -680,18 +672,16 @@ async def test_fire_threads_resolved_cwd_into_spawn_and_wait(tmp_path, monkeypat
         ),
         patch("lionagi.studio.scheduler.subprocess.spawn_and_wait", new=spawn_mock),
     ):
-        await engine._fire(schedule, "run-cwd-001", trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, "run-cwd-001", trigger_context={"scheduled": True})
 
     spawn_mock.assert_awaited_once()
     _args, kwargs = spawn_mock.await_args
     assert kwargs.get("cwd") == str(project_dir)
 
 
-# ---------------------------------------------------------------------------
 # Fail-closed attribution: a schedule carrying an execution root whose
 # configured directories are all gone is refused before spawn (identity
 # protection), recorded with FAILED_CWD_INHERIT_REFUSED, and never spawned.
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -722,7 +712,7 @@ async def test_fire_refuses_owner_carrying_cwd_inherit(monkeypatch):
         ),
         patch("lionagi.studio.scheduler.subprocess.spawn_and_wait", new=spawn_mock),
     ):
-        await engine._fire(schedule, "run-cwd-002", trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, "run-cwd-002", trigger_context={"scheduled": True})
 
     spawn_mock.assert_not_awaited()
 
@@ -759,7 +749,7 @@ async def test_fire_plain_nonzero_exit_keeps_generic_reason(monkeypatch):
             new=AsyncMock(return_value=(1, "boom")),
         ),
     ):
-        await engine._fire(schedule, "run-cwd-003", trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, "run-cwd-003", trigger_context={"scheduled": True})
 
     terminal_calls = [
         c
@@ -772,9 +762,7 @@ async def test_fire_plain_nonzero_exit_keeps_generic_reason(monkeypatch):
     assert call.kwargs["reason_code"] == RunReasons.FAILED_EXIT_NONZERO
 
 
-# ---------------------------------------------------------------------------
 # SchedulerEngine._backfill_action_cwd — one-shot startup migration
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -1011,9 +999,7 @@ async def test_refusal_names_an_empty_execution_root_as_empty_not_as_the_project
     assert excinfo.value.configured_root == ""
 
 
-# ---------------------------------------------------------------------------
 # declarative manifest path: relative in, absolute out
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("raw", [".", "sub", "../", "sub/..", "./sub"])

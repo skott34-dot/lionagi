@@ -45,6 +45,7 @@ from ._notify import register_flow_notify_scope, unregister_flow_notify_scope
 from ._orchestration import (
     EFFORT_MAP,
     OrchestrationEnv,
+    _resolve_worker_model_spec,
     attribute_worker_build_failure,
     available_roles,
     build_worker_branch,
@@ -54,8 +55,6 @@ from ._orchestration import (
     parse_orchestrator_provider,
     register_branch_hook,
     resolve_modes,
-    resolve_worker_spec,
-    role_config,
     role_roster,
     setup_orchestration,
     start_live_persist,
@@ -131,7 +130,11 @@ def _heartbeat_warning(
     max_activity_rate = max(activity_rates)
     peer_rates = activity_rates.copy()
     peer_rates.remove(max_activity_rate)
-    activity_floor = statistics.median(peer_rates) if peer_rates else 0.0
+    # Agent process trees contain many blocked infrastructure descendants.
+    # Their exact-zero rates are not a working peer baseline; including them
+    # drives the median to zero and makes this relative discriminator inert.
+    active_peer_rates = [rate for rate in peer_rates if rate > 0]
+    activity_floor = statistics.median(active_peer_rates) if active_peer_rates else 0.0
     ratio_activity_cutoff = activity_floor * _DESCENDANT_CPU_ACTIVITY_RATIO
     fallback_activity_seconds = _DESCENDANT_CPU_FALLBACK_SECONDS * math.sqrt(
         sample_interval_seconds / _DESCENDANT_CPU_FALLBACK_INTERVAL_SECONDS
@@ -164,17 +167,33 @@ def _heartbeat_warning(
 
 def _surface_dropped_spawns(env: OrchestrationEnv, dropped_spawns: list[dict]) -> None:
     rejected = [item for item in dropped_spawns if item.get("reason") == "builder_error"]
-    if not rejected:
-        return
+    if rejected:
+        evidence = []
+        for item in rejected:
+            assignee = item.get("assignee") or "unassigned"
+            error = item.get("error") or "spawn routing failed"
+            progress(f"  ⚠ SPAWN REJECTED: {assignee} — {error}")
+            evidence.append({"kind": "unroutable_spawn", "id": assignee, "label": error})
+        prior = getattr(env, "_failed_operation_evidence", None) or []
+        env._failed_operation_evidence = [*prior, *evidence]
 
-    evidence = []
-    for item in rejected:
-        assignee = item.get("assignee") or "unassigned"
-        error = item.get("error") or "spawn routing failed"
-        progress(f"  ⚠ SPAWN REJECTED: {assignee} — {error}")
-        evidence.append({"kind": "unroutable_spawn", "id": assignee, "label": error})
-    prior = getattr(env, "_failed_operation_evidence", None) or []
-    env._failed_operation_evidence = [*prior, *evidence]
+    refused = [item for item in dropped_spawns if item.get("reason") == "max_spawn_exceeded"]
+    if refused:
+        evidence = []
+        for item in refused:
+            assignee = item.get("assignee") or "unassigned"
+            emitter_id = str(item.get("emitter_id") or item.get("op_id") or assignee)
+            reason = str(item.get("reason"))
+            progress(f"  ⚠ SPAWN REFUSED: {emitter_id} → {assignee} — {reason}")
+            evidence.append(
+                {
+                    "kind": "refused_spawn",
+                    "id": emitter_id,
+                    "label": f"{assignee} ({reason})",
+                }
+            )
+        prior = getattr(env, "_spawn_refusal_evidence", None) or []
+        env._spawn_refusal_evidence = [*prior, *evidence]
 
 
 class FlowPlanError(LionError):
@@ -410,25 +429,11 @@ skip them.
 
 
 def critical_path_depth(dep_indices: list[list[int]]) -> int:
-    """Longest dependency chain in the plan, in ops.
-
-    This is how many ops the *dependencies* force to run one after another,
-    which is not the op count: ops with no path between them are free to run at
-    the same time.
-
-    It is a lower bound on the flow's wall clock, not the bound. A concurrency
-    cap serializes ops this function calls parallel, and under `--max-concurrent
-    1` it says 1 for a plan that runs strictly in sequence.
-
-    What actually sizes a budget is `max_sequential_depth`, which takes this
-    together with what the cap forces. This function is exact only when nothing
-    caps concurrency, which is the common case and why it is still worth
-    computing directly.
-
-    Dependencies point backwards (op i may only depend on ops before it), so a
-    single forward pass is enough. Cycles are therefore not reachable here, and
-    an entry pointing outside the plan is ignored rather than raising: a bad
-    index should not be able to take down a run over a budget hint.
+    """Longest dependency chain in the plan, in ops — a lower bound on wall
+    clock, not the bound `max_sequential_depth` computes. See
+    ``docs/internals/cli.md`` (`flow.py` — dividing a time budget across a
+    DAG). Dependencies point only backwards, so a single forward pass
+    suffices; an out-of-range entry is ignored rather than raising.
     """
     if not dep_indices:
         return 0
@@ -443,33 +448,15 @@ def critical_path_depth(dep_indices: list[list[int]]) -> int:
 def max_sequential_depth(dep_indices: list[list[int]], num_ops: int, max_concurrent: int) -> int:
     """The most ops that can end up running one after another.
 
-    This number divides the flow's budget, so its error has a direction:
-    counting too few hands every op more time than the flow can afford and the
-    flow overruns its deadline, while counting too many only means an op is
-    told it has slightly less time than it might have had. That asymmetry is
-    what makes this an upper bound rather than an estimate.
+    An upper bound, not an estimate — the error must undercount never, since
+    undercounting hands every op more time than the flow can afford. See
+    ``docs/internals/cli.md`` (`flow.py` — dividing a time budget across a
+    DAG) for why a simulated schedule is wrong and how the two forcing
+    mechanisms (dependencies, capacity) combine.
 
-    It has to be a bound, because the quantity it describes depends on how long
-    each op runs and a budget is computed before any of them have. An earlier
-    version simulated the schedule directly — a queue of ready ops, admitting
-    `max_concurrent` at a time, counting passes. That models one schedule, the
-    one where every op takes about as long as every other, and the executor
-    runs a great many. Give four ops a cap of two and let the second one run
-    six times longer than the rest, and the other three serialize behind it in
-    a chain of three where the simulation counted two. Unequal durations are
-    the normal case, not the corner, so the equal-duration schedule is the
-    wrong thing to be exact about.
-
-    Two things force ops into sequence and the bound is the worse of them.
-    Dependencies force a chain that no amount of capacity can shorten. Capacity
-    forces the rest: any run of ops executing strictly one after another can
-    contain at most one op from a set that started together, so it is bounded
-    by one plus however many ops are not in that first admitted batch. Neither
-    can exceed the everything-serializes case of one op at a time.
-
-    `max_concurrent <= 0` means unbounded, matching how the executor reads it.
-    A plan whose dependency data does not describe its ops gets `num_ops`, the
-    assumption that nothing overlaps, since nothing can be said about what does.
+    `max_concurrent <= 0` means unbounded, matching how the executor reads
+    it. A plan whose dependency data does not describe its ops gets
+    `num_ops` (assume nothing overlaps).
     """
     if num_ops <= 0:
         return 0
@@ -477,24 +464,13 @@ def max_sequential_depth(dep_indices: list[list[int]], num_ops: int, max_concurr
         return num_ops
     conc = max_concurrent if max_concurrent > 0 else num_ops
 
-    # Unbounded capacity admits every ready op, so each pass clears one level
-    # of the dependency graph and the pass count is exactly the longest chain.
-    # Worth taking directly: it is the common case and it is one linear scan.
+    # Unbounded capacity: each pass clears one level of the dependency graph,
+    # so the pass count is exactly the longest chain.
     if conc >= num_ops:
         return critical_path_depth(dep_indices) or num_ops
 
-    # Two things can force ops into sequence, and the answer is the worse of
-    # them.
-    #
-    # Dependencies force a chain no amount of capacity can shorten.
-    #
-    # Capacity forces the rest. When ops are ready the executor admits
-    # `conc` of them at once, and a run of ops that execute strictly one
-    # after another can contain at most ONE op out of any set that started
-    # together — so such a run is at most one of that first batch plus every
-    # op outside it, `num_ops - conc + 1`.
-    #
-    # Nothing can exceed `num_ops`, which is the everything-serializes case.
+    # Worse of: the dependency chain, and capacity's forced remainder
+    # (num_ops - conc + 1), capped at the everything-serializes case.
     return min(num_ops, max(critical_path_depth(dep_indices), num_ops - conc + 1))
 
 
@@ -524,25 +500,12 @@ def _build_budget_preambles(
 ) -> dict[int, str]:
     """The per-op budget preambles for one flow, keyed by op index.
 
-    Exists as its own function so the share an op is actually told can be
-    asserted directly. Tests that only call `op_budget_share` cannot see
-    whether the caller uses it, which is how the equal-split divisor survived
-    a suite that was green the whole time.
-
     `deadline_epoch` is an instant the caller captured when the run's clock
-    started, not a duration to add to now. It is deliberately not defaulted:
-    the obvious fallback, `now + total_budget`, is wrong by however long the
-    run has already been going, and it is wrong silently and in the permissive
-    direction — every op would be told it has more time than it does. Missing
-    the instant therefore means no preamble at all, since telling an op
-    nothing is the honest failure and telling it a late deadline is not.
+    started, not a duration to add to now, and is deliberately not defaulted
+    (see ``docs/internals/cli.md`` — the obvious `now + total_budget`
+    fallback is silently wrong). Missing it means no preamble at all.
     """
     if total_budget and num_ops > 0 and deadline_epoch is None:
-        # A budgeted run that got this far without an instant is a wiring
-        # error rather than a configuration: the limit will still be enforced
-        # on these ops, they just will not be told about it. Staying silent is
-        # right about the value and wrong about the event, so name the event
-        # once and still refuse to invent the value.
         _warn(
             "flow has a total budget but no recorded deadline instant; "
             "its ops will be given no budget guidance"
@@ -641,6 +604,25 @@ async def _resolve_invocation_terminal_flow(
                     metadata,
                 )
             if all(s == "completed" for s in child_statuses):
+                spawn_refused = [
+                    s
+                    for s in sessions
+                    if str(s.get("status_reason_code") or "") == RunReasons.COMPLETED_SPAWN_REFUSED
+                ]
+                if spawn_refused:
+                    spawn_metadata = dict(metadata)
+                    spawn_metadata["spawn_refused_session_ids"] = [
+                        s["id"] for s in spawn_refused if s.get("id")
+                    ]
+                    return (
+                        "completed",
+                        RunReasons.COMPLETED_SPAWN_REFUSED,
+                        "Flow completed, but at least one child session refused "
+                        "reactively requested work because its spawn capacity "
+                        "was exhausted.",
+                        [{"kind": "session", "id": s["id"]} for s in spawn_refused if s.get("id")],
+                        spawn_metadata,
+                    )
                 # A "completed" child may still carry COMPLETED_GATE_REJECTED
                 # (a gate rejected mid-DAG and short-circuited its dependent
                 # subtree) — surface that at the invocation level too, or it
@@ -766,6 +748,14 @@ def _parse_reactive(spec: str | None) -> tuple[bool, set[str] | None]:
     return (True, roles) if roles else (True, None)
 
 
+def _remaining_spawn_capacity(
+    max_ops: int, planned_count: int, restored_spawn_count: int = 0
+) -> int:
+    """Return the remaining reactive-spawn budget for this execution attempt."""
+    initial_capacity = max_ops - planned_count if max_ops > 0 else 20
+    return max(0, initial_capacity - restored_spawn_count)
+
+
 def _flow_header_fn(w: dict, i: int, n: int) -> list[str]:
     deps = w.get("depends_on") or []
     dep_str = f"  deps: {', '.join(deps)}" if deps else ""
@@ -798,6 +788,7 @@ class _DagState:
     spawn_roles: set[str] | None
     role_base: dict[str, object]
     worker_models: list[str]
+    max_spawn: int | None = None
     op_segments: list[dict] = field(default_factory=list)
     # role → its resolved artifact_defaults (profile first, else casts Role),
     # cached once per role in _build_dag so _execute_dag can register the same
@@ -820,6 +811,15 @@ class _ExecResult:
     n_spawned: int
     t_exec_elapsed: float
     escalated_agent_ids: list[str] = field(default_factory=list)
+    engine_run: Any | None = field(default=None, repr=False)
+    # Op ids the checkpoint observer must ignore. The observer is registered
+    # on the engine run, which later phases reuse, so it also sees nodes that
+    # did not exist when it was built. A phase that adds such a node declares
+    # it here before running. Named as what to SKIP rather than a set of
+    # nodes to accept: an accept-list is a closed description of the graph
+    # taken before the graph stopped changing, so anything arriving later is
+    # misclassified by default, which is the failure this carries.
+    checkpoint_skip_ids: set[str] = field(default_factory=set, repr=False)
 
 
 # ── Phase 1: build DAG ────────────────────────────────────────────────────────
@@ -828,19 +828,13 @@ class _ExecResult:
 def _deps_from_built_graph(builder, label_by_node: dict[str, str]) -> dict[str, list[str]]:
     """Read each node's incoming edges out of the graph the executor walks.
 
-    A dependency list re-derived from what the planner declared is a statement
-    about the *input* to the build step, not an observation of its *output*:
-    the builder can add or omit edges, the executor waits on every incoming
-    edge whatever its label, and nothing downstream would notice the two
-    disagreeing. Reading the graph makes the reported structure and the
-    executed one the same object.
-
-    `label_by_node` names the nodes a reader already has a name for — plan
-    steps, by their 1-based ordinal, matching how deps have always been shown.
-    A head outside it is a node that has no plan ordinal because it did not
-    exist at plan time; it is named by the spawn id stamped on it (the same id
-    its own result record carries), falling back to the raw node id so an edge
-    is never dropped for want of a name.
+    Reads the graph itself, not the planner's declared deps, so the reported
+    structure and the executed one are the same object — a re-derivation from
+    what was declared could silently drift from what the builder actually
+    wired. `label_by_node` names plan-time nodes by their 1-based ordinal; a
+    head outside it (a node with no plan ordinal, spawned after plan time) is
+    named by its stamped `spawn_id`, falling back to the raw node id so an
+    edge is never dropped for want of a name.
     """
     graph = builder.get_graph()
     nodes = getattr(graph, "internal_nodes", None)
@@ -871,6 +865,7 @@ async def _build_dag(
     plan_result: _PlanResult,
     *,
     reactive_spec: str,
+    max_spawn: int,
 ) -> _DagState:
     """Wire worker branches into the operation graph builder and snapshot to Studio."""
     assignments = plan_result.assignments
@@ -882,7 +877,7 @@ async def _build_dag(
     reactive, spawn_roles = _parse_reactive(reactive_spec)
 
     def _may_spawn(role: str) -> bool:
-        return reactive and (spawn_roles is None or role in spawn_roles)
+        return max_spawn > 0 and reactive and (spawn_roles is None or role in spawn_roles)
 
     worker_models: list[str] = []
     node_ids: list[str] = []
@@ -936,6 +931,8 @@ async def _build_dag(
         role_artifact_entries.extend(leg_expected)
 
         ctx: list = [{"original_task": prompt}]
+        if ta.inputs:
+            ctx.append({"assignment_inputs": list(ta.inputs)})
         artifact_note = _artifact_directive(env.run, agent_ids[i], leg_expected)
         if dep_indices[i]:
             ups = "; ".join(
@@ -968,6 +965,10 @@ async def _build_dag(
             ctx.append({"effort_guidance": EFFORT_MAP.get(w_effort, "")})
 
         instruction = budget_preambles.get(i, "") + ta.task
+        if ta.exit_criteria:
+            instruction += (
+                f"\n\nExit criteria (must be satisfied before completion):\n{ta.exit_criteria}"
+            )
         dep_nodes = [node_ids[j] for j in dep_indices[i]]
         node = _build_worker_operate_node(
             env.builder,
@@ -992,6 +993,8 @@ async def _build_dag(
 
     # Early DAG snapshot for Studio.
     early_graph = {
+        "reactive": reactive,
+        "max_spawn": max_spawn,
         "agents": [
             {"id": agent_ids[i], "name": agent_ids[i], "model": worker_models[i]}
             for i in range(len(assignments))
@@ -1040,6 +1043,7 @@ async def _build_dag(
         spawn_roles=spawn_roles,
         role_base=role_base,
         worker_models=worker_models,
+        max_spawn=max_spawn,
         role_artifact_defaults=role_artifact_defaults,
         worker_branches=worker_branches,
         messenger_bound=worker_messenger_bound,
@@ -1055,11 +1059,21 @@ def _reconstruct_spawned_nodes(
     dag_state: _DagState,
     checkpoint_ops: dict[str, dict],
     checkpoint_spawned: list[dict],
+    *,
+    retry_failed: bool = False,
 ) -> None:
     """Rebuild reactively spawned nodes from a checkpoint into the fresh
     graph, pre-completed like a planned node. See docs/internals/cli.md for
     the three soundness checks (operation field, parent-terminal, spawn_id)
-    each entry must pass before any node is added to the graph."""
+    each entry must pass before any node is added to the graph.
+
+    With retry_failed, an entry the checkpoint recorded as failed is rebuilt
+    to run rather than rebuilt as already-failed, and a failed planned op is
+    no longer terminal for the parent-terminal check: it is about to run
+    again, so the spawn decision it recorded is not one this resume can
+    replay. Children of such a parent are expected to have been dropped
+    before this point; excluding it here means any that were not are refused
+    by that check rather than kept against a superseded parent."""
     from uuid import UUID as _UUID
 
     from lionagi.operations.node import create_operation
@@ -1100,10 +1114,11 @@ def _reconstruct_spawned_nodes(
 
     known_ids = {str(n) for n in dag_state.node_ids}
     candidate_ids = {e["node_id"] for e in checkpoint_spawned}
+    replayable = ("completed",) if retry_failed else ("completed", "failed")
     terminal_planned_ids = {
         str(node_id)
         for agent_id, node_id in zip(plan_result.agent_ids, dag_state.node_ids, strict=True)
-        if (checkpoint_ops.get(agent_id) or {}).get("status") in ("completed", "failed")
+        if (checkpoint_ops.get(agent_id) or {}).get("status") in replayable
     }
 
     unsound = [
@@ -1146,10 +1161,16 @@ def _reconstruct_spawned_nodes(
             id=_UUID(node_id),
             metadata=metadata,
         )
-        node.execution.status = (
-            EventStatus.COMPLETED if entry["status"] == "completed" else EventStatus.FAILED
-        )
-        node.execution.response = entry.get("response")
+        if entry["status"] == "completed":
+            node.execution.status = EventStatus.COMPLETED
+            node.execution.response = entry.get("response")
+        elif not retry_failed:
+            node.execution.status = EventStatus.FAILED
+            node.execution.response = entry.get("response")
+        # else: rebuilt with its default pending status and no response, so the
+        # executor runs it. The prior failure produced no result to carry, and
+        # the node is fully reconstructible from its recorded operation,
+        # instruction and context.
         role_branch = dag_state.role_base.get(assignee) if assignee else None
         if role_branch is not None:
             node.branch_id = role_branch.id
@@ -1165,6 +1186,31 @@ def _reconstruct_spawned_nodes(
         graph.add_edge(Edge(head=parent_uuid, tail=built[entry["node_id"]].id, label=["spawn"]))
 
 
+def _drop_spawns_under_rerun_parents(
+    checkpoint_spawned: list[dict], rerun_node_ids: set[str]
+) -> list[dict]:
+    """Drop every recorded spawn descended from a node that is about to re-run.
+
+    A re-running op decides its own reactive spawns, and there is no reason the
+    second attempt makes the same ones. Keeping the first attempt's children
+    would leave work attributed to a parent execution that no longer exists,
+    and would double it the moment the re-run spawns its own. Dropping them is
+    the re-derive half of "invalidate or re-derive": the parent produces its
+    children again, or produces none.
+
+    The walk is transitive, because a dropped spawn's own children are
+    descended from the same superseded run.
+    """
+    dropped = set(rerun_node_ids)
+    remaining = list(checkpoint_spawned)
+    while True:
+        keep = [e for e in remaining if e.get("parent_id") not in dropped]
+        if len(keep) == len(remaining):
+            return keep
+        dropped.update(e["node_id"] for e in remaining if e.get("parent_id") in dropped)
+        remaining = keep
+
+
 def _apply_checkpoint_precompletion(
     env: OrchestrationEnv,
     plan_result: _PlanResult,
@@ -1172,17 +1218,61 @@ def _apply_checkpoint_precompletion(
     checkpoint_ops: dict[str, dict],
     *,
     allow_degraded_context: bool,
+    retry_failed: bool = False,
     checkpoint_spawned: list[dict] | None = None,
 ) -> None:
     """Mark nodes the checkpoint recorded as terminal so the executor's
     pre-completed seam short-circuits them. A pending op with inherit_context
     is refused unless allow_degraded_context is passed (v1 resume restores
     results-context only). checkpoint_spawned is rebuilt the same way — see
-    _reconstruct_spawned_nodes."""
+    _reconstruct_spawned_nodes.
+
+    A node the checkpoint recorded as failed refuses the resume unless
+    retry_failed is passed. Replaying it as terminal is what the executor's
+    pre-completed seam does with any terminal status, so the node is skipped
+    and nothing downstream of it ever becomes runnable — a run that died on
+    its deadline can never be finished by resuming it. Re-running it silently
+    is the other way to be wrong, because it re-executes whatever side effects
+    the first attempt already had, so the choice is the caller's to make."""
     from lionagi.protocols.types import EventStatus
 
+    failed_agent_ids = []
+    failed_node_ids = set()
+    for agent_id, node_id in zip(plan_result.agent_ids, dag_state.node_ids, strict=True):
+        if (checkpoint_ops.get(agent_id) or {}).get("status") == "failed":
+            failed_agent_ids.append(agent_id)
+            failed_node_ids.add(str(node_id))
+    failed_spawned_ids = [
+        entry["node_id"] for entry in (checkpoint_spawned or []) if entry.get("status") == "failed"
+    ]
+    if (failed_agent_ids or failed_spawned_ids) and not retry_failed:
+        named = ", ".join([*failed_agent_ids, *failed_spawned_ids])
+        raise FlowResumeError(
+            f"Resume refused: the checkpoint recorded [{named}] as failed. "
+            "Replaying a failed node as terminal skips it and everything "
+            "downstream of it, so resuming would finish nothing. Pass "
+            "--retry-failed to run them again instead, which re-executes any "
+            "side effects their first attempt already had."
+        )
+
+    # A failed spawned node is rebuilt to run again exactly as a failed planned
+    # one is, so it is a re-running parent by the same reasoning, and its own
+    # recorded children are just as superseded. Leaving it out would keep them:
+    # unlike a child of a re-running planned op, which the reconstruction's
+    # parent-terminal check catches, a child of a spawned parent names a parent
+    # that is still in the checkpoint's own list and so passes that check.
+    rerun_node_ids = failed_node_ids | set(failed_spawned_ids)
+    if checkpoint_spawned and rerun_node_ids:
+        checkpoint_spawned = _drop_spawns_under_rerun_parents(checkpoint_spawned, rerun_node_ids)
     if checkpoint_spawned:
-        _reconstruct_spawned_nodes(env, plan_result, dag_state, checkpoint_ops, checkpoint_spawned)
+        _reconstruct_spawned_nodes(
+            env,
+            plan_result,
+            dag_state,
+            checkpoint_ops,
+            checkpoint_spawned,
+            retry_failed=retry_failed,
+        )
 
     graph = env.builder.get_graph()
     degraded: list[str] = []
@@ -1195,10 +1285,13 @@ def _apply_checkpoint_precompletion(
         if entry and entry.get("status") == "completed":
             node.execution.status = EventStatus.COMPLETED
             node.execution.response = entry.get("response")
-        elif entry and entry.get("status") == "failed":
+        elif entry and entry.get("status") == "failed" and not retry_failed:
             node.execution.status = EventStatus.FAILED
             node.execution.response = entry.get("response")
         elif node.metadata.get("inherit_context"):
+            # A failed op being re-run reaches here too, and correctly: it is
+            # about to run for real, so it needs the same context its first
+            # attempt had and resume cannot restore it either.
             degraded.append(agent_id)
 
     if degraded and not allow_degraded_context:
@@ -1228,6 +1321,7 @@ async def _execute_dag(
     checkpoint_flow_context: dict | None = None,
     checkpoint_spawned_seed: list[dict] | None = None,
     team_max_rounds: int = 2,
+    checkpoint_skip_ids: set[str] | None = None,
 ) -> _ExecResult:
     """Drive the planning engine over the DAG and collect per-agent results.
     checkpoint_config gates the checkpoint writer (opt-in); checkpoint_spawned_seed
@@ -1254,11 +1348,26 @@ async def _execute_dag(
     # DependencyAwareExecutor.__init__; both the control poller and the
     # checkpoint writer's per-completion hook read from it.
     _executor_ref: dict[str, object] = {}
+
+    # Handed out on the result so a later phase sharing this engine run can
+    # exclude its own node from checkpointing before that node runs. Accepted
+    # as an argument so a caller can seed it, since the observer's writes are
+    # drained inside this call and a later phase's additions have to be
+    # visible to that drain.
+    if checkpoint_skip_ids is None:
+        checkpoint_skip_ids = set()
     _checkpoint_tasks: list = []
     _branch_status_tasks: list = []
     _escalation_link_tasks: list = []
     _segment_tasks: list = []
     _control_log_tasks: list = []
+
+    # Restored spawns already consumed spawn budget and exist as completed/
+    # failed work; both the budget below and spawn accounting must count them.
+    restored_spawn_count = len(checkpoint_spawned_seed or [])
+    max_spawn = dag_state.max_spawn
+    if max_spawn is None:
+        max_spawn = _remaining_spawn_capacity(max_ops, len(assignments), restored_spawn_count)
 
     _checkpoint_writer: CheckpointWriter | None = None
     if checkpoint_config is not None:
@@ -1269,6 +1378,7 @@ async def _execute_dag(
             prompt=checkpoint_prompt,
             plan=checkpoint_plan or [],
             config=checkpoint_config,
+            max_spawn=max_spawn,
             # Seed with prior-checkpoint state (empty on a fresh run) so a
             # resume-of-a-resume can't silently lose context before the next flush.
             flow_context=dict(checkpoint_flow_context or {}),
@@ -1285,12 +1395,6 @@ async def _execute_dag(
     else:
         progress(f"Executing DAG (reactive off): {len(assignments)} assignments...")
     conc = max_concurrent if max_concurrent > 0 else max(len(assignments), 1)
-    # Restored spawns already consumed spawn budget and exist as completed/
-    # failed work; both the budget below and spawn accounting must count them.
-    restored_spawn_count = len(checkpoint_spawned_seed or [])
-    # --max-ops shares budget between initial plan + spawns; default cap of
-    # 20 otherwise so an un-capped reactive run can't fan out unbounded.
-    max_spawn = max(0, (max_ops - len(assignments) if max_ops > 0 else 20) - restored_spawn_count)
     # Resume must start the spawn-id ordinal sequence past whatever restored
     # spawns already used (MAX existing + 1, not count — crashes can leave
     # gaps) or a live spawn could reissue a restored spawn_id/artifact dir.
@@ -1379,6 +1483,19 @@ async def _execute_dag(
         (not sig.name, which a spawned clone can share with a planned node)
         routes to record() vs record_spawned() to avoid key collisions."""
         if _checkpoint_writer is None:
+            return
+        # A node a later phase adds to the graph is neither a planned op nor a
+        # reactive spawn, and both branches below are wrong for it: record()
+        # would write the planned `ops` keyspace under a name no plan entry
+        # claims, and record_spawned() would hand resume something it rebuilds
+        # into the fresh graph as pre-completed work. The spawn soundness
+        # checks do not stop that, because they are written for role-spawned
+        # nodes and such a node passes each one vacuously -- no assignee, so
+        # the assignee/spawn_id pairing check does not apply, and no parent, so
+        # the parent-terminal check does not apply. Not recording is the honest
+        # answer: nothing about the phase needs restoring, since it is derived
+        # from results the checkpoint already holds.
+        if sig.op_id in checkpoint_skip_ids:
             return
         executor = _executor_ref.get("executor")
         response = None
@@ -1872,30 +1989,23 @@ async def _execute_dag(
                     await _drain_escalation_links_bounded()
                 else:
                     # Bounded by _ESCALATION_LINK_RETRIES * _ESCALATION_LINK_RETRY_INTERVAL
-                    # (a few seconds worst case) in the happy path — the outer
-                    # db/session teardown (teardown_persist) only runs after this
-                    # function returns, so draining here, not firing untracked, is
-                    # what keeps a late retry from writing into a store this run
-                    # has already closed.
+                    # (a few seconds worst case); draining here rather than
+                    # firing untracked keeps a late retry from writing into a
+                    # store teardown_persist is about to close.
                     #
-                    # A cancellation can also land on *this* task after
-                    # run_dag() already returned — the CancelScope shield above
-                    # only stops anyio-mediated cancellation, not a direct
-                    # cancel() on this task — so _dag_cancelled stays False and
-                    # this is the await that would otherwise take it. gather()
-                    # only settles its own cancellation once every child
-                    # actually finishes, so a link task that swallows the one
-                    # cancel it's handed (or blocks past it) would leave a bare
-                    # `await gather(...)` parked here forever — asyncio.shield
-                    # lets this await raise promptly instead of waiting on the
-                    # children, which keep running in the background for
-                    # _drain_escalation_links_bounded() to actually finish off.
-                    # Re-raise afterward so the caller still observes the
-                    # cancellation — unless the try body already raised a real
-                    # exception, in which case that exception is what the
-                    # caller was waiting on and must win; a cancellation that
-                    # only landed during this teardown drain must not silently
-                    # replace it.
+                    # A cancellation can land on *this* task after run_dag()
+                    # already returned (the CancelScope shield above only
+                    # stops anyio-mediated cancellation, not a direct
+                    # cancel()), so _dag_cancelled stays False and this await
+                    # would otherwise absorb it. asyncio.shield lets this
+                    # await raise promptly instead of blocking on gather()
+                    # until every child settles (a link task that swallows or
+                    # outlives its own cancel would otherwise park this await
+                    # forever) — the children keep running in the background
+                    # for _drain_escalation_links_bounded() to finish off.
+                    # Re-raised below unless the try body already raised a
+                    # real exception, which must win over a cancellation that
+                    # only landed during this teardown drain.
                     _in_flight_exc = sys.exc_info()[1]
                     try:
                         with contextlib.suppress(Exception):
@@ -1978,21 +2088,13 @@ async def _execute_dag(
         prior_failed_evidence = getattr(env, "_failed_operation_evidence", None) or []
         env._failed_operation_evidence = [*prior_failed_evidence, *failed_evidence]
 
-    # Lost-node evidence: a node in the fixed initial plan (node_ids /
-    # assignments, indexed 1:1) whose result never landed in
-    # operation_results at all -- distinct from a node that ran and failed
-    # (already caught above) or was legitimately never meant to run. Every
-    # other accounted-for fate is excluded explicitly: an edge-condition skip
-    # is named in skipped_operations; a leg that gave up via EscalationRequest
-    # is named in escalated_operations and already fails the run through the
-    # escalated-evidence backstop above with its own, more specific reason;
-    # a reactive/budget-refused spawn was never a planned node to begin with
-    # (dropped_spawns never touches node_ids). A cancelled run never reaches
-    # this line -- run_dag raises and the whole evidence block above is
-    # skipped -- so no separate check is needed for it. What remains here is
-    # a node the plan expected but execution never observed in any of those
-    # ways; treat it as a failure with its own evidence rather than letting
-    # it render as "(no response)" below.
+    # Lost-node evidence: a planned node (node_ids/assignments, 1:1) whose
+    # result never landed in operation_results, and whose absence isn't
+    # already explained by skipped_operations (edge-condition skip),
+    # escalated_operations (already handled above), or dropped_spawns (never
+    # a planned node). A cancelled run never reaches this line at all. What's
+    # left is a node the plan expected but never observed in any known way;
+    # treat it as its own failure rather than rendering "(no response)" below.
     skipped_op_ids = {str(x) for x in dag_result.get("skipped_operations", [])}
     observed_op_ids = {str(k) for k in op_results}
     lost_evidence = [
@@ -2006,17 +2108,13 @@ async def _execute_dag(
         prior_failed_evidence = getattr(env, "_failed_operation_evidence", None) or []
         env._failed_operation_evidence = [*prior_failed_evidence, *lost_evidence]
 
-    # Lost-spawn evidence: mirrors the lost-node check above, but for the
-    # reactive surface. spawned_ids (when the executor reports it) is the
-    # roster of every node _accept_node actually accepted into the graph --
-    # spawned_operations is only a running count and can't answer "which
-    # nodes were accepted" on its own. An accepted spawn that reached a
-    # terminal EventStatus (e.g. CANCELLED) without ever producing a result
-    # is absent from operation_results, failed_operations, and
-    # skipped_operations alike; without this check it would also read as a
-    # clean completion. A spawn the executor refused to accept in the first
-    # place (dropped_spawns) never enters spawned_ids, so it stays excluded
-    # here exactly as dropped_spawns already is above.
+    # Lost-spawn evidence: mirrors the lost-node check above for the reactive
+    # surface. spawned_ids is the roster _accept_node actually accepted
+    # (spawned_operations is only a running count, not a roster). An accepted
+    # spawn that reached a terminal EventStatus (e.g. CANCELLED) with no
+    # result would otherwise be absent from every known-outcome set and read
+    # as a clean completion. A spawn the executor refused (dropped_spawns)
+    # never enters spawned_ids, so it stays excluded here too.
     spawned_ids = {str(x) for x in dag_result.get("spawned_ids", [])}
     lost_spawn_ids = (
         spawned_ids - observed_op_ids - skipped_op_ids - escalated_op_ids - failed_op_ids
@@ -2033,7 +2131,7 @@ async def _execute_dag(
         prior_failed_evidence = getattr(env, "_failed_operation_evidence", None) or []
         env._failed_operation_evidence = [*prior_failed_evidence, *lost_spawn_evidence]
 
-    # Gate-reject evidence (issue #2860): a mid-DAG gate node returned a
+    # Gate-reject evidence: a mid-DAG gate node returned a
     # REJECT verdict and the executor short-circuited its dependent subtree
     # to skipped rather than let it run against the rejected baseline. This
     # names the rejecting gate(s), not the (possibly many) skipped
@@ -2186,6 +2284,8 @@ async def _execute_dag(
         n_spawned=n_spawned,
         t_exec_elapsed=t_exec_elapsed,
         escalated_agent_ids=escalated_agent_ids,
+        engine_run=eng_run,
+        checkpoint_skip_ids=checkpoint_skip_ids,
     )
 
 
@@ -2253,7 +2353,26 @@ async def _synthesize(
         context=artifacts,
     )
     t_synth = time.monotonic()
-    synth_result_raw = await env.session.flow(env.builder.get_graph(), verbose=env.verbose)
+    if exec_result.engine_run is None:
+        raise RuntimeError("synthesis requires the engine run that executed the DAG")
+    # The graph still carries every worker node, because synthesis depends on
+    # them and the executor resolves those dependencies from it. They already
+    # ran in the execution phase, though, so this pass must not signal them
+    # again: that would write a second set of terminal events for work it did
+    # not do, and a checkpointed resume rebuilt from those events treats the
+    # replayed nodes as completed.
+    synth_graph = env.builder.get_graph()
+    already_ran = {str(n.id) for n in synth_graph.internal_nodes.values()} - {str(synth_node)}
+    # The synthesis node's own signals stay audible, so the checkpoint
+    # observer registered during execution sees a node that did not exist
+    # when it was built and has no branch it belongs to. Exclude it before
+    # the pass rather than after: the observer fires during run_dag.
+    exec_result.checkpoint_skip_ids.add(str(synth_node))
+    synth_result_raw = await exec_result.engine_run.run_dag(
+        synth_graph,
+        verbose=env.verbose,
+        skip_signal_ops=already_ran,
+    )
     t_synth_elapsed = time.monotonic() - t_synth
     synth_res = synth_result_raw.get("operation_results", {}).get(synth_node)
     synthesis_result = {
@@ -2451,6 +2570,7 @@ async def _run_flow(
     pack: str | None = None,
     resume_checkpoint: dict | None = None,
     allow_degraded_context: bool = False,
+    retry_failed: bool = False,
     notify: str | None = None,
     mcp_config: str | None = None,
     no_mcp_config: bool = False,
@@ -2633,6 +2753,7 @@ async def _run_flow(
         reactive_spec=reactive_spec,
         resume_checkpoint=resume_checkpoint,
         allow_degraded_context=allow_degraded_context,
+        retry_failed=retry_failed,
         checkpoint_config=_checkpoint_config,
     )
     _terminal_status = "completed"
@@ -2783,6 +2904,7 @@ async def _run_flow_inner(
     reactive_spec: str = "all",
     resume_checkpoint: dict | None = None,
     allow_degraded_context: bool = False,
+    retry_failed: bool = False,
     checkpoint_config: dict | None = None,
 ) -> str:
     """Sequence the flow phases: plan → [dry-run] → build → execute → synthesize → finalize."""
@@ -2922,17 +3044,16 @@ async def _run_flow_inner(
             if env.bare:
                 lines.append(f"  {agent_ids[i]}: {model_spec} (bare)")
                 continue
-            rm, rp = resolve_worker_spec(ta.assignee)
-            cfg = role_config(ta.assignee, env.pack)
-            if rp:
+            model, rp, cfg = _resolve_worker_model_spec(env, ta.assignee)
+            if cfg and cfg.model:
+                src = "pack"
+                modes = [] if rp else resolve_modes(ta.assignee, ta.modes or None, env.pack)
+            elif rp:
                 # A user profile supplies its own body — casts modes don't apply
                 # (profile shadows casts; ADR-0043 follow-up makes them compose).
-                model, src, modes = rm, "profile", []
-            elif cfg and cfg.model:
-                model, src = cfg.model, "pack"
-                modes = resolve_modes(ta.assignee, ta.modes or None, env.pack)
+                src, modes = "profile", []
             else:
-                model, src = model_spec, "default"
+                src = "default"
                 modes = resolve_modes(ta.assignee, ta.modes or None, env.pack)
             mode_str = f"  modes={modes}" if modes else ""
             lines.append(f"  {agent_ids[i]}: {model} ({src}){mode_str}")
@@ -2992,7 +3113,15 @@ async def _run_flow_inner(
         budget_preambles=budget_preambles,
     )
 
-    dag_state = await _build_dag(env, prompt, plan_result, reactive_spec=reactive_spec)
+    restored_spawn_count = len((resume_checkpoint or {}).get("spawned") or [])
+    max_spawn = _remaining_spawn_capacity(max_ops, len(assignments), restored_spawn_count)
+    dag_state = await _build_dag(
+        env,
+        prompt,
+        plan_result,
+        reactive_spec=reactive_spec,
+        max_spawn=max_spawn,
+    )
 
     if resume_checkpoint is not None:
         _apply_checkpoint_precompletion(
@@ -3001,6 +3130,7 @@ async def _run_flow_inner(
             dag_state,
             resume_checkpoint.get("ops") or {},
             allow_degraded_context=allow_degraded_context,
+            retry_failed=retry_failed,
             checkpoint_spawned=resume_checkpoint.get("spawned") or None,
         )
         checkpoint_plan = resume_checkpoint["plan"]
@@ -3062,6 +3192,7 @@ async def _resume_flow(
     target: str,
     *,
     allow_degraded_context: bool = False,
+    retry_failed: bool = False,
     dry_run: bool = False,
     show_graph: bool = False,
     notify: str | None = None,
@@ -3079,5 +3210,6 @@ async def _resume_flow(
         prompt=checkpoint.get("prompt", ""),
         resume_checkpoint=checkpoint,
         allow_degraded_context=allow_degraded_context,
+        retry_failed=retry_failed,
         **config,
     )

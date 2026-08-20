@@ -21,6 +21,8 @@ import socket
 import subprocess
 import sys
 import time
+from collections import Counter
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -315,22 +317,14 @@ _DIFFERENTIAL_FAKE_TMPDIR = "/tmp/lionagi-differential-fake-tmp"
 _DIFFERENTIAL_FAKE_USER = "lionagi-differential-fake-user"
 
 
-def differential_capture(argv: list[str], timeout: float = 20.0) -> list[dict[str, Any]]:
-    """Capture *argv* three times: once under the ambient environment and
-    working directory, once under a deliberately different HOME / TMPDIR /
-    USER and a different working directory, and once more after a wall-clock
-    gap crossing a one-second boundary. A stream that reads anything from
-    the environment, the current directory, or the clock necessarily differs
-    across these runs; genuinely static argparse usage/error text does not.
-    This replaces guessing at what a leaked value looks like (a pattern list,
-    a vocabulary of "known-safe" words) with a check on the property that
-    actually matters: does the output depend on the machine at all."""
+def _environment_and_cwd_runs(argv: Sequence[str], timeout: float) -> list[dict[str, Any]]:
     fake_cwd = Path(_DIFFERENTIAL_FAKE_TMPDIR)
     fake_cwd.mkdir(parents=True, exist_ok=True)
-    runs = [
-        _run_cli_env(argv, timeout=timeout),
+    args = list(argv)
+    return [
+        _run_cli_env(args, timeout=timeout),
         _run_cli_env(
-            argv,
+            args,
             env_overrides={
                 "HOME": _DIFFERENTIAL_FAKE_HOME,
                 "TMPDIR": _DIFFERENTIAL_FAKE_TMPDIR,
@@ -342,8 +336,30 @@ def differential_capture(argv: list[str], timeout: float = 20.0) -> list[dict[st
             timeout=timeout,
         ),
     ]
-    time.sleep(1.05)
-    runs.append(_run_cli_env(argv, timeout=timeout))
+
+
+def _wait_for_next_wall_clock_second() -> None:
+    now = time.time()
+    time.sleep(max(0.001, int(now) + 1.001 - now))
+
+
+def differential_capture_many(
+    argvs: Iterable[Sequence[str]], timeout: float = 20.0
+) -> dict[tuple[str, ...], list[dict[str, Any]]]:
+    """Capture every argv under ambient and changed host state, then cross
+    one shared wall-clock boundary before the final ambient captures.
+
+    Sharing the boundary preserves the clock-variance proof without paying a
+    one-second sleep for every CLI case assigned to the same pytest worker.
+    """
+    keys = tuple(tuple(argv) for argv in argvs)
+    if len(keys) != len(set(keys)):
+        raise ValueError("differential capture argv values must be unique")
+
+    runs = {argv: _environment_and_cwd_runs(argv, timeout) for argv in keys}
+    _wait_for_next_wall_clock_second()
+    for argv in keys:
+        runs[argv].append(_run_cli_env(list(argv), timeout=timeout))
     return runs
 
 
@@ -351,7 +367,7 @@ def known_machine_identity() -> frozenset[str]:
     """Literal values that identify *this* machine or checkout: hostname,
     real username, home directory, and this repo's own checkout path.
 
-    ``differential_capture`` above cannot catch a value that is constant on
+    ``differential_capture_many`` above cannot catch a value that is constant on
     this machine but still identifying -- a hostname baked into a banner
     line does not vary between two runs on the same box. This closes that
     gap by redacting known values rather than guessing at shapes: it is
@@ -415,30 +431,21 @@ def capture_specialized() -> list[dict[str, Any]]:
     return [_run_cli(list(argv)) for argv in SPECIALIZED_CASES]
 
 
-# A handful of the committable specialized-CLI cases capture argparse's own
-# rendered usage/help/error text verbatim (see _COMMITTABLE_SPECIALIZED_ARGV
-# in test_public_surfaces.py). That text depends on the interpreter's
-# HelpFormatter, which CPython has changed more than once across this
-# project's CI matrix. Two distinct changes are in play here, and only one of
-# them is stable enough to pin per minor version:
+# Committable specialized-CLI cases capture argparse's own rendered
+# usage/help/error text verbatim, which depends on the interpreter's
+# HelpFormatter. Two distinct CPython rendering changes are in play, only
+# one of which is stable enough to pin per minor version:
 #
-# - Invalid-choice quoting (e.g. "choose from 'a', 'b'" vs "choose from a,
-#   b") is NOT a stable per-minor-version property: it was dropped in 3.12,
-#   and CPython has since flipped it again *within* the 3.14 series (a local
-#   3.14.3 interpreter renders unquoted; CI's 3.14.6 renders quoted, for the
-#   same argparse call). A per-minor-version baseline key cannot represent a
-#   property that changes between patch releases of the same minor. This is
-#   handled by narrow, named normalization -- see
-#   ``normalize_argparse_choice_quoting`` below -- applied only to the
-#   "(choose from ...)" fragment, so the choice names themselves (this
-#   project's own subcommand list) still fail the comparison if they change.
-# - The 3.13 metavar collapse (a repeated per-option-string metavar folded
-#   into one shared metavar, e.g. "-f PATH, --file PATH" -> "-f, --file
-#   PATH") is a real, stable rendering change that also reflows the
-#   surrounding wrapped usage lines. It has not been observed to vary within
-#   a minor version, so it keeps its own pinned baseline rather than being
-#   normalized away -- normalizing it would risk masking an actual change in
-#   this CLI's own usage/help text.
+# - Invalid-choice quoting ("choose from 'a', 'b'" vs "choose from a, b") is
+#   NOT stable per minor version: dropped in 3.12, then flipped again
+#   *within* the 3.14 series (3.14.3 renders unquoted, CI's 3.14.6 quoted,
+#   for the same call). Handled by narrow normalization on just the
+#   "(choose from ...)" fragment -- see ``normalize_argparse_choice_quoting``
+#   -- so the choice names themselves still fail comparison if they change.
+# - The 3.13 metavar collapse ("-f PATH, --file PATH" -> "-f, --file PATH",
+#   which also reflows wrapped usage lines) is stable within a minor
+#   version, so it keeps its own pinned baseline rather than being
+#   normalized away.
 _SPECIALIZED_BASELINE_BY_PYVER: dict[tuple[int, int], str] = {
     (3, 10): "specialized",
     (3, 11): "specialized",  # measured byte-identical to 3.10's capture (mod. choice quoting)
@@ -484,16 +491,13 @@ _CHOOSE_FROM_RE = re.compile(r"\(choose from ((?:'[^']*'|[^,)]+)(?:, (?:'[^']*'|
 
 
 def normalize_argparse_choice_quoting(text: str) -> str:
-    """Strip the quote characters CPython's argparse ``HelpFormatter`` wraps
-    each choice name in inside a "(choose from ...)" invalid-choice error.
+    """Strip the quote characters argparse's ``HelpFormatter`` wraps each
+    choice name in inside a "(choose from ...)" invalid-choice error.
 
-    This targets exactly that fragment, not the surrounding text: the choice
-    *names* are this project's own subcommand list and remain fully
-    compared by the caller (a renamed, added, or removed choice still
-    produces a different normalized fragment and fails); only the
-    quote-or-not rendering argparse wraps them in -- which CPython has
-    flipped more than once within a single Python 3.14 patch series -- is
-    discarded.
+    Targets exactly that fragment: the choice names remain fully compared by
+    the caller (a renamed/added/removed choice still fails), only the
+    quote-or-not rendering -- which CPython has flipped more than once
+    within a single 3.14 patch series -- is discarded.
     """
 
     def _sub(match: re.Match[str]) -> str:
@@ -616,7 +620,24 @@ def capture_mcp() -> dict[str, Any]:
             "available_count": catalog["available_count"],
             "max_ops": catalog["max_ops"],
             "verb_names": sorted(v["verb"] for v in catalog["verbs"]),
-            "available_verb_names": sorted(v["verb"] for v in catalog["verbs"] if v["available"]),
+            # the catalog omits `available` at its default, so absence means available
+            "available_verb_names": sorted(
+                v["verb"] for v in catalog["verbs"] if v.get("available", True)
+            ),
+            # Which keys an entry carries is the contract every caller reads, and
+            # names and counts alone are blind to it: fields can be added to or
+            # dropped from all 70 entries without moving anything above. Held as
+            # the distinct key sets with their frequency, so the baseline moves on
+            # a shape change without carrying a row per verb.
+            # lists rather than tuples: this is compared against the JSON
+            # baseline, which has no tuple to round-trip back to
+            "entry_key_sets": [
+                [sorted(shape), count]
+                for shape, count in sorted(
+                    Counter(frozenset(v) for v in catalog["verbs"]).items(),
+                    key=lambda kv: sorted(kv[0]),
+                )
+            ],
         },
         "projections": projections,
         "projection_count": len(projections),
@@ -657,18 +678,15 @@ def capture_machine() -> list[dict[str, Any]]:
     return cases
 
 
-# ── Fresh-process import-laziness trace ──────────────────────────────────────
-
-# Self-contained subprocess payload: import only the named seed via the
-# registry's own `load_cli_command`, then report which *other* seeds' modules
-# leaked in, whether the HTTP registry got realized as a side effect, and
-# which seed(s) ended up in `_cli_realized`. Comparing against
-# `{s.module for s in iter_cli_seeds() if s.module != seed.module}` handles
-# shared modules (studio/schedule -> lionagi.studio.cli;
-# handshake/runs/lifecycle -> lionagi.cli.machine) for free: a shared
-# module's string is removed from the "other" set together with the selected
-# seed's own module, so loading `studio` never flags `lionagi.studio.cli`
-# even though `schedule` also maps to it.
+# Fresh-process import-laziness trace: self-contained subprocess payload that
+# imports only the named seed via `load_cli_command`, then reports which
+# *other* seeds' modules leaked in, whether the HTTP registry got realized as
+# a side effect, and which seed(s) ended up in `_cli_realized`. Comparing
+# against modules belonging to seeds other than this one's own handles
+# shared modules for free (e.g. studio/schedule both map to
+# lionagi.studio.cli): a shared module is excluded from "other" together
+# with the selected seed's own module, so loading `studio` never flags
+# `lionagi.studio.cli` even though `schedule` also uses it.
 _IMPORT_TRACE_SCRIPT = (
     "import sys, json\n"
     "from lionagi._auto import load_cli_command, seed_for, iter_cli_seeds, _http, _cli_realized\n"
@@ -736,15 +754,13 @@ _COMPAT_TRACE_SCRIPT = (
 
 def _run_compat_trace(module_name: str, timeout: float = 20.0) -> dict[str, Any]:
     """Import *module_name* alone in a fresh subprocess and report its public
-    ``dir()``. A compat module's own ``__init__.py`` declares its intended
-    re-exports, but Python also binds any submodule onto its parent package's
-    namespace the moment *anything* imports that submodule dotted-path --
-    including unrelated code elsewhere in the process (e.g. a lazy import
-    inside a different module). In-process capture would pick up whichever of
-    those happened to run first in this pytest worker, making the result
-    depend on suite composition rather than the compat module's own surface.
-    A fresh subprocess with a declared import set (only *module_name* itself)
-    removes that dependency."""
+    ``dir()``. Python binds any submodule onto its parent package's
+    namespace the moment *anything* imports that dotted path, including
+    unrelated code elsewhere in the process -- so in-process capture would
+    pick up whichever import happened to run first in this pytest worker,
+    making the result depend on suite composition rather than the compat
+    module's own surface. A fresh subprocess with a declared import set
+    (only *module_name* itself) removes that dependency."""
     proc = subprocess.run(
         [sys.executable, "-c", _COMPAT_TRACE_SCRIPT, module_name],
         cwd=REPO_ROOT,

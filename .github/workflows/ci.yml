@@ -18,9 +18,17 @@ on:
   # PR that has since changed state, and if a job is ever made conditional on
   # draft it will not have run at all. Listing the defaults back is mandatory:
   # naming types replaces them rather than adding to them.
+  #
+  # And no branches filter, the same principle a third time. A PR based on any
+  # branch other than main or develop raised no event, so nothing here ever ran
+  # on it. Its
+  # base is unprotected, so the required checks do not apply either: the PR reads
+  # mergeable with no suite behind it, and merging it carries never-tested code
+  # into the parent branch, where the parent's own suite structurally cannot see
+  # it. That failure is silent, which is why the filter goes rather than the
+  # branch list growing.
   pull_request:
     types: [ opened, synchronize, reopened, ready_for_review ]
-    branches: [ main, develop ]
   workflow_dispatch:
     inputs:
       python-matrix:
@@ -143,8 +151,17 @@ jobs:
     - name: Lint markdown (formatting)
       uses: DavidAnson/markdownlint-cli2-action@v24
       with:
-        globs: "docs/**/*.md,README.md,AGENT.md,CLAUDE.md,CONTRIBUTING.md,CHANGELOG.md"
-        config: ".markdownlint.json"
+        # globs is newline-delimited; the action's `separator` input defaults to
+        # "\n". A single comma-joined string is taken as one literal glob, matches
+        # no file, and the step then passes having linted nothing at all.
+        globs: |
+          docs/**/*.md
+          README.md
+          AGENT.md
+          CLAUDE.md
+          CONTRIBUTING.md
+          CHANGELOG.md
+        config: ".markdownlint.jsonc"
 
     - name: Check internal links
       uses: lycheeverse/lychee-action@v2
@@ -390,9 +407,14 @@ jobs:
     - name: Install frontend dependencies
       working-directory: apps/studio/frontend
       run: npm ci
+    # No --with-deps: it runs apt on the runner, which has hung for the whole
+    # 15-minute job budget when an Ubuntu mirror is unreachable, and the runner
+    # image already ships Chrome and the shared libraries Chromium needs. If one
+    # is ever genuinely missing, the e2e step below fails immediately and names
+    # it, which is a better failure than a silent timeout.
     - name: Install Playwright browsers
       working-directory: apps/studio/frontend
-      run: npx playwright install chromium --with-deps
+      run: npx playwright install chromium
     # Builds the SPA, boots a seeded daemon + `vite preview` on temp/free-port
     # infrastructure (never the real ~/.lionagi), and runs the Chromium smoke
     # specs against it -- see apps/studio/frontend/e2e/ and tests/e2e_studio/.

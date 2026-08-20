@@ -120,7 +120,7 @@ async def _mark_running(db: StateDB, run_id: str, *, now: float) -> None:
     assert result.applied is True
 
 
-# ── 1. Capability mismatch -> deferred, never terminal ──────────────────────
+# Capability mismatch -> deferred, never terminal
 
 
 async def test_capability_mismatch_defers_not_terminal(db: StateDB) -> None:
@@ -145,7 +145,7 @@ async def test_capability_match_and_no_holder_admits(db: StateDB) -> None:
     assert decision == AdmissionDecision(admitted=True)
 
 
-# ── 2. Concurrency block (within waiter cap) -> deferred, never terminal ────
+# Concurrency block (within waiter cap) -> deferred, never terminal
 
 
 async def test_concurrency_block_within_cap_defers(db: StateDB) -> None:
@@ -198,7 +198,7 @@ async def test_claimed_keys_pass_local_holder_blocks_even_when_db_shows_no_runni
     assert "deferred" in decision.reason_summary
 
 
-# ── 3. Waiter-cap overflow -> terminal, unless opted into deferred ─────────
+# Waiter-cap overflow -> terminal, unless opted into deferred
 
 
 async def test_waiter_cap_exceeded_is_terminal_rejection(db: StateDB) -> None:
@@ -246,7 +246,7 @@ async def test_waiter_cap_exceeded_but_opted_into_deferred_stays_deferred(db: St
     assert "opted into deferred" in decision.reason_summary
 
 
-# ── 4. Duration guard -> terminal, unconditional ────────────────────────────
+# Duration guard -> terminal, unconditional
 
 
 async def test_duration_guard_rejects_when_at_or_above_lease_ttl(db: StateDB) -> None:
@@ -307,7 +307,7 @@ async def test_duration_guard_takes_priority_over_capability_mismatch(db: StateD
     assert decision.reason_code == RunReasons.SKIPPED_DURATION_EXCEEDS_LEASE
 
 
-# ── 5. Pure helper functions ─────────────────────────────────────────────
+# Pure helper functions
 
 
 def test_normalize_action_args_handles_json_string_dict_and_junk():
@@ -336,8 +336,8 @@ def test_allows_deferred_over_cap_reads_admission_opts():
 
 
 def test_notify_request_requires_deliver_to():
-    assert notify_request({"admission": {"notify": {"deliver_to": "lambda:leo"}}}) == {
-        "deliver_to": "lambda:leo"
+    assert notify_request({"admission": {"notify": {"deliver_to": "notify-target"}}}) == {
+        "deliver_to": "notify-target"
     }
     assert notify_request({"admission": {"notify": {"kind": "terminal_notify"}}}) is None
     assert notify_request({"admission": {"notify": "not-a-dict"}}) is None
@@ -352,10 +352,11 @@ def test_notify_request_rejects_malformed_field_types():
     assert notify_request({"admission": {"notify": {"deliver_to": ""}}}) is None
     assert notify_request({"admission": {"notify": {"deliver_to": None}}}) is None
     assert (
-        notify_request({"admission": {"notify": {"deliver_to": "lambda:leo", "kind": 7}}}) is None
+        notify_request({"admission": {"notify": {"deliver_to": "notify-target", "kind": 7}}})
+        is None
     )
     assert (
-        notify_request({"admission": {"notify": {"deliver_to": "lambda:leo", "dedup_key": 123}}})
+        notify_request({"admission": {"notify": {"deliver_to": "notify-target", "dedup_key": 123}}})
         is None
     )
     # Valid optional fields still pass through unchanged.
@@ -363,14 +364,14 @@ def test_notify_request_rejects_malformed_field_types():
         {
             "admission": {
                 "notify": {
-                    "deliver_to": "lambda:leo",
+                    "deliver_to": "notify-target",
                     "kind": "terminal_notify",
                     "dedup_key": "abc",
                 }
             }
         }
     ) == {
-        "deliver_to": "lambda:leo",
+        "deliver_to": "notify-target",
         "kind": "terminal_notify",
         "dedup_key": "abc",
     }
@@ -381,31 +382,34 @@ def test_notify_request_rejects_present_but_null_optional_fields():
     # KEY-ABSENT -- it must be rejected the same as any other wrong type,
     # never silently passed through to DispatchSignal.
     assert (
-        notify_request({"admission": {"notify": {"deliver_to": "lambda:leo", "kind": None}}})
+        notify_request({"admission": {"notify": {"deliver_to": "notify-target", "kind": None}}})
         is None
     )
     assert (
-        notify_request({"admission": {"notify": {"deliver_to": "lambda:leo", "dedup_key": None}}})
+        notify_request(
+            {"admission": {"notify": {"deliver_to": "notify-target", "dedup_key": None}}}
+        )
         is None
     )
     # Empty string is also rejected for present optional fields.
     assert (
-        notify_request({"admission": {"notify": {"deliver_to": "lambda:leo", "kind": ""}}}) is None
+        notify_request({"admission": {"notify": {"deliver_to": "notify-target", "kind": ""}}})
+        is None
     )
     assert (
-        notify_request({"admission": {"notify": {"deliver_to": "lambda:leo", "dedup_key": ""}}})
+        notify_request({"admission": {"notify": {"deliver_to": "notify-target", "dedup_key": ""}}})
         is None
     )
     # A genuinely ABSENT kind/dedup_key stays optional -- payload still passes.
-    assert notify_request({"admission": {"notify": {"deliver_to": "lambda:leo"}}}) == {
-        "deliver_to": "lambda:leo"
+    assert notify_request({"admission": {"notify": {"deliver_to": "notify-target"}}}) == {
+        "deliver_to": "notify-target"
     }
     assert notify_request(
-        {"admission": {"notify": {"deliver_to": "lambda:leo", "kind": "terminal_notify"}}}
-    ) == {"deliver_to": "lambda:leo", "kind": "terminal_notify"}
+        {"admission": {"notify": {"deliver_to": "notify-target", "kind": "terminal_notify"}}}
+    ) == {"deliver_to": "notify-target", "kind": "terminal_notify"}
 
 
-# ── 6. waiter_ahead_count / holder_is_running direct coverage ───────────────
+# waiter_ahead_count / holder_is_running direct coverage
 
 
 async def test_holder_is_running_true_and_false(db: StateDB) -> None:

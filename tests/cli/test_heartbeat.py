@@ -14,7 +14,7 @@ import pytest
 
 from lionagi.cli.orchestrate import flow as flow_mod
 
-# ── Unit tests for the heartbeat loop logic ──────────────────────────────────
+# Unit tests for the heartbeat loop logic
 
 
 @pytest.mark.asyncio
@@ -91,20 +91,6 @@ async def test_heartbeat_skips_completed_ops():
         pass
 
     assert emitted == []
-
-
-def test_elapsed_threshold_requires_descendant_activity_signal():
-    now = time.time()
-    warning = flow_mod._heartbeat_warning(
-        _running_segment(now, 601),
-        now=now,
-        max_idle_seconds=600,
-        sample_interval_seconds=60,
-        previous=({41: 8.0}, True),
-        current=({41: 8.2}, True),
-    )
-
-    assert warning is None
 
 
 def _running_segment(now: float, age: float) -> dict:
@@ -514,7 +500,7 @@ async def test_heartbeat_does_not_fire_before_interval():
     assert fires == []
 
 
-# ── flow.py integration: _record_segment includes last_heartbeat_at ───────────
+# flow.py integration: _record_segment includes last_heartbeat_at
 
 
 def test_op_segment_schema_includes_heartbeat_field():

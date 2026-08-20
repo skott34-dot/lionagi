@@ -116,7 +116,8 @@
       "busyPlaceholder": "Operator is working…",
       "hint": "Enter to send · Shift+Enter for a new line",
       "send": "Send",
-      "sending": "Sending…"
+      "sending": "Sending…",
+      "autoAllow": "Автоматически разрешать предложения"
     },
     "message": {
       "you": "You",
@@ -169,7 +170,12 @@
     "model": {
       "label": "Model",
       "default": "По умолчанию",
-      "unavailable": "{model} (unavailable)"
+      "unavailable": "{model} (unavailable)",
+      "recommendedGroup": "{provider} · рекомендуется",
+      "legacyGroup": "Устаревший выбор",
+      "efforts": "Усилие: {efforts}",
+      "effortInModel": "Уровень усилия закодирован в ID модели",
+      "effortAsSetting": "Уровень усилия передаётся как настройка провайдера"
     },
     "effort": {
       "label": "Усилие",
@@ -239,7 +245,7 @@
       "createWorkflow": "Новый рабочий процесс",
       "createAgent": "Новый агент",
       "allSkill": "Навыки не найдены.",
-      "allSkillHint": "Добавьте SKILL.md в ~/.lionagi/skills/<name>/, чтобы увидеть его здесь.",
+      "allSkillHint": "Добавьте SKILL.md в ~/.lionagi/skills/NAME/, чтобы увидеть его здесь.",
       "allPlugin": "Плагины не найдены.",
       "allPluginHint": "Установите плагин в ~/.claude/plugins/, чтобы увидеть его здесь."
     },
@@ -376,6 +382,38 @@
       "creating": "Creating…",
       "create": "Create",
       "createError": "Could not create this server."
+    },
+    "filterHooks": "Хуки",
+    "hooks": {
+      "title": "Хуки",
+      "description": "Именованные переиспользуемые хуки: определяются здесь один раз и собираются для каждого агента — агент привязывает хуки из библиотеки к событиям (перед вызовом инструмента, при отправке промпта, после ответа). Одна и та же сборка работает с любым CLI провайдера.",
+      "libraryTitle": "Библиотека хуков",
+      "newHook": "Новый хук",
+      "emptyLibrary": "Хуки ещё не определены. Создайте хук, чтобы его мог собрать любой агент.",
+      "emptyLibraryHint": "Сначала определите хуки в библиотеке — привязки связывают хуки библиотеки с событиями.",
+      "operatorTitle": "Сборка Operator",
+      "operatorDescription": "Хуки, которые выполняет Operator Studio. Operator не наследует пользовательские и проектные настройки: загружаются только хуки, привязанные здесь.",
+      "enabled": "Включено",
+      "save": "Сохранить",
+      "saving": "Сохранение…",
+      "savedNotice": "Сохранено — применится со следующего хода.",
+      "cancel": "Отмена",
+      "delete": "Удалить",
+      "fieldName": "Имя",
+      "fieldDescription": "Описание",
+      "fieldCommand": "Команда",
+      "fieldTimeout": "Тайм-аут (секунды)",
+      "nameRequired": "Хуку нужно имя.",
+      "timeoutInvalid": "Тайм-аут должен быть числом.",
+      "noAttachments": "Хуки не привязаны.",
+      "attachmentHook": "Хук",
+      "attachmentOn": "на",
+      "attachmentEvent": "Событие",
+      "attachmentMatcher": "Матчер",
+      "matcherPlaceholder": "матчер (необязательно)",
+      "removeAttachment": "Убрать привязку",
+      "addAttachment": "Привязать хук",
+      "agentSectionTitle": "Хуки"
     }
   },
   "history": {
@@ -445,6 +483,8 @@
       "statMessages": "Сообщения",
       "statToolCalls": "Вызовы инструментов",
       "statErrors": "Ошибки",
+      "statTokensIn": "Входные токены",
+      "statTokensOut": "Выходные токены",
       "statTopic": "Тема",
       "statPlay": "Play",
       "statPlaybook": "Рабочий процесс",
@@ -468,6 +508,7 @@
       "statErrorsRecent": "Ошибки (последние)",
       "noBranchErrorsPartial": "В загруженных сообщениях ошибок нет.",
       "noFilesPartial": "В загруженных сообщениях операции с файлами не обнаружены.",
+      "filesUnionBounded": "Часть файловых операций не показана: этот запуск затронул больше файлов, чем собирает одно представление.",
       "olderUnavailable": "Не удалось загрузить более раннюю историю — разговор продолжился до завершения запроса.",
       "reloadConversation": "Перезагрузить разговор",
       "graphEdgeCount": "рёбер: {count}",
@@ -481,17 +522,51 @@
       "graphNodeStatusDone": "готово",
       "graphNodeStatusFailed": "ошибка",
       "graphNodeStatusSkipped": "пропущено",
+      "graphNodeStatusCancelled": "отменено",
       "graphNodeStatusEscalated": "эскалировано",
       "progressTotal": "Всего",
       "progressCompleted": "Завершено",
       "progressRunning": "Выполняется",
       "progressFailed": "Ошибка",
       "progressPending": "Ожидание",
+      "progressEscalated": "Эскалировано",
       "progressElapsed": "Прошло времени",
       "expandGraph": "Развернуть граф выполнения",
       "collapseGraph": "Свернуть граф выполнения",
       "closeExpandedGraph": "Закрыть",
-      "nodeNoBranch": "Ветка для «{node}» не найдена — этот шаг ещё не начался."
+      "nodeNoBranch": "Ветка для «{node}» не найдена — этот шаг ещё не начался.",
+      "viewGraph": "Graph",
+      "viewList": "List",
+      "viewToggleLabel": "Graph or list view",
+      "selectedNode": "Selected: {node}",
+      "controls": {
+        "pause": "Pause",
+        "pausePhasePausing": "Pausing…",
+        "pausePhasePaused": "Paused",
+        "resume": "Resume gate",
+        "steer": "Steer",
+        "steerSend": "Send",
+        "steerPlaceholder": "Message to steer the run…",
+        "confirmYes": "Confirm",
+        "confirmCancel": "Cancel",
+        "proposeFailed": "Could not propose the command.",
+        "confirmFailed": "Could not confirm the command.",
+        "confirm": {
+          "pause": "Confirm pause?",
+          "resume": "Confirm resume?",
+          "message": "Confirm sending this message?"
+        },
+        "reason": {
+          "run-terminal": "This run has ended.",
+          "agent-no-pause-seam": "An agent run has no pause seam inside a single turn — steer instead.",
+          "no-live-consumer": "This run is a mirrored or imported session, so no runner would deliver a control.",
+          "already-pause-requested": "A pause has already been requested.",
+          "not-paused": "The run is not paused.",
+          "still-pausing": "Still finishing in-flight operations.",
+          "no-executable-path": "Пока нет команды, которая бы это выполнила.",
+          "no-project-scope": "У этого запуска нет проекта, поэтому управление не может быть авторизовано."
+        }
+      }
     },
     "masterAria": "Список истории",
     "detailAria": "Сведения об элементе"
@@ -758,6 +833,9 @@
       "noRuns": "Запусков пока нет",
       "ago": " назад",
       "cancel": "Отмена",
+      "discardWarning": "Есть несохранённые изменения.",
+      "keepEditing": "Продолжить редактирование",
+      "discardChanges": "Отменить изменения",
       "save": "Сохранить изменения",
       "saving": "Сохранение…",
       "saveFailed": "Не удалось сохранить.",
@@ -796,6 +874,7 @@
       "permission": "доступ запрещён",
       "missingDependency": "отсутствует зависимость",
       "notFound": "файл не найден",
+      "unclassified": "неклассифицированная ошибка",
       "showDetails": "Показать полную ошибку",
       "hideDetails": "Скрыть полную ошибку"
     }
@@ -837,7 +916,7 @@
     "stale": {
       "error": "ошибка · {message}",
       "unreachable": "API недоступен",
-      "lastUpdated": "устарело · последнее обновление {age} с назад"
+      "lastUpdated": "последнее обновление {age} с назад"
     },
     "detail": {
       "hint": "Выберите сессию для проверки",
@@ -853,8 +932,7 @@
       "updated": "Обновлено",
       "branchesTitle": "Ветки ({count})",
       "noBranches": "Веток нет.",
-      "msgs": " сообщ.",
-      "engineRuns": "Запуски движка"
+      "msgs": " сообщ."
     },
     "split": {
       "master": "Список сессий",
@@ -1000,7 +1078,7 @@
     "stale": {
       "error": "ошибка · {message}",
       "unreachable": "API недоступен",
-      "lastUpdated": "устарело · последнее обновление {age} с назад"
+      "lastUpdated": "последнее обновление {age} с назад"
     },
     "zeroState": {
       "heading": "Начните работу",
@@ -1089,6 +1167,7 @@
     "showEarlier": "{count, plural, one {Показать # предыдущее сообщение} few {Показать # предыдущих сообщения} many {Показать # предыдущих сообщений} other {Показать # предыдущих сообщения}}",
     "noArgs": "(нет аргументов)",
     "noOutput": "(нет вывода)",
+    "outputWithheld": "не прочитано",
     "roleUser": "пользователь",
     "roleThinking": "размышление",
     "roleResponse": "ответ",

@@ -5,19 +5,32 @@
 from __future__ import annotations
 
 import logging
-import os
 import time
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 from lionagi.state.db import StateDB, state_db_known_absent
 from lionagi.state.reasons import RunReasons, SessionReasons, ShowReasons
 
 from . import admin as admin_svc
-from .admin import _artifacts_path, _ps_snapshot, process_liveness
+from .admin import (
+    _artifacts_path,
+    process_identity_is_foreign,
+    process_liveness,
+    resolve_process_liveness_probe,
+)
 from .shows import _SHOW_TERMINAL_STATUSES, _play_dirs
 from .shows import _read_json as _read_show_json
 
 _log = logging.getLogger(__name__)
+
+
+async def _resolve_liveness(session: dict, artifacts: Path | None) -> bool | None:
+    """Preserve the module's liveness seam while sharing the host-wide fallback."""
+    return await resolve_process_liveness_probe(
+        lambda snapshot: process_liveness(session, artifacts, snapshot)
+    )
+
 
 # Phantom PhantomReason → SessionReasons code (mirrors admin._PHANTOM_REASON_CODES).
 _PHANTOM_REASON_CODES: dict[str, str] = {
@@ -42,27 +55,43 @@ _REAPABLE_PLAY_STATUSES = frozenset({"running", "running_complete", "prepared", 
 # a shell script, a test runner — which has no reason to ever open a Branch.
 # The wall-clock deadline still applies to them; only this heuristic is off.
 _SESSIONLESS_ACTION_KINDS = frozenset({"command"})
+_INVOCATION_REAPER_PAGE_SIZE = 500
 
 
-def _deadline_for_kind(action_kind: str | None, global_default: int) -> int:
-    """Resolve the effective deadline: checks
-    ``LIONAGI_STUDIO_INVOCATION_DEADLINE_<KIND>_SECONDS`` first, falling back
-    to *global_default* when absent or *action_kind* is None.
-    """
-    if action_kind:
-        env_key = f"LIONAGI_STUDIO_INVOCATION_DEADLINE_{action_kind.upper()}_SECONDS"
-        raw = os.environ.get(env_key)
-        if raw is not None:
-            try:
-                return int(raw)
-            except ValueError:
-                _log.warning("Ignoring non-integer env var %s=%r", env_key, raw)
-    return global_default
+def _deadline_for_kind(action_kind: str | None, global_default: float | int) -> float:
+    """Compatibility wrapper around the shared validated deadline resolver."""
+    from lionagi.studio.config import invocation_deadline_seconds
+
+    return invocation_deadline_seconds(
+        action_kind,
+        global_default=global_default,
+    )
+
+
+async def _running_invocations_for_reaping(db: StateDB) -> AsyncIterator[dict]:
+    """Yield every running invocation through stable oldest-first keyset pages."""
+    after_started_at: float | None = None
+    after_id: str | None = None
+    while True:
+        invocations = await db.list_running_invocations_for_reaping(
+            limit=_INVOCATION_REAPER_PAGE_SIZE,
+            after_started_at=after_started_at,
+            after_id=after_id,
+        )
+        if not invocations:
+            return
+        for invocation in invocations:
+            yield invocation
+        last = invocations[-1]
+        after_started_at = last["started_at"]
+        after_id = last["id"]
+        if len(invocations) < _INVOCATION_REAPER_PAGE_SIZE:
+            return
 
 
 async def reap_stale_invocations(
     *,
-    deadline_seconds: int | None = None,
+    deadline_seconds: float | int | None = None,
     zero_session_grace_seconds: int | None = None,
 ) -> int:
     """Transition stale running invocations to ``timed_out``.
@@ -91,8 +120,7 @@ async def reap_stale_invocations(
 
     try:
         async with StateDB() as db:
-            invocations = await db.list_invocations(status="running", limit=1000)
-            for inv in invocations:
+            async for inv in _running_invocations_for_reaping(db):
                 inv_id = inv["id"]
                 started_at = inv.get("started_at") or now
                 updated_at = inv.get("updated_at") or started_at
@@ -117,7 +145,7 @@ async def reap_stale_invocations(
                     # atomic UPDATE as the status transition — a winning CAS
                     # followed by a separate update_invocation() call could
                     # leave status="timed_out" with ended_at never patched if
-                    # that second write failed (issue #2844). Preserving a
+                    # that second write failed. Preserving a
                     # pre-existing ended_at (rather than overwriting it) is
                     # still decided off this same pre-write snapshot.
                     transitioned = await db.update_status(
@@ -192,16 +220,12 @@ async def reap_stale_invocations(
 
 async def reap_null_status_sessions(*, stale_hours: float | None = None) -> int:
     """Transition null-status sessions whose process is dead to ``failed``.
-
     Sessions get ``status=NULL`` when the process crashes before writing a
-    terminal status (crash, OOM, SIGKILL).  Guard is ``status IS NULL`` so
-    already-terminal rows are never touched.  Liveness honors the recorded
-    ``node_metadata.pid`` via ``process_liveness()``; when a row is not
-    observably alive it still gets a staleness grace (mirroring
-    ``_classify_phantom``) before it is reaped, so a fresh/quiet null-status
-    session is not punished for a momentary window before it writes its own
-    status.
-    """
+    terminal status; the ``status IS NULL`` guard never touches
+    already-terminal rows. Liveness honors the recorded
+    ``node_metadata.pid`` via ``process_liveness()``, and a not-observably-
+    alive row still gets a staleness grace (mirroring ``_classify_phantom``)
+    so a fresh/quiet session isn't reaped for a momentary window."""
     from lionagi.studio.config import PHANTOM_STALE_HOURS
 
     if stale_hours is None:
@@ -221,15 +245,16 @@ async def reap_null_status_sessions(*, stale_hours: float | None = None) -> int:
                 "FROM sessions WHERE status IS NULL"
             )
 
-        ps_snapshot: str | None = None
         for row in rows:
             sid = row["id"]
             artifacts = _artifacts_path(row)
             session = {"id": sid, "node_metadata": row.get("node_metadata")}
-            if ps_snapshot is None:
-                ps_snapshot = _ps_snapshot()
-            if process_liveness(session, artifacts, ps_snapshot) is True:
+            if await _resolve_liveness(session, artifacts) is True:
                 # Process still alive — skip, it may write its own status.
+                continue
+            if process_identity_is_foreign(session):
+                # Hosted on another machine: nothing observable here says if it's alive, and
+                # the staleness grace below cannot supply that, so reaping it would guess.
                 continue
 
             updated_at = row.get("updated_at") or row.get("started_at") or 0.0
@@ -412,7 +437,6 @@ async def reap_stale_plays(*, stale_hours: float | None = None) -> int:
                 tuple(sorted(_REAPABLE_PLAY_STATUSES)),
             )
 
-        ps_snapshot: str | None = None
         for cand in candidates:
             play_id = cand["id"]
             try:
@@ -440,13 +464,12 @@ async def reap_stale_plays(*, stale_hours: float | None = None) -> int:
                             (session_id,),
                         )
                         if srow is not None:
-                            if ps_snapshot is None:
-                                ps_snapshot = _ps_snapshot()
                             session = {"id": srow["id"], "node_metadata": srow.get("node_metadata")}
-                            if (
-                                process_liveness(session, _artifacts_path(srow), ps_snapshot)
-                                is True
-                            ):
+                            if await _resolve_liveness(session, _artifacts_path(srow)) is True:
+                                continue
+                            # Child session hosted elsewhere: this machine can't tell a dead
+                            # runner from a working one, so the play stays in flight.
+                            if process_identity_is_foreign(session):
                                 continue
 
                     updated_at_raw = row.get("updated_at")
@@ -506,21 +529,16 @@ async def reap_stale_plays(*, stale_hours: float | None = None) -> int:
 
 async def reap_stale_schedule_runs(*, stale_hours: float | None = None) -> int:
     """Transition ``schedule_runs`` rows stuck at ``status="running"`` to
-    ``timed_out``.
-
-    The scheduler process can die between committing a schedule_run row and
-    its own terminal write, orphaning the row at ``running`` forever with no
-    process-liveness signal to check (unlike stale sessions/plays -- the
-    "process" here is the scheduler daemon, and its restart triggers
-    reaping). Pure wall-clock deadline against ``updated_at`` (falling back
-    to ``fired_at``), with the same optimistic-lock ``expected_updated_at``
-    guard as ``reap_stale_plays``.
-
-    Scoped to ``schedule_id IS NOT NULL``: the ad-hoc task queue
-    (``schedule_id IS NULL``) has its own lease-based recovery
+    ``timed_out``. The scheduler process can die between committing a
+    schedule_run row and its own terminal write, orphaning the row at
+    ``running`` forever with no process-liveness signal to check (the
+    "process" here is the scheduler daemon; its restart triggers reaping).
+    Pure wall-clock deadline against ``updated_at`` (falling back to
+    ``fired_at``), with the same optimistic-lock ``expected_updated_at``
+    guard as ``reap_stale_plays``. Scoped to ``schedule_id IS NOT NULL`` --
+    the ad-hoc task queue has its own lease-based recovery
     (``worker.reap_expired_leases``) and is excluded so a live-leased task
-    isn't marked ``timed_out`` here before its lease even expires.
-    """
+    isn't marked ``timed_out`` before its lease even expires."""
     from lionagi.studio.config import SCHEDULE_RUN_STALE_HOURS
 
     if stale_hours is None:
@@ -596,17 +614,14 @@ _REAPABLE_SHOW_STATUSES = frozenset({"active", "imported"})
 
 
 def _recompute_show_status_from_disk(show_dir: Path) -> tuple[str, str, str] | None:
-    """Re-derive a show's terminal status from on-disk play/verdict evidence.
-
-    Mirrors the rules ``shows.import_shows()`` applies once, at mirror-row
-    creation time: an ``_ABORT`` marker means aborted; a passing
+    """Re-derive a show's terminal status from on-disk play/verdict
+    evidence, mirroring the rules ``shows.import_shows()`` applies once at
+    mirror-row creation time: an ``_ABORT`` marker means aborted; a passing
     ``_final_verdict.json`` means completed; every child play reaching
     ``merged`` (with at least one play) also means completed. Any other
-    on-disk state is still genuinely in flight, so this returns ``None`` and
-    the caller skips the show.
-
-    Returns ``(new_status, reason_code, reason_summary)`` or ``None``.
-    """
+    on-disk state is still in flight, so this returns ``None`` and the
+    caller skips the show. Returns ``(new_status, reason_code,
+    reason_summary)`` or ``None``."""
     if (show_dir / "_ABORT").exists():
         return (
             "aborted",
@@ -636,20 +651,16 @@ def _recompute_show_status_from_disk(show_dir: Path) -> tuple[str, str, str] | N
 
 async def reap_stale_shows(*, stale_hours: float | None = None) -> int:
     """Recompute a stale non-terminal show's status from its plays' state.
-
     ``shows.py`` computes ``show_status`` only once, at mirror-row creation
-    time (``import_shows()``): a show mirrored while its plays are still
-    in flight gets ``status="active"`` and the row is never re-evaluated
-    once those plays later merge or abort on disk — there is no periodic
-    re-derivation, unlike sessions/plays/invocations/schedule_runs, which
-    all have their own reapers. This fills that gap using the exact same
+    time -- a show mirrored while its plays are still in flight gets
+    ``status="active"`` and is never re-evaluated once those plays later
+    merge or abort on disk, unlike sessions/plays/invocations/schedule_runs
+    which all have their own reapers. This fills that gap using the exact
     on-disk rules ``import_shows()`` already applies (see
-    ``_recompute_show_status_from_disk``).
-
-    Liveness-first, like ``reap_stale_plays``: a show with any child play
-    whose session process is still observably alive is never reaped,
-    regardless of the on-disk snapshot or how stale the row looks.
-    """
+    ``_recompute_show_status_from_disk``). Liveness-first, like
+    ``reap_stale_plays``: a show with any child play whose session process
+    is still observably alive is never reaped, regardless of the on-disk
+    snapshot or how stale the row looks."""
     from lionagi.studio.config import SHOW_STALE_HOURS
 
     if stale_hours is None:
@@ -670,7 +681,6 @@ async def reap_stale_shows(*, stale_hours: float | None = None) -> int:
                 tuple(sorted(_SHOW_TERMINAL_STATUSES)),
             )
 
-        ps_snapshot: str | None = None
         for cand in candidates:
             show_id = cand["id"]
             try:
@@ -705,10 +715,13 @@ async def reap_stale_shows(*, stale_hours: float | None = None) -> int:
                         )
                         if srow is None:
                             continue
-                        if ps_snapshot is None:
-                            ps_snapshot = _ps_snapshot()
                         session = {"id": srow["id"], "node_metadata": srow.get("node_metadata")}
-                        if process_liveness(session, _artifacts_path(srow), ps_snapshot) is True:
+                        if await _resolve_liveness(session, _artifacts_path(srow)) is True:
+                            live = True
+                            break
+                        # A child hosted on another machine is unmeasurable here, not dead —
+                        # treated like a live child, the only honest move when it's unseen.
+                        if process_identity_is_foreign(session):
                             live = True
                             break
                     if live:
@@ -728,7 +741,7 @@ async def reap_stale_shows(*, stale_hours: float | None = None) -> int:
                         if play_pid <= 1:
                             continue
                         session = {"id": "", "node_metadata": {"pid": play_pid}}
-                        if process_liveness(session, None, ps_snapshot) is True:
+                        if await _resolve_liveness(session, None) is True:
                             live = True
                             break
                     if live:

@@ -23,6 +23,7 @@ __all__ = (
     "NodeCompleted",
     "NodeFailed",
     "NodeSkipped",
+    "NodeCancelled",
     "NodeQueued",
     "NodeAwaitingApproval",
     "NodeEscalated",
@@ -131,6 +132,20 @@ class NodeSkipped(Signal):
     depends_on: list[str] = []
 
 
+class NodeCancelled(Signal):
+    """DAG node lifecycle: stopped before normal completion.
+
+    Cancellation is terminal, but it is neither a failure nor a skip: the node
+    may have started work before an operator or runtime stopped it.
+    """
+
+    op_id: str = ""
+    name: str = ""
+    elapsed: float = 0.0
+    parent_id: str | None = None
+    depends_on: list[str] = []
+
+
 class GateDenied(Signal):
     """Governance gate denied a proposed action."""
 
@@ -150,8 +165,11 @@ class DispatchSignal(Signal):
     body: dict = {}
 
 
-# -- Extended node lifecycle (ADR-0033): queued → running → awaiting_approval →
-# succeeded|failed|escalated. NodeStarted/Completed/Failed (above) cover running/succeeded/failed; these three cover the rest.
+# -- Extended node lifecycle (ADR-0033): queued → running →
+# {awaiting_approval, paused} → succeeded|failed|skipped|cancelled|escalated.
+# NodeStarted/Completed/Failed (above) cover running/succeeded/failed; the
+# signals below cover the rest. NodeLifecycleState is the vocabulary of record
+# and tests/protocols/test_event_schema_drift.py pins it.
 
 
 class NodeQueued(Signal):
@@ -191,7 +209,7 @@ class NodePaused(Signal):
 
 # -- Lifecycle projection (ADR-0033) ------------------------------------------
 
-#: The eight canonical per-node lifecycle states.
+#: The nine canonical per-node lifecycle states.
 NodeLifecycleState = Literal[
     "queued",
     "running",
@@ -200,13 +218,14 @@ NodeLifecycleState = Literal[
     "succeeded",
     "failed",
     "skipped",
+    "cancelled",
     "escalated",
 ]
 
 #: Terminal lanes are sticky. "skipped" belongs here because a node passed over
 #: by an edge condition is finished, not waiting -- but it is deliberately kept
 #: distinct from "failed", which means the node ran and raised.
-_TERMINAL: frozenset[str] = frozenset({"succeeded", "failed", "skipped", "escalated"})
+_TERMINAL: frozenset[str] = frozenset({"succeeded", "failed", "skipped", "cancelled", "escalated"})
 
 
 def _signal_to_state(sig: Any) -> NodeLifecycleState | None:
@@ -225,6 +244,8 @@ def _signal_to_state(sig: Any) -> NodeLifecycleState | None:
         return "failed"
     if isinstance(sig, NodeSkipped):
         return "skipped"
+    if isinstance(sig, NodeCancelled):
+        return "cancelled"
     if isinstance(sig, NodeEscalated):
         req = sig.escalation_request
         # Soft ("fyi") urgency is informational only, not terminal; only
@@ -259,22 +280,11 @@ def lane_for(signals: Iterable[Signal | Any]) -> NodeLifecycleState:
 
 
 def _extract_usage_dims(usage: dict[str, Any]) -> tuple[int, int, int, int, bool]:
-    """Split a raw provider usage dict into (input, output, cached, cache_write, is_valid) tokens.
-
-    Anthropic-style: ``input_tokens`` already excludes cache activity; cache
-    reads/writes arrive separately as ``cache_read_input_tokens`` /
-    ``cache_creation_input_tokens``. OpenAI-style: ``prompt_tokens`` INCLUDES
-    cached reads, split out under ``prompt_tokens_details.cached_tokens`` --
-    subtracted here so the returned "input" figure means "uncached prompt
-    tokens" under both conventions.
-
-    ``is_valid`` is False when the OpenAI-style provider report violates the
-    token-count invariants (a negative prompt total, or cached_tokens greater
-    than prompt_tokens). The returned numbers are still clamped into a safe,
-    non-negative shape so a caller that ignores validity still gets a sane
-    aggregate -- but a billing consumer that checks ``is_valid`` can tell a
-    genuine full-cache hit from a provider sending garbage, which the clamp
-    alone makes indistinguishable.
+    """Split a raw provider usage dict into (input, output, cached,
+    cache_write, is_valid) tokens, normalizing Anthropic- and OpenAI-style
+    shapes to "uncached prompt tokens" for input — see docs/internals/core.md
+    (session/signal.py) for the per-provider field layout and the meaning of
+    ``is_valid``.
     """
     output_tokens = int(usage.get("output_tokens", usage.get("completion_tokens", 0)) or 0)
     if "cache_read_input_tokens" in usage or "cache_creation_input_tokens" in usage:
@@ -286,11 +296,6 @@ def _extract_usage_dims(usage: dict[str, Any]) -> tuple[int, int, int, int, bool
     prompt_tokens = int(usage.get("input_tokens", usage.get("prompt_tokens", 0)) or 0)
     details = usage.get("prompt_tokens_details")
     cached = int(details.get("cached_tokens", 0) or 0) if isinstance(details, dict) else 0
-    # Provider invariants: prompt_tokens must be non-negative, and
-    # cached_tokens must not exceed it. A violation would otherwise produce a
-    # negative "uncached input" figure that reaches billing aggregates --
-    # clamp into a safe, non-negative shape instead of propagating it, but
-    # report the violation via is_valid rather than absorbing it silently.
     is_valid = prompt_tokens >= 0 and 0 <= cached <= prompt_tokens
     prompt_tokens = max(0, prompt_tokens)
     cached = max(0, min(cached, prompt_tokens))
@@ -316,21 +321,10 @@ def _as_nonneg_int(value: Any) -> int | None:
 
 
 def _sum_model_usage(model_usage: dict[str, Any]) -> tuple[int, int, int, int, bool]:
-    """Sum per-model whole-tree token counts from a claude_code CLI ``modelUsage`` map.
-
-    Unlike the flat top-level ``usage`` field (top-level-loop only), each
-    entry here already includes descendant subagent spend, so this is the
-    whole-tree figure when present.
-
-    Returns ``(input, output, cached, cache_write, has_valid_entry)``. An
-    entry only counts as valid when it is a dict carrying all four expected
-    keys with non-negative-integer values -- a genuinely zero-usage model
-    still reports the full shape, so a valid entry that happens to sum to
-    zero is distinct from no valid entry at all. If ANY entry in the map is
-    malformed (missing keys, non-dict, or a value that is not a real
-    non-negative integer), the whole map is untrustworthy and
-    ``has_valid_entry`` is False -- summing only the well-shaped entries
-    would silently undercount whatever the malformed entry actually spent.
+    """Sum per-model whole-tree token counts (including descendant subagent
+    spend) from a claude_code CLI ``modelUsage`` map. Returns ``(input,
+    output, cached, cache_write, has_valid_entry)`` — see docs/internals/core.md
+    (session/signal.py) for the entry-validity and all-or-nothing rules.
     """
     input_tokens = output_tokens = cached = cache_write = 0
     all_valid = bool(model_usage)

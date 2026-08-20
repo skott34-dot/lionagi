@@ -32,6 +32,7 @@ async def _seed_running_session(
     session_id: str,
     artifacts_path: str | None = None,
     updated_at: float | None = None,
+    status: str = "running",
 ) -> None:
     async with StateDB(db_path) as db:
         pid = str(uuid.uuid4())
@@ -41,7 +42,7 @@ async def _seed_running_session(
                 "id": session_id,
                 "progression_id": pid,
                 "name": "test-session",
-                "status": "running",
+                "status": status,
                 "started_at": time.time(),
             }
         )
@@ -105,35 +106,22 @@ def test_admin_doctor_no_db_returns_empty_health(tmp_path, monkeypatch):
 def test_db_health_reports_only_numbers_it_can_actually_measure(tmp_path, monkeypatch):
     """The payload carries no field that merely duplicates another.
 
-    ``wal_pending`` used to be returned as a second copy of ``wal_bytes``. A
-    field named for pending WAL frames invites exactly one inference, that
-    frames are waiting, and the WAL file's size cannot support it: SQLite
-    leaves a checkpointed WAL at its allocated size, so a fully checkpointed
-    store reported a large pending count forever, in the alarming direction.
+    ``wal_pending`` used to duplicate ``wal_bytes``: SQLite leaves a
+    checkpointed WAL file at its allocated size, so a fully checkpointed
+    store reported a large "pending" count forever. It was dropped rather
+    than populated correctly because the only source for a real pending
+    count is ``PRAGMA wal_checkpoint``, which performs a checkpoint rather
+    than reading one -- a health read must not become a writer against the
+    store it reports on. The test pins the whole key set, not just the
+    absence of that one name, so the next duplicate field is also caught.
 
-    It is dropped rather than populated because the only source for the number
-    is ``PRAGMA wal_checkpoint``, which does not read the pending count, it
-    performs a checkpoint. Populating the field would turn a health read into a
-    writer against the store it reports on.
-
-    Pinning the whole key set, not just the absence of that one name, is
-    deliberate: the defect was a duplicate, and the next duplicate will have a
-    different name.
-
-    ``size_alert`` and ``size_threshold_bytes`` were added later and are named
-    here on purpose. The threshold is configuration, not a measurement, and it
-    is not derivable from anything else in the payload, so without it a reader
-    cannot say whether the store is over the limit at all. ``size_alert`` is
-    arithmetically derivable once the threshold is present, which is what makes
-    it worth stating anyway: the comparison is a policy the producer owns, and a
-    reader that re-implements it can drift from the server's own predicate
-    silently, in whichever direction the mistake runs. Both come from the same
-    helper ``/api/stats`` uses, so the two surfaces agree by construction rather
-    than by two consumers happening to compute the same thing.
-
-    The rule this test enforces is unchanged: no field that merely restates
-    another. A derived field earns its place only by carrying a decision, and
-    the reason has to be written down here.
+    ``size_alert`` and ``size_threshold_bytes`` stay: the threshold is
+    configuration that cannot be derived from the rest of the payload, and
+    ``size_alert``, though arithmetically derivable once the threshold is
+    known, is kept because the comparison is a policy the producer owns --
+    a reader that re-implements it can silently drift from the server's own
+    predicate. Both come from the same helper ``/api/stats`` uses, so the
+    two surfaces agree by construction.
     """
     from lionagi.studio.services.admin import db_health
 
@@ -151,18 +139,91 @@ def test_admin_prune_selected_sessions(tmp_path, monkeypatch):
     db_path = tmp_path / "state.db"
     s1 = str(uuid.uuid4())
     s2 = str(uuid.uuid4())
-    _run(_seed_running_session(db_path, s1))
-    _run(_seed_running_session(db_path, s2))
+    _run(_seed_running_session(db_path, s1, status="completed"))
+    _run(_seed_running_session(db_path, s2, status="completed"))
     client = _make_client(tmp_path, monkeypatch, db_path)
 
     r = client.post("/api/admin/prune", json={"session_ids": [s1]})
     assert r.status_code == 200
     assert r.json()["pruned"] == 1
 
-    # Verify s1 gone, s2 remains via doctor
-    r2 = client.get("/api/admin/doctor")
-    remaining_ids = {p["session_id"] for p in r2.json()["phantom_sessions"]}
-    assert s1 not in remaining_ids
+    async def _remaining_ids() -> set[str]:
+        async with StateDB(db_path) as db:
+            rows = await db.fetch_all("SELECT id FROM sessions")
+        return {row["id"] for row in rows}
+
+    assert _run(_remaining_ids()) == {s2}
+
+
+def test_admin_prune_selected_sessions_refuses_running_rows(tmp_path, monkeypatch):
+    db_path = tmp_path / "state.db"
+    session_id = str(uuid.uuid4())
+    _run(_seed_running_session(db_path, session_id))
+    client = _make_client(tmp_path, monkeypatch, db_path)
+
+    response = client.post("/api/admin/prune", json={"session_ids": [session_id]})
+
+    assert response.status_code == 200
+    assert response.json()["pruned"] == 0
+
+    async def _read_session() -> dict | None:
+        async with StateDB(db_path) as db:
+            return await db.get_session(session_id)
+
+    assert _run(_read_session()) is not None
+
+
+def test_admin_prune_selected_terminal_session_cleans_only_its_lineage(tmp_path, monkeypatch):
+    db_path = tmp_path / "state.db"
+    session_id = str(uuid.uuid4())
+    progression_id = str(uuid.uuid4())
+    target_message_id = str(uuid.uuid4())
+    unrelated_message_id = str(uuid.uuid4())
+
+    async def _seed() -> None:
+        async with StateDB(db_path) as db:
+            for message_id in (target_message_id, unrelated_message_id):
+                await db.insert_message(
+                    {
+                        "id": message_id,
+                        "created_at": time.time(),
+                        "content": {"text": message_id},
+                        "role": "assistant",
+                    }
+                )
+            await db.create_progression(progression_id, [target_message_id])
+            await db.create_session(
+                {
+                    "id": session_id,
+                    "progression_id": progression_id,
+                    "name": "terminal-target",
+                    "status": "completed",
+                    "started_at": time.time(),
+                }
+            )
+
+    _run(_seed())
+    client = _make_client(tmp_path, monkeypatch, db_path)
+
+    response = client.post("/api/admin/prune", json={"session_ids": [session_id]})
+
+    assert response.status_code == 200
+    assert response.json()["pruned"] == 1
+
+    async def _read_rows() -> tuple[dict | None, dict | None, dict | None, dict | None]:
+        async with StateDB(db_path) as db:
+            return (
+                await db.get_session(session_id),
+                await db.fetch_one("SELECT id FROM progressions WHERE id = ?", (progression_id,)),
+                await db.get_message(target_message_id),
+                await db.get_message(unrelated_message_id),
+            )
+
+    session, progression, target_message, unrelated_message = _run(_read_rows())
+    assert session is None
+    assert progression is None
+    assert target_message is None
+    assert unrelated_message is not None
 
 
 def test_admin_prune_rejects_empty_body(tmp_path, monkeypatch):
@@ -172,7 +233,7 @@ def test_admin_prune_rejects_empty_body(tmp_path, monkeypatch):
     assert r.status_code == 422
 
 
-# ─── _classify_phantom liveness/staleness gate (khive#1793) ──────────────────
+# _classify_phantom liveness/staleness gate
 
 
 def test_fresh_running_session_missing_artifacts_not_reaped(tmp_path):
@@ -380,7 +441,7 @@ def test_stale_session_empty_but_existing_artifact_root_not_missing_artifacts(tm
     assert reason == "process_dead"
 
 
-# ─── /api/admin/health + /api/admin/transition ───────────────────────────────
+# /api/admin/health + /api/admin/transition
 
 
 def test_admin_health_reports_status_and_health_buckets(tmp_path, monkeypatch):
@@ -549,7 +610,7 @@ def test_admin_transition_rejects_healthy_session(tmp_path, monkeypatch):
     assert "healthy" in r.json()["detail"].lower()
 
 
-# ─── health guard re-evaluated per session, not pre-computed ─────────────────
+# health guard re-evaluated per session, not pre-computed
 
 
 def test_admin_transition_guard_re_evaluates_health_per_call(tmp_path, monkeypatch):
@@ -605,7 +666,7 @@ def test_admin_transition_guard_re_evaluates_health_per_call(tmp_path, monkeypat
     assert body["skipped"] == []
 
 
-# ─── reason_code in TransitionBody ───────────────────────────────────────────
+# reason_code in TransitionBody
 
 
 def test_admin_transition_with_reason_code_succeeds(tmp_path, monkeypatch):
@@ -1033,28 +1094,21 @@ def test_a_lock_scan_does_not_block_the_loop_that_serves_every_other_request(
 ):
     """The artifact walk runs off the event loop, so other requests keep moving.
 
-    This is the defect rather than a refinement of it. The walk is synchronous
-    filesystem work and the scan is a coroutine, so left inline it holds the
-    loop for the whole traversal and every other request queues behind it.
-    Measured on a running daemon before this change: a static health probe that
-    reads no session data timed out at five seconds while an admin scan was in
+    The walk is synchronous filesystem work and the scan is a coroutine, so
+    left inline it holds the loop for the whole traversal. Measured on a
+    running daemon before this fix: a static health probe that reads no
+    session data timed out at five seconds while an admin scan was in
     flight, and the scan itself ran past four minutes.
 
-    Two arms, because the passing one alone would prove nothing:
+    Two arms: the loop is never held for long while a walk is deliberately
+    blocked, and a walk really ran (otherwise a scan that reached no row at
+    all would leave the loop idle and pass the first assertion vacuously).
 
-    * the loop is never held for long while a walk is deliberately blocked, and
-    * a walk really ran. Without that, a scan that reached no row at all would
-      leave the loop idle and the first assertion would pass having measured an
-      empty population.
-
-    Every coroutine that walks is covered, rather than the one the defect was
-    first noticed in. They offload at separate call sites, so a guard on one of
-    them says nothing about the others, and an untested one is where a later
-    edit puts the walk back on the loop with everything still green.
-
-    The instrument's own sensitivity is established separately, by
-    ``test_the_tick_counter_would_have_caught_a_walk_left_on_the_loop``. A
-    counter that ticks whatever the subject does is not evidence.
+    Every coroutine that walks is covered, not just the one the defect was
+    first noticed in -- they offload at separate call sites, so a guard on
+    one says nothing about the others. The instrument's own sensitivity is
+    checked separately by
+    ``test_the_tick_counter_would_have_caught_a_walk_left_on_the_loop``.
     """
     import lionagi.state.db as state_db_mod
     import lionagi.studio.services.admin as admin_svc

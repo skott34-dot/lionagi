@@ -3,27 +3,22 @@
 
 """Event/signal schema drift gate (ADR-0033, ADR-0003).
 
-Regression class this guards against: the reactive-bus signal payloads
-(``lionagi.session.signal``), the in-process event execution status
-vocabulary (``lionagi.protocols.generic.event.EventStatus``), and the flow
-executor's own completion event (``lionagi.operations.flow.FlowEvent``)
-change shape silently -- a field gets renamed, removed, or an enum member is
-dropped -- and nothing in the suite notices until a downstream consumer (the
-Studio bus renderer, the CLI progress projector, a persisted signal replay,
-``flow_signals.py``'s ``NodeQueued(...)`` construction call) breaks on a
-``KeyError``/``AttributeError``/``ValidationError`` far away from the actual
-change.
+Guards against the reactive-bus signal payloads (``lionagi.session.signal``),
+``EventStatus`` (``lionagi.protocols.generic.event``), and the flow
+executor's ``FlowEvent`` (``lionagi.operations.flow``) changing shape
+silently -- a field renamed, removed, or an enum member dropped -- with
+nothing noticing until a downstream consumer (Studio's bus renderer, the
+CLI progress projector, a persisted signal replay, ``flow_signals.py``'s
+``NodeQueued(...)`` call) breaks far from the actual change.
 
-These tests pin the CURRENT, empirically-observed shape of every exported
-signal class, the ``EventStatus`` enum, the per-node ``NodeLifecycleState``
-vocabulary, and ``FlowEvent`` so any drift fails loudly, in this file, at the
-point of change -- and constructively instantiate every signal from its
-documented fields so a construction-site break (e.g. inside
-``lionagi/engines/flow_signals.py``) is caught here too.
+These tests pin the current, empirically-observed shape of every exported
+signal class, ``EventStatus``, ``NodeLifecycleState``, and ``FlowEvent``,
+and construct each signal from its documented fields so a construction-site
+break (e.g. inside ``lionagi/engines/flow_signals.py``) is caught here too.
 
 An intentional schema change bumps ``SIGNAL_SCHEMA_VERSION`` in
-``lionagi/session/signal.py`` and updates the golden tables below in the same
-change.
+``lionagi/session/signal.py`` and updates the golden tables below in the
+same change.
 """
 
 from __future__ import annotations
@@ -41,6 +36,7 @@ from lionagi.session.signal import (
     GateDenied,
     MessageAdded,
     NodeAwaitingApproval,
+    NodeCancelled,
     NodeCompleted,
     NodeEscalated,
     NodeFailed,
@@ -57,9 +53,7 @@ from lionagi.session.signal import (
     StructuredOutput,
 )
 
-# ---------------------------------------------------------------------------
 # 1. Signal module export surface
-# ---------------------------------------------------------------------------
 
 # The full exported name set from lionagi.session.signal (ADR-0033). Adding
 # or removing a signal type -- or renaming lane_for/build_run_end -- is a
@@ -75,6 +69,7 @@ EXPECTED_SIGNAL_EXPORTS = (
     "NodeCompleted",
     "NodeFailed",
     "NodeSkipped",
+    "NodeCancelled",
     "NodeQueued",
     "NodeAwaitingApproval",
     "NodeEscalated",
@@ -101,9 +96,7 @@ def test_signal_schema_version_golden():
     assert Signal().schema_version == 1
 
 
-# ---------------------------------------------------------------------------
 # 2. Per-class field-set goldens (sorted field-name shape)
-# ---------------------------------------------------------------------------
 
 # Sorted field-name set per pydantic Signal subclass, empirically pinned via
 # `cls.model_fields.keys()`. Inherited Element/Signal fields (id, created_at,
@@ -202,6 +195,19 @@ EXPECTED_SIGNAL_FIELDS: dict[str, tuple[str, ...]] = {
         "parent_id",
         "schema_version",
     ),
+    "NodeCancelled": (
+        "created_at",
+        "data",
+        "depends_on",
+        "elapsed",
+        "emitter_role",
+        "id",
+        "metadata",
+        "name",
+        "op_id",
+        "parent_id",
+        "schema_version",
+    ),
     "NodeQueued": (
         "created_at",
         "data",
@@ -278,6 +284,7 @@ _SIGNAL_CLASSES: dict[str, type[Signal]] = {
     "NodeCompleted": NodeCompleted,
     "NodeFailed": NodeFailed,
     "NodeSkipped": NodeSkipped,
+    "NodeCancelled": NodeCancelled,
     "NodeQueued": NodeQueued,
     "NodeAwaitingApproval": NodeAwaitingApproval,
     "NodeEscalated": NodeEscalated,
@@ -314,9 +321,7 @@ def test_signal_payload_goldens_cover_every_exported_signal_class():
     assert exported_signal_classes == set(_SIGNAL_CLASSES)
 
 
-# ---------------------------------------------------------------------------
 # 3. Constructive: every signal is instantiable from its documented fields
-# ---------------------------------------------------------------------------
 
 # Field -> representative sample value, keyed by the exact field names used
 # across the payload-contract table in the lionagi/session/signal.py module
@@ -373,9 +378,7 @@ def test_signal_constructible_from_documented_fields(name):
     assert instance.schema_version == signal_mod.SIGNAL_SCHEMA_VERSION
 
 
-# ---------------------------------------------------------------------------
 # 4. EventStatus vocabulary + transition invariants (ADR-0003)
-# ---------------------------------------------------------------------------
 
 EXPECTED_EVENT_STATUS_VALUES = (
     "pending",
@@ -458,9 +461,7 @@ def test_event_status_setter_rejects_unknown_value():
         ev.status = "not-a-real-status"
 
 
-# ---------------------------------------------------------------------------
 # 5. NodeLifecycleState vocabulary + terminal-lane invariants (ADR-0033)
-# ---------------------------------------------------------------------------
 
 EXPECTED_NODE_LIFECYCLE_STATES = (
     "queued",
@@ -470,10 +471,13 @@ EXPECTED_NODE_LIFECYCLE_STATES = (
     "succeeded",
     "failed",
     "skipped",
+    "cancelled",
     "escalated",
 )
 
-EXPECTED_NODE_LIFECYCLE_TERMINAL = frozenset({"succeeded", "failed", "skipped", "escalated"})
+EXPECTED_NODE_LIFECYCLE_TERMINAL = frozenset(
+    {"succeeded", "failed", "skipped", "cancelled", "escalated"}
+)
 
 
 def test_node_lifecycle_state_vocabulary_golden():
@@ -482,17 +486,15 @@ def test_node_lifecycle_state_vocabulary_golden():
 
 def test_node_lifecycle_terminal_lane_set_golden():
     """The sticky-terminal lane set backing lane_for()'s transition rule
-    (queued -> running -> {awaiting_approval, paused} -> one of these three,
+    (queued -> running -> {awaiting_approval, paused} -> one of these five,
     then sticky unless explicitly reset to queued/running)."""
     assert signal_mod._TERMINAL == EXPECTED_NODE_LIFECYCLE_TERMINAL
 
 
-# ---------------------------------------------------------------------------
 # 6. FlowEvent shape (lionagi/operations/flow.py)
-# ---------------------------------------------------------------------------
 
 EXPECTED_FLOW_EVENT_FIELDS = ("operation_id", "name", "status", "result", "spawned")
-EXPECTED_FLOW_EVENT_STATUS_VALUES = frozenset({"completed", "failed", "skipped"})
+EXPECTED_FLOW_EVENT_STATUS_VALUES = frozenset({"completed", "failed", "skipped", "cancelled"})
 
 
 def test_flow_event_field_set_golden():

@@ -33,7 +33,7 @@ from lionagi.state.db import StateDB
 _NUM_CONCURRENT_WORKERS = 4
 _BARRIER_TIMEOUT_SECONDS = 15
 
-# ── Legacy fixture builders ─────────────────────────────────────────────────
+# Legacy fixture builders
 
 
 def _create_legacy_session_status_db(db_path: Path) -> None:
@@ -53,14 +53,14 @@ def _create_legacy_session_status_db(db_path: Path) -> None:
         "  status          TEXT,\n"
         "  started_at      REAL,\n"
         "  ended_at        REAL,\n"
-        "  -- ── Activity"
+        "  -- 1 means ended_at"
     )
     legacy_status_col_with_check = (
         "  status          TEXT CHECK(status IN "
         "('running', 'completed', 'failed', 'aborted')),\n"
         "  started_at      REAL,\n"
         "  ended_at        REAL,\n"
-        "  -- ── Activity"
+        "  -- 1 means ended_at"
     )
     assert schema_sql.count(legacy_status_col) == 1, (
         "sessions.status column definition not found (or found more than once) in schema.sql "
@@ -98,7 +98,7 @@ def _create_legacy_invocations_status_db(db_path: Path) -> None:
         conn.executescript(legacy_sql)
 
 
-# ── Multi-process race: sessions status CHECK rebuild ───────────────────────
+# Multi-process race: sessions status CHECK rebuild
 
 
 def _open_state_db_worker_synchronized_begin(
@@ -248,7 +248,7 @@ def test_concurrent_statedb_opens_rebuild_session_status_check(tmp_path: Path) -
     assert table_names == ["sessions"], table_names
 
 
-# ── Guard-helper unit tests (table/marker-agnostic) ──────────────────────────
+# Guard-helper unit tests (table/marker-agnostic)
 
 
 async def test_rebuild_check_constraint_swallows_error_when_winner_already_rebuilt():
@@ -338,7 +338,7 @@ async def test_rebuild_check_constraint_reraises_on_non_sqlite_dialect():
         await state.close()
 
 
-# ── Raw-driver (FK-toggling) rebuild wiring: invocations ────────────────────
+# Raw-driver (FK-toggling) rebuild wiring: invocations
 
 
 async def test_drop_legacy_invocations_status_check_tolerates_concurrent_winner(tmp_path):

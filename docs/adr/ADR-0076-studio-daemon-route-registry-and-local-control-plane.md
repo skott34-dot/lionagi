@@ -224,6 +224,18 @@ Exact semantics:
   catch-up window, and polls every `5` seconds. These values are inherited operating
   defaults; the source records bounded catch-up and live tailing as the reasons, but
   no measurement selecting exactly 24 hours or 5 seconds.
+- The conventional `~/.lionagi` profile may mirror the ambient
+  `~/.claude/projects` and `~/.codex/sessions` trees by default. Any explicitly
+  selected, different `LIONAGI_HOME` is isolated: Studio starts no ambient mirror
+  unless `LIONAGI_STUDIO_MIRROR_CLAUDE_ROOT` and/or
+  `LIONAGI_STUDIO_MIRROR_CODEX_ROOT` names a source, or
+  `LIONAGI_STUDIO_MIRROR_IMPORT_AMBIENT=1` explicitly restores ambient imports.
+  A custom root wins over the corresponding ambient root, and a missing root
+  removes that provider from a `both` request rather than falling through to home.
+- Mirror startup logs describe the provider selection and window, never source
+  paths or transcript content. An unexpected task failure reports only its exception
+  class at this boundary; detailed transcript-bearing exceptions are not rendered
+  into the user-facing startup log.
 - Mirror shutdown signals its stop event and waits up to 10 seconds, then cancels the
   task. Ten seconds is a backstop inherited from the implementation; no recorded
   measurement justifies the exact value.
@@ -276,9 +288,9 @@ Exact semantics:
 - `/health` remains public. Non-API `GET` and `HEAD` requests other than schema/docs
   remain public so the SPA document and hashed assets can load.
 - `OPTIONS` passes the inner guards because valid-host preflight is answered by CORS.
-- A non-GET/HEAD/OPTIONS `/api` request with a non-empty body must declare media type
-  `application/json`; otherwise it returns HTTP 415. Bodyless mutation requests do not
-  acquire a synthetic content-type requirement.
+- Every non-GET/HEAD/OPTIONS `/api` request must declare media type
+  `application/json`; otherwise it returns HTTP 415. The rule includes bodyless action
+  routes so a cross-site simple request cannot bypass preflight by omitting its body.
 - The rule is central. Individual services cannot opt out by omitting a dependency.
 
 This is defense in depth for the shipped local daemon; it is not a claim that one static
@@ -303,12 +315,13 @@ def sse_response(generator: AsyncGenerator[str]) -> StreamingResponse:
     )
 ```
 
-All current producers emit unnamed frames of the form `data: <JSON>\n\n`, but their
-contracts are distinct:
+Most producers emit unnamed frames of the form `data: <JSON>\n\n`. Session-message data
+frames additionally carry `id: <opaque-cursor>` so authenticated fetch clients can resume;
+the endpoint contracts remain distinct:
 
 | Endpoint | Cursor/source | Poll/heartbeat | Terminal and miss semantics |
 |---|---|---|---|
-| `/api/sessions/{id}/stream` | local `after_ts`, messages after timestamp | poll 0.5s; heartbeat after 5s idle | preflight 404; `done` only after terminal status is stable more than 60s |
+| `/api/sessions/{id}/stream` | optional opaque query cursor encoding `(created_at,id)`; data frames return the next cursor in `id:` | rows limited to 500 per read and drained immediately; poll 0.5s only when caught up; heartbeat after 5s idle | preflight 404; invalid/foreign cursor 400; `done` only after the bounded backlog is drained and terminal status is stable more than 60s |
 | `/api/sessions/{id}/signals` | persisted per-session `seq`, starting at 0 | rows limited to 500 per poll; poll 0.5s; heartbeat after 5s | preflight 404; same 60s stable terminal test |
 | `/api/shows/{topic}/stream` | in-memory `(mtime,size)` map over sorted files | scan every 0.5s; no heartbeat | route preflight 404; generator emits `done` on invalid/missing directory or terminal DB status after 60s without file change |
 | `/api/leo/sessions/{id}/messages` | one in-memory turn, no replay cursor | no heartbeat/reconnect state | missing/expired session 404; concurrent turn 409; model error emits `error` then `done`; success emits effects, `text`, then `done` |
@@ -316,13 +329,15 @@ contracts are distinct:
 The 0.5-second polls, 5-second heartbeats, and 60-second stability windows are shipped
 compatibility values. Their qualitative reasons are fast local feedback, keeping idle
 connections visibly alive, and avoiding closure on a transient terminal write. The source
-contains no measurement selecting the exact numbers. The signal batch cap of 500 bounds
-each database read while allowing replay to advance over repeated polls; no recorded
-measurement selects exactly 500.
+contains no measurement selecting the exact numbers. The session-message and signal batch
+caps of 500 bound each database read while allowing replay to advance over repeated reads;
+no recorded measurement selects exactly 500.
 
 Fetch-based consumers are required when bearer auth is enabled because native
-`EventSource` cannot attach the authorization header. There is no `id:` field,
-`Last-Event-ID` handling, universal cursor, common error envelope, or central replay log.
+`EventSource` cannot attach the authorization header. The session-message stream alone
+uses an SSE `id:` field and an explicit `cursor` query parameter; there is no
+`Last-Event-ID` header handling, universal cursor, common error envelope, or central replay
+log.
 
 ## Consequences
 
@@ -347,9 +362,11 @@ Fetch-based consumers are required when bearer auth is enabled because native
 | # | Delta | Size | Issue |
 |---|---|---|---|
 | 1 | Generate and verify the mounted Studio route manifest and OpenAPI snapshot in CI; fail when an intended public service is absent or an existing method/path changes without an explicit compatibility update. | S | (filled at issue-open time) |
-| 2 | Define a shared SSE frame envelope, error frame, terminal frame, and reconnect-cursor rule for session, signal, show, and Leo streams while preserving endpoint-specific payloads. | M | (filled at issue-open time) |
+| 2 | Define a shared SSE frame envelope, error and terminal frames, a stable replay cursor (composite where timestamps can collide), bounded batch semantics, and reconnect rules for session, signal, show, and Leo streams while preserving endpoint-specific payloads; acceptance covers same-timestamp inserts, reconnect after a partial batch, explicit truncation, prompt cancellation cleanup, and shared web/VS Code behavior fixtures. | M | (filled at issue-open time) |
 | 3 | Decide whether filesystem show import is a browser-admin mutation or a CLI maintenance operation, then enforce one policy with matching authorization and confirmation behavior. | S | (filled at issue-open time) |
 | 4 | Document and test API-only, daemon-hosted SPA, Vite development, and container/reverse-proxy modes against the same host, CORS, token, and API-base rules. | S | (filled at issue-open time) |
+| 5 | Separate stream-subscription lifetime from per-poll database setup and bound per-viewer work; acceptance: idle viewers do not open a new database connection or repeat schema discovery every 500 ms, terminal checks use bounded/shared reads, disconnect closes promptly, and a repeatable benchmark records query and connection growth as viewer count rises. | M | (filled at issue-open time) |
+| 6 | Put a measured bound and observable phase/progress on startup reconciliation while preserving D3's correctness gate; acceptance: a seeded large database reaches ready within the agreed budget, only non-authoritative maintenance is deferred, and no stale execution row is exposed as healthy before reconciliation completes. | M | (filled at issue-open time) |
 
 ## Alternatives considered
 

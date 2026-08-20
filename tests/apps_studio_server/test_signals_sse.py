@@ -17,9 +17,7 @@ aiosqlite = pytest.importorskip("aiosqlite", reason="aiosqlite not installed")
 
 from lionagi.state.db import StateDB  # noqa: E402
 
-# ---------------------------------------------------------------------------
 # Helpers shared with test_sessions_detail.py conventions
-# ---------------------------------------------------------------------------
 
 
 async def _seed_session(db_path: Path, session_id: str = "sig-sess-1") -> None:
@@ -40,9 +38,7 @@ async def _seed_session(db_path: Path, session_id: str = "sig-sess-1") -> None:
         )
 
 
-# ---------------------------------------------------------------------------
 # StateDB: insert_session_signal + get_session_signals_after
-# ---------------------------------------------------------------------------
 
 
 async def test_insert_signal_returns_sequential_seq(tmp_path):
@@ -145,9 +141,7 @@ async def test_get_signals_payload_round_trips(tmp_path):
     assert row["payload"] == payload
 
 
-# ---------------------------------------------------------------------------
 # Studio service layer: signals.get_signals_after
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -220,9 +214,37 @@ async def test_service_get_signals_after_seq_filter(patched_signals_db):
     assert rows[1]["seq"] == 4
 
 
+async def test_signals_stream_starts_after_requested_resume_cursor(monkeypatch):
+    """A reconnect must not replay the session's full durable signal log."""
+    from lionagi.studio.services import sessions as sessions_svc
+    from lionagi.studio.services import signals as signals_svc
+
+    seen: list[tuple[str, int]] = []
+
+    async def _exists(_session_id: str) -> bool:
+        return True
+
+    async def _after(session_id: str, after_seq: int):
+        seen.append((session_id, after_seq))
+        return []
+
+    async def _state(_session_id: str):
+        return {"status": "completed"}
+
+    monkeypatch.setattr(sessions_svc, "session_exists", _exists)
+    monkeypatch.setattr(sessions_svc, "get_session_stream_state", _state)
+    monkeypatch.setattr(sessions_svc, "is_session_stream_done", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(signals_svc, "get_signals_after", _after)
+
+    response = await sessions_svc.stream_signals("resume-session", after_seq=41)
+    frame = await anext(response.body_iterator)
+
+    assert seen == [("resume-session", 41)]
+    assert '"type":"done"' in frame
+
+
 # ---------------------------------------------------------------------------
 # HTTP endpoint: GET /api/sessions/{id}/signals
-# ---------------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -402,11 +424,9 @@ async def test_signals_endpoint_ordering_by_seq(patched_app):
     assert [r["seq"] for r in signal_rows] == [1, 2, 3]
 
 
-# ---------------------------------------------------------------------------
 # Production bind-site integration: observer.bind_db_persistence via the
 # CLI persist layer.  These tests prove the ignition wire exists and that
 # signals flow end-to-end from emit() → session_signals table → SSE service.
-# ---------------------------------------------------------------------------
 
 
 async def test_bind_db_persistence_production_path(tmp_path):
@@ -543,10 +563,8 @@ async def test_setup_agent_persist_wires_signal_bind(tmp_path, monkeypatch):
     await teardown_persist(ctx, status="completed")
 
 
-# ---------------------------------------------------------------------------
 # MAJOR-1: Concurrent emit must not drop rows (regression for BEGIN IMMEDIATE
 # on shared connection without per-instance asyncio lock).
-# ---------------------------------------------------------------------------
 
 
 async def test_concurrent_emit_all_rows_present(tmp_path):
@@ -590,9 +608,7 @@ async def test_concurrent_emit_all_rows_present(tmp_path):
     assert seqs == list(range(1, n + 1)), f"seq gaps detected: {seqs}"
 
 
-# ---------------------------------------------------------------------------
 # MAJOR-2: Payload safety — non-serialisable objects and large payloads.
-# ---------------------------------------------------------------------------
 
 
 async def test_payload_sanitizer_node_escalated_arbitrary_request(tmp_path):
@@ -682,6 +698,65 @@ async def test_payload_sanitizer_hook_signal_non_json_kwargs(tmp_path):
     assert len(rows) == 1, "HookSignal with non-JSON kwargs was dropped"
 
 
+async def test_hook_signal_full_payload_is_preserved_through_persistence_and_sse(
+    patched_signals_db,
+):
+    pytest.importorskip("fastapi", reason="studio extra not installed")
+    from lionagi.hooks.bus import HookPoint, HookSignal
+    from lionagi.session.session import Session
+    from lionagi.studio.services.sessions import stream_signals
+
+    _svc, db_path = patched_signals_db
+    session_id = "hook-sse-contract"
+    signal = HookSignal(
+        point=HookPoint.SESSION_START,
+        kwargs={"session_id": session_id, "status": "running"},
+        created_at=1234.5,
+        metadata={"source": "profile-freeze"},
+    )
+    expected_payload = {
+        "created_at": signal.created_at,
+        "metadata": {"source": "profile-freeze"},
+        "schema_version": 1,
+        "point": HookPoint.SESSION_START.value,
+        "kwargs": {"session_id": session_id, "status": "running"},
+    }
+
+    async with StateDB(db_path) as db:
+        progression_id = f"{session_id}-prog"
+        await db.create_progression(progression_id)
+        await db.create_session(
+            {
+                "id": session_id,
+                "created_at": 100.0,
+                "progression_id": progression_id,
+                "name": "hook-sse-contract",
+                "status": "running",
+                "invocation_kind": "agent",
+            }
+        )
+        observer = Session(name="hook-sse-contract").observer
+        observer.bind_db_persistence(session_id, db=db)
+        await observer.emit(signal)
+        rows = await db.get_session_signals_after(session_id, 0)
+
+    assert len(rows) == 1
+    persisted = rows[0]
+    assert persisted["kind"] == "HookSignal"
+    assert persisted["op_id"] == ""
+    assert persisted["payload"] == expected_payload
+
+    response = await stream_signals(session_id)
+    iterator = response.body_iterator
+    try:
+        frame = await asyncio.wait_for(anext(iterator), timeout=2.0)
+        streamed = json.loads(frame.removeprefix("data: ").strip())
+    finally:
+        await iterator.aclose()
+
+    assert streamed == persisted
+
+
 async def test_payload_sanitizer_large_payload_truncated(tmp_path):
     """A payload exceeding _PAYLOAD_BYTE_CAP is stored with truncated=true marker."""
     from lionagi.session.observer import _PAYLOAD_BYTE_CAP, _sanitize_signal_payload
@@ -755,9 +830,7 @@ async def test_payload_sanitizer_message_added_stores_ref_not_body(tmp_path):
     assert "data" not in payload
 
 
-# ---------------------------------------------------------------------------
 # MINOR: Bearer auth rejection for /api/sessions/{id}/signals
-# ---------------------------------------------------------------------------
 
 
 def test_signals_endpoint_requires_bearer_auth(tmp_path, monkeypatch):
@@ -796,9 +869,7 @@ def test_signals_endpoint_requires_bearer_auth(tmp_path, monkeypatch):
     )
 
 
-# ---------------------------------------------------------------------------
 # MINOR: Generator cancellation — client disconnect stops the SSE generator.
-# ---------------------------------------------------------------------------
 
 
 async def test_signals_generator_cancellation_on_disconnect(tmp_path, monkeypatch):
@@ -860,11 +931,9 @@ async def test_signals_generator_cancellation_on_disconnect(tmp_path, monkeypatc
         pytest.fail(f"generator.aclose() raised unexpected {type(exc).__name__}: {exc}")
 
 
-# ---------------------------------------------------------------------------
 # Invariant: _write_lock must be connection-wide — concurrent signal emits
 # must not race with update_status, update_session, or insert_message on
 # the same bound StateDB connection.
-# ---------------------------------------------------------------------------
 
 
 async def test_concurrent_emit_and_update_status_no_failures(tmp_path):
@@ -1092,11 +1161,9 @@ async def test_concurrent_emit_and_artifact_verification_no_failures(tmp_path):
     assert seqs == list(range(1, n + 1)), f"seq gaps after artifact race: {seqs}"
 
 
-# ---------------------------------------------------------------------------
 # Invariant: byte cap must hold on the FINAL serialized form, including JSON
 # escaping overhead. Regression: quote/backslash-heavy payloads stored 32 KB
 # instead of the claimed 16 KB cap.
-# ---------------------------------------------------------------------------
 
 
 async def test_payload_byte_cap_final_form_plain(tmp_path):

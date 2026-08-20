@@ -8,10 +8,14 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timezone
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 import pytest
+
+from lionagi.state.db import NO_CURSOR_CLAIM
+from tests._scheduler_claims import claim_holds, fire_with_claim, persisting_update_schedule
 
 NY = ZoneInfo("America/New_York")
 
@@ -30,9 +34,7 @@ async def _cancel_after_launch(*args, on_launched=None, **kwargs):
     raise asyncio.CancelledError()
 
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 
 def _minimal_schedule(**overrides) -> dict:
@@ -79,9 +81,7 @@ def _make_svc() -> AsyncMock:
     return svc
 
 
-# ---------------------------------------------------------------------------
 # resolve_invocation_terminal tests (pure-logic, no DB)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -120,8 +120,8 @@ async def test_resolve_terminal_completed_empty_child_taints_invocation():
 @pytest.mark.asyncio
 async def test_resolve_terminal_nonterminal_child_not_trusted_as_completed():
     """A leader process exiting 0 is not evidence that a still-running child
-    session's own work finished (see #2535 -- the terminal stamp today comes
-    from the leader's stderr pipe closing, not from the work ending). A
+    session's own work finished (the terminal stamp today comes from the
+    leader's stderr pipe closing, not from the work ending). A
     child session that has not reached ANY terminal status must not be
     silently trusted via the fallback_status="completed" path -- it belongs
     on completed_empty (no positive evidence), the same bucket a
@@ -231,9 +231,7 @@ async def test_resolve_terminal_cancelled():
     assert status == "cancelled"
 
 
-# ---------------------------------------------------------------------------
 # SchedulerEngine._fire() — happy path (exit_code=0)
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -255,7 +253,7 @@ async def test_fire_happy_path_records_invocation_and_run():
             new=AsyncMock(return_value=(0, "")),
         ),
     ):
-        await engine._fire(schedule, "run-001", trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, "run-001", trigger_context={"scheduled": True})
 
     svc.create_invocation.assert_awaited_once()
     # Occurrence-insert + cursor-advance land together, atomically, through
@@ -318,7 +316,7 @@ async def test_fire_records_substituted_prompt_not_raw_template():
             new=AsyncMock(return_value=(0, "")),
         ),
     ):
-        await engine._fire(schedule, "run-002", trigger_context={"pr_number": "42"})
+        await fire_with_claim(engine, schedule, "run-002", trigger_context={"pr_number": "42"})
 
     svc.create_invocation.assert_awaited_once()
     (invocation_payload,), _kwargs = svc.create_invocation.await_args
@@ -347,7 +345,7 @@ async def test_fire_records_empty_rendered_prompt_as_is_not_playbook_fallback():
             new=AsyncMock(return_value=(0, "")),
         ),
     ):
-        await engine._fire(schedule, "run-002b", trigger_context={"payload": ""})
+        await fire_with_claim(engine, schedule, "run-002b", trigger_context={"payload": ""})
 
     svc.create_invocation.assert_awaited_once()
     (invocation_payload,), _kwargs = svc.create_invocation.await_args
@@ -372,7 +370,7 @@ async def test_fire_executable_resolution_failure_records_failed_run_with_action
         ),
         patch("lionagi.studio.scheduler.subprocess.spawn_and_wait", new=AsyncMock()) as spawn_mock,
     ):
-        await engine._fire(schedule, "run-003", trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, "run-003", trigger_context={"scheduled": True})
 
     spawn_mock.assert_not_awaited()
     svc.create_schedule_run.assert_not_awaited()
@@ -402,7 +400,7 @@ async def test_fire_nonzero_exit_records_failed_status():
             new=AsyncMock(return_value=(1, "error text")),
         ),
     ):
-        await engine._fire(schedule, "run-002", trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, "run-002", trigger_context={"scheduled": True})
 
     # Find the update_status call for "schedule_run" with new_status="failed"
     failed_calls = [
@@ -432,7 +430,7 @@ async def test_fire_build_argv_exception_records_failed_run():
             new=AsyncMock(),
         ) as mock_spawn,
     ):
-        await engine._fire(schedule, "run-003", trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, "run-003", trigger_context={"scheduled": True})
 
     mock_spawn.assert_not_awaited()
     svc.create_schedule_run.assert_not_awaited()
@@ -463,7 +461,7 @@ async def test_fire_cancellation_records_cancelled_run():
         ),
     ):
         with pytest.raises(asyncio.CancelledError):
-            await engine._fire(schedule, "run-004", trigger_context={"scheduled": True})
+            await fire_with_claim(engine, schedule, "run-004", trigger_context={"scheduled": True})
 
     # "Scheduler shutdown" is a placeholder, not a measured cause, and it used
     # to be written unguarded ahead of the guarded transition. A run already
@@ -515,7 +513,7 @@ async def test_fire_inner_exception_records_failed_and_does_not_reraise():
         ),
     ):
         # Should not raise
-        await engine._fire(schedule, "run-005", trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, "run-005", trigger_context={"scheduled": True})
 
     failed_calls = [
         c for c in svc.update_status.await_args_list if c.kwargs.get("new_status") == "failed"
@@ -543,7 +541,7 @@ async def test_fire_chain_depth_0_tracks_running():
             new=AsyncMock(return_value=(0, "")),
         ),
     ):
-        await engine._fire(schedule, "run-006", trigger_context={}, chain_depth=0)
+        await fire_with_claim(engine, schedule, "run-006", trigger_context={}, chain_depth=0)
 
     assert sid not in engine._running
 
@@ -567,8 +565,13 @@ async def test_fire_chain_depth_nonzero_does_not_track_running():
             new=AsyncMock(return_value=(0, "")),
         ),
     ):
-        await engine._fire(
-            schedule, "run-007", trigger_context={}, chain_depth=1, chain_parent_id="run-006"
+        await fire_with_claim(
+            engine,
+            schedule,
+            "run-007",
+            trigger_context={},
+            chain_depth=1,
+            chain_parent_id="run-006",
         )
 
     assert schedule["id"] not in engine._running
@@ -588,7 +591,9 @@ async def test_fire_on_success_chain_fires():
     fire_calls: list[tuple] = []
     original_fire = engine._fire
 
-    async def _patched_fire(sched, run_id, *, trigger_context, chain_parent_id=None, chain_depth=0):
+    async def _patched_fire(
+        sched, run_id, *, trigger_context, chain_parent_id=None, chain_depth=0, **kw
+    ):
         fire_calls.append((sched["id"], chain_depth))
         if chain_depth > 0:
             return
@@ -598,6 +603,7 @@ async def test_fire_on_success_chain_fires():
             trigger_context=trigger_context,
             chain_parent_id=chain_parent_id,
             chain_depth=chain_depth,
+            **kw,
         )
 
     engine._fire = _patched_fire  # type: ignore[method-assign]
@@ -612,7 +618,13 @@ async def test_fire_on_success_chain_fires():
             new=AsyncMock(return_value=(0, "")),
         ),
     ):
-        await original_fire(schedule, "run-chain", trigger_context={}, chain_depth=0)
+        await original_fire(
+            schedule,
+            "run-chain",
+            trigger_context={},
+            chain_depth=0,
+            expect_next_fire_at=schedule.get("next_fire_at"),
+        )
 
     # The chain should have been triggered
     chained = [c for c in fire_calls if c[1] == 1]
@@ -643,7 +655,9 @@ async def test_fire_running_child_with_on_success_does_not_run_success_chain():
     fire_calls: list[tuple] = []
     original_fire = engine._fire
 
-    async def _patched_fire(sched, run_id, *, trigger_context, chain_parent_id=None, chain_depth=0):
+    async def _patched_fire(
+        sched, run_id, *, trigger_context, chain_parent_id=None, chain_depth=0, **kw
+    ):
         fire_calls.append((sched["id"], chain_depth))
         if chain_depth > 0:
             return
@@ -653,6 +667,7 @@ async def test_fire_running_child_with_on_success_does_not_run_success_chain():
             trigger_context=trigger_context,
             chain_parent_id=chain_parent_id,
             chain_depth=chain_depth,
+            **kw,
         )
 
     engine._fire = _patched_fire  # type: ignore[method-assign]
@@ -667,7 +682,13 @@ async def test_fire_running_child_with_on_success_does_not_run_success_chain():
             new=AsyncMock(return_value=(0, "")),
         ),
     ):
-        await original_fire(schedule, "run-empty-success", trigger_context={}, chain_depth=0)
+        await original_fire(
+            schedule,
+            "run-empty-success",
+            trigger_context={},
+            chain_depth=0,
+            expect_next_fire_at=schedule.get("next_fire_at"),
+        )
 
     # Assertion 1: status. completed_empty must not be recorded as "completed".
     terminal_calls = [
@@ -737,7 +758,7 @@ async def test_fire_invocation_finalization_cas_miss_is_checked_and_does_not_rai
             new=AsyncMock(return_value=(0, "")),
         ),
     ):
-        await engine._fire(schedule, "run-cas", trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, "run-cas", trigger_context={"scheduled": True})
 
     svc.count_schedule_runs.assert_awaited()
 
@@ -794,7 +815,7 @@ async def test_fire_exception_during_invocation_resolution_marks_run_failed_once
             new=AsyncMock(side_effect=_resolve_invocation_terminal),
         ),
     ):
-        await engine._fire(schedule, "run-late-exc", trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, "run-late-exc", trigger_context={"scheduled": True})
 
     assert resolve_calls["n"] == 2, "the broad-except handler must retry invocation resolution"
     assert len(schedule_run_terminal_calls) == 1, (
@@ -832,7 +853,9 @@ async def test_fire_chain_runs_when_terminal_write_loses_cas():
     fire_calls: list[tuple] = []
     original_fire = engine._fire
 
-    async def _patched_fire(sched, run_id, *, trigger_context, chain_parent_id=None, chain_depth=0):
+    async def _patched_fire(
+        sched, run_id, *, trigger_context, chain_parent_id=None, chain_depth=0, **kw
+    ):
         fire_calls.append((sched["id"], chain_depth))
         if chain_depth > 0:
             return
@@ -842,6 +865,7 @@ async def test_fire_chain_runs_when_terminal_write_loses_cas():
             trigger_context=trigger_context,
             chain_parent_id=chain_parent_id,
             chain_depth=chain_depth,
+            **kw,
         )
 
     engine._fire = _patched_fire  # type: ignore[method-assign]
@@ -856,7 +880,13 @@ async def test_fire_chain_runs_when_terminal_write_loses_cas():
             new=AsyncMock(return_value=(0, "")),
         ),
     ):
-        await original_fire(schedule, "run-chain-cas", trigger_context={}, chain_depth=0)
+        await original_fire(
+            schedule,
+            "run-chain-cas",
+            trigger_context={},
+            chain_depth=0,
+            expect_next_fire_at=schedule.get("next_fire_at"),
+        )
 
     chained = [c for c in fire_calls if c[1] == 1]
     assert chained, "on_success chain must still fire when the invocation write lost its CAS"
@@ -895,7 +925,9 @@ async def test_fire_invalid_action_invocation_cas_miss_is_checked_and_does_not_r
         "lionagi.studio.scheduler.subprocess.build_argv",
         side_effect=RuntimeError("bad template"),
     ):
-        await engine._fire(schedule, "run-invalid-action", trigger_context={"scheduled": True})
+        await fire_with_claim(
+            engine, schedule, "run-invalid-action", trigger_context={"scheduled": True}
+        )
 
     svc.count_schedule_runs.assert_awaited()
 
@@ -934,7 +966,9 @@ async def test_fire_cancellation_schedule_run_cas_miss_does_not_skip_side_effect
         ),
     ):
         with pytest.raises(asyncio.CancelledError):
-            await engine._fire(schedule, "run-cancel-cas", trigger_context={"scheduled": True})
+            await fire_with_claim(
+                engine, schedule, "run-cancel-cas", trigger_context={"scheduled": True}
+            )
 
     # Invocation finalization must still be attempted despite the lost CAS
     # race on the schedule_run status write above.
@@ -945,9 +979,7 @@ async def test_fire_cancellation_schedule_run_cas_miss_does_not_skip_side_effect
     svc.count_schedule_runs.assert_awaited()
 
 
-# ---------------------------------------------------------------------------
 # Coordination telemetry: terminal-write races must not leak signal counters
-# ---------------------------------------------------------------------------
 
 
 def _lose_invocation_race(entity_type, entity_id, *, new_status, **kwargs):
@@ -985,7 +1017,9 @@ async def test_fire_normal_path_discards_counters_when_invocation_write_loses_ra
             new=AsyncMock(),
         ) as flush_mock,
     ):
-        await engine._fire(schedule, "run-race-normal", trigger_context={"scheduled": True})
+        await fire_with_claim(
+            engine, schedule, "run-race-normal", trigger_context={"scheduled": True}
+        )
 
     flush_mock.assert_not_awaited()
     assert engine._signal_bus.pop_run_counters("run-race-normal") is None
@@ -1012,7 +1046,9 @@ async def test_fire_invalid_action_discards_counters_when_invocation_write_loses
             new=AsyncMock(),
         ) as flush_mock,
     ):
-        await engine._fire(schedule, "run-race-invalid", trigger_context={"scheduled": True})
+        await fire_with_claim(
+            engine, schedule, "run-race-invalid", trigger_context={"scheduled": True}
+        )
 
     flush_mock.assert_not_awaited()
     assert engine._signal_bus.pop_run_counters("run-race-invalid") is None
@@ -1043,7 +1079,9 @@ async def test_fire_cancellation_discards_counters_when_invocation_write_loses_r
         ) as flush_mock,
     ):
         with pytest.raises(asyncio.CancelledError):
-            await engine._fire(schedule, "run-race-cancel", trigger_context={"scheduled": True})
+            await fire_with_claim(
+                engine, schedule, "run-race-cancel", trigger_context={"scheduled": True}
+            )
 
     flush_mock.assert_not_awaited()
     assert engine._signal_bus.pop_run_counters("run-race-cancel") is None
@@ -1073,7 +1111,7 @@ async def test_fire_exception_path_discards_counters_when_invocation_write_loses
             new=AsyncMock(),
         ) as flush_mock,
     ):
-        await engine._fire(schedule, "run-race-exc", trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, "run-race-exc", trigger_context={"scheduled": True})
 
     flush_mock.assert_not_awaited()
     assert engine._signal_bus.pop_run_counters("run-race-exc") is None
@@ -1103,7 +1141,9 @@ async def test_fire_telemetry_flush_failure_does_not_alter_run_outcome():
             new=AsyncMock(return_value=(0, "")),
         ),
     ):
-        await engine._fire(schedule, "run-flush-fails", trigger_context={"scheduled": True})
+        await fire_with_claim(
+            engine, schedule, "run-flush-fails", trigger_context={"scheduled": True}
+        )
 
     # Exactly the one terminal write from the normal completion path -- no
     # second rewrite from a broad-except handler catching a telemetry failure
@@ -1152,7 +1192,7 @@ async def test_fire_normal_completion_dispatches_signal_before_flush_pops_counte
             new=AsyncMock(return_value=(0, "")),
         ),
     ):
-        await engine._fire(schedule, "run-order", trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, "run-order", trigger_context={"scheduled": True})
 
     node_metadata_calls = [
         call.kwargs["node_metadata"]
@@ -1164,9 +1204,7 @@ async def test_fire_normal_completion_dispatches_signal_before_flush_pops_counte
     assert coordination["signals"]["emitted"] == {"ScheduleRunSucceeded": 1}
 
 
-# ---------------------------------------------------------------------------
 # SchedulerEngine.fire_now() — delegates through service
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -1196,9 +1234,7 @@ async def test_fire_now_returns_none_when_schedule_missing():
     assert run_id is None
 
 
-# ---------------------------------------------------------------------------
 # _maybe_fire() tests
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -1237,9 +1273,7 @@ async def test_maybe_fire_fires_when_no_overlap():
     mock_tracked.assert_called_once()
 
 
-# ---------------------------------------------------------------------------
 # create_skipped_run helper
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -1265,9 +1299,7 @@ async def test_create_skipped_run_calls_svc_create_and_update_status():
     assert call.kwargs["new_status"] == "skipped"
 
 
-# ---------------------------------------------------------------------------
 # SchedulerEngine construction — default vs injected service
-# ---------------------------------------------------------------------------
 
 
 def test_engine_uses_default_svc_when_none_provided():
@@ -1286,11 +1318,9 @@ def test_engine_uses_injected_svc():
     assert engine._svc is svc
 
 
-# ---------------------------------------------------------------------------
 # Cron timezone resolution — the P1 fix: cron_expr is resolved in the
 # configured timezone (default: system local), not UTC. next_fire_at is
 # still stored as a UTC epoch.
-# ---------------------------------------------------------------------------
 
 
 def test_compute_next_fire_uses_configured_timezone(monkeypatch):
@@ -1411,10 +1441,8 @@ def test_compute_next_fire_cron_null_resolved_timezone_uses_scheduler_tz(monkeyp
     assert got_utc == datetime(2026, 7, 2, 22, 0, 0, tzinfo=timezone.utc)
 
 
-# ---------------------------------------------------------------------------
 # 'at' trigger — fire-once semantics (no next occurrence to compute; the
 # fired row's next_fire_at must be explicitly cleared, not left in place).
-# ---------------------------------------------------------------------------
 
 
 def test_compute_next_fire_at_trigger_returns_none():
@@ -1465,7 +1493,7 @@ async def test_fire_at_trigger_persists_explicit_none_next_fire_at():
             new=AsyncMock(return_value=(0, "")),
         ),
     ):
-        await engine._fire(schedule, "run-001", trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, "run-001", trigger_context={"scheduled": True})
 
     (_run_payload,), kwargs = svc.create_schedule_run_and_advance.await_args
     schedule_fields = kwargs["schedule_fields"]
@@ -1490,13 +1518,77 @@ async def test_recover_missed_fire_run_once_reserves_cleared_next_fire_for_at_tr
         next_fire_at=time.time() - 60,
     )
 
-    fired: list[str] = []
+    due_instant = schedule["next_fire_at"]
+    fired: list[tuple[str, Any]] = []
+    engine._tracked_fire = lambda sched, run_id, **kw: fired.append(
+        (run_id, kw.get("expect_next_fire_at"))
+    )
+
+    await engine._recover_missed_fire_run_once(schedule, time.time())
+
+    # The reserve claims the instant it is recovering, and the fire that follows claims the
+    # value the reserve wrote, not the pre-reserve value still sitting in the local dict.
+    svc.update_schedule.assert_awaited_once_with(
+        "sched-001", expect_next_fire_at=due_instant, next_fire_at=None
+    )
+    assert len(fired) == 1
+    assert fired[0][1] is None
+
+
+@pytest.mark.asyncio
+async def test_missed_fire_recovery_claims_the_instant_it_reserved_not_the_one_it_read():
+    """The recovery moves the cursor itself, so it must claim the value it wrote.
+
+    Claiming the pre-reserve value the local dict still holds refuses the recovery against
+    its own reservation: no occurrence, and the invocation cancelled.
+    """
+    from lionagi.studio.scheduler.engine import SchedulerEngine
+
+    svc = _make_svc()
+    engine = SchedulerEngine(svc=svc)
+    due = time.time() - 60
+    schedule = _minimal_schedule(next_fire_at=due, missed_fire_policy="run_once")
+    # The row, kept apart from the dict the recovery holds: a real reserve does not write back
+    # into the caller's snapshot, so the snapshot stays stale exactly as it does in production.
+    stored: dict[str, Any] = {"next_fire_at": due}
+
+    async def _reserve(sid, *, expect_next_fire_at=None, **fields):
+        if stored["next_fire_at"] != expect_next_fire_at:
+            return False
+        stored.update(fields)
+        return True
+
+    svc.update_schedule = AsyncMock(side_effect=_reserve)
+
+    fired: list[Any] = []
+    engine._tracked_fire = lambda sched, run_id, **kw: fired.append(kw["expect_next_fire_at"])
+
+    await engine._recover_missed_fire_run_once(schedule, time.time())
+
+    assert len(fired) == 1
+    reserved = stored["next_fire_at"]
+    assert reserved != due, "the reserve did not move the cursor, so this proves nothing"
+    assert schedule["next_fire_at"] == due, "the snapshot must stay stale for this to mean anything"
+    assert fired[0] == reserved
+
+
+@pytest.mark.asyncio
+async def test_missed_fire_recovery_stands_down_when_another_scheduler_reserved_first():
+    """Two daemons recovering one missed instant: the reserve is the claim, so one wins."""
+    from lionagi.studio.scheduler.engine import SchedulerEngine
+
+    svc = _make_svc()
+    engine = SchedulerEngine(svc=svc)
+    schedule = _minimal_schedule(next_fire_at=time.time() - 60, missed_fire_policy="run_once")
+    # Already reserved by someone else: the row no longer holds the value this caller read.
+    svc.update_schedule = AsyncMock(return_value=False)
+
+    fired: list[Any] = []
     engine._tracked_fire = lambda sched, run_id, **kw: fired.append(run_id)
 
     await engine._recover_missed_fire_run_once(schedule, time.time())
 
-    svc.update_schedule.assert_awaited_once_with("sched-001", next_fire_at=None)
-    assert len(fired) == 1
+    assert fired == []
 
 
 @pytest.mark.asyncio
@@ -1588,11 +1680,9 @@ async def test_maybe_fire_at_trigger_already_fired_refused_by_max_runs_gate():
     svc.update_schedule.assert_awaited_once_with("sched-001", enabled=0)
 
 
-# ---------------------------------------------------------------------------
 # recompute_next_fire — shared recompute+log path for daemon start, PATCH,
 # and disable->enable (services/schedules.py hooks it too; see
 # tests/studio/test_schedule_tz_recompute.py for those integration paths).
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -1748,13 +1838,8 @@ async def test_startup_missed_fire_run_once_recovers_and_advances(monkeypatch):
     svc = _make_svc()
     svc.list_schedules = AsyncMock(return_value=[schedule])
 
-    async def _persist_update_schedule(sid, **fields):
-        # Mutate the same dict list_schedules() keeps returning, mirroring
-        # a real DB: a persisted update must be visible to the next fetch.
-        if sid == schedule["id"]:
-            schedule.update(fields)
-
-    svc.update_schedule = AsyncMock(side_effect=_persist_update_schedule)
+    # Persists into the same dict list_schedules() keeps returning, mirroring a real DB.
+    svc.update_schedule = AsyncMock(side_effect=persisting_update_schedule(schedule))
     engine = SchedulerEngine(svc=svc)
 
     original_tracked_fire = engine._tracked_fire
@@ -1833,13 +1918,8 @@ async def test_startup_missed_fire_run_once_not_double_fired_by_immediate_tick(
     svc = _make_svc()
     svc.list_schedules = AsyncMock(return_value=[schedule])
 
-    async def _persist_update_schedule(sid, **fields):
-        # Mutate the same dict list_schedules() keeps returning, mirroring
-        # a real DB: a persisted update must be visible to the next fetch.
-        if sid == schedule["id"]:
-            schedule.update(fields)
-
-    svc.update_schedule = AsyncMock(side_effect=_persist_update_schedule)
+    # Persists into the same dict list_schedules() keeps returning, mirroring a real DB.
+    svc.update_schedule = AsyncMock(side_effect=persisting_update_schedule(schedule))
     engine = SchedulerEngine(svc=svc)
 
     original_tracked_fire = engine._tracked_fire
@@ -1927,15 +2007,16 @@ async def test_startup_missed_fire_run_once_reserve_failure_skips_recovery(monke
 
     calls = {"n": 0}
 
-    async def _first_write_fails(sid, **fields):
+    _persist = persisting_update_schedule(schedule)
+
+    async def _first_write_fails(sid, **kwargs):
         # The reserve (first write) hits a transient storage failure; later
         # writes (the normal fire's own advance) succeed and persist into
         # the same dict list_schedules() keeps returning.
         calls["n"] += 1
         if calls["n"] == 1:
             raise RuntimeError("storage briefly unavailable")
-        if sid == schedule["id"]:
-            schedule.update(fields)
+        return await _persist(sid, **kwargs)
 
     svc.update_schedule = AsyncMock(side_effect=_first_write_fails)
     engine = SchedulerEngine(svc=svc)
@@ -2009,11 +2090,7 @@ async def test_startup_missed_fire_skip_records_no_recovery_and_advances(monkeyp
     svc = _make_svc()
     svc.list_schedules = AsyncMock(return_value=[schedule])
 
-    async def _persist_update_schedule(sid, **fields):
-        if sid == schedule["id"]:
-            schedule.update(fields)
-
-    svc.update_schedule = AsyncMock(side_effect=_persist_update_schedule)
+    svc.update_schedule = AsyncMock(side_effect=persisting_update_schedule(schedule))
     engine = SchedulerEngine(svc=svc)
 
     with patch.object(engine, "_tracked_fire") as mock_tracked:
@@ -2187,7 +2264,7 @@ async def test_check_missed_fires_excludes_github_poll(monkeypatch):
 async def test_tick_does_not_await_worker_pass_before_evaluating_schedules(monkeypatch, tmp_path):
     """_tick() must not await the ad-hoc task-worker pass before loading and
     evaluating due schedules -- a hung/slow worker pass would otherwise defer
-    every schedule's evaluation for the whole pass (see #2750). The worker
+    every schedule's evaluation for the whole pass. The worker
     pass here never completes; _tick() must still return promptly and fire
     the due schedule in the same cycle."""
     import lionagi.state.db as state_db_mod
@@ -2256,8 +2333,7 @@ async def test_tick_does_not_await_worker_pass_before_evaluating_schedules(monke
 @pytest.mark.asyncio
 async def test_tick_worker_pass_is_single_flight(monkeypatch, tmp_path):
     """A second _tick() must not start a second worker-pass task while the
-    first is still running -- single-flight, not an unguarded task per tick
-    (see #2750's fix-shape constraint)."""
+    first is still running -- single-flight, not an unguarded task per tick."""
     import lionagi.state.db as state_db_mod
     import lionagi.studio.scheduler.engine as engine_mod
     from lionagi.studio.scheduler.engine import SchedulerEngine
@@ -2303,9 +2379,7 @@ async def test_tick_worker_pass_is_single_flight(monkeypatch, tmp_path):
         await asyncio.wait_for(engine._worker_task, timeout=2.0)
 
 
-# ---------------------------------------------------------------------------
 # max_runs / one-shot semantics
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -2328,7 +2402,7 @@ async def test_max_runs_reached_auto_disables_schedule():
             new=AsyncMock(return_value=(0, "")),
         ),
     ):
-        await engine._fire(schedule, "run-once-1", trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, "run-once-1", trigger_context={"scheduled": True})
 
     svc.count_schedule_runs.assert_awaited_with("sched-001", chain_depth=0)
     disable_calls = [c for c in svc.update_schedule.await_args_list if c.kwargs.get("enabled") == 0]
@@ -2451,8 +2525,8 @@ async def test_fire_transfers_max_runs_claim_at_occurrence_commit():
             new=AsyncMock(side_effect=spawn),
         ),
     ):
-        await engine._fire(
-            schedule, "run-xfer", trigger_context={"scheduled": True}, max_runs_claim=claim
+        await fire_with_claim(
+            engine, schedule, "run-xfer", trigger_context={"scheduled": True}, max_runs_claim=claim
         )
 
     assert inflight_during_action == [0], (
@@ -2481,7 +2555,7 @@ async def test_max_runs_not_reached_leaves_schedule_enabled():
             new=AsyncMock(return_value=(0, "")),
         ),
     ):
-        await engine._fire(schedule, "run-once-2", trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, "run-once-2", trigger_context={"scheduled": True})
 
     disable_calls = [c for c in svc.update_schedule.await_args_list if c.kwargs.get("enabled") == 0]
     assert not disable_calls
@@ -2506,7 +2580,9 @@ async def test_max_runs_none_is_unlimited_never_checks_count():
             new=AsyncMock(return_value=(0, "")),
         ),
     ):
-        await engine._fire(schedule, "run-unlimited", trigger_context={"scheduled": True})
+        await fire_with_claim(
+            engine, schedule, "run-unlimited", trigger_context={"scheduled": True}
+        )
 
     svc.count_schedule_runs.assert_not_awaited()
     disable_calls = [c for c in svc.update_schedule.await_args_list if c.kwargs.get("enabled") == 0]
@@ -2532,7 +2608,8 @@ async def test_max_runs_chain_child_never_checked():
             new=AsyncMock(return_value=(0, "")),
         ),
     ):
-        await engine._fire(
+        await fire_with_claim(
+            engine,
             schedule,
             "run-child",
             trigger_context={"scheduled": True},
@@ -2559,16 +2636,14 @@ async def test_max_runs_build_argv_exception_still_checked():
         "lionagi.studio.scheduler.subprocess.build_argv",
         side_effect=ValueError("bad action_kind"),
     ):
-        await engine._fire(schedule, "run-badargv", trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, "run-badargv", trigger_context={"scheduled": True})
 
     svc.count_schedule_runs.assert_awaited_with("sched-001", chain_depth=0)
     disable_calls = [c for c in svc.update_schedule.await_args_list if c.kwargs.get("enabled") == 0]
     assert disable_calls
 
 
-# ---------------------------------------------------------------------------
 # max_runs enforcement BEFORE firing (pre-flight reservation), not just after
-# ---------------------------------------------------------------------------
 
 
 class _StatefulSvc:
@@ -2584,7 +2659,13 @@ class _StatefulSvc:
         self,
         existing_runs: dict[str, dict] | None = None,
         fail_create_invocation_times: int = 0,
+        schedule_row: dict | None = None,
     ):
+        # Stands for the schedule row the claims are decided against. Empty by default, which
+        # reads as a row whose cursors are NULL; a test modelling a refusal seeds it. Held by
+        # reference rather than copied, so a caller passing the schedule dict it also hands the
+        # engine sees its own writes, the way a caller re-reading the row would.
+        self.schedule_row: dict = schedule_row if schedule_row is not None else {}
         self.runs: dict[str, dict] = dict(existing_runs or {})
         self.schedule_updates: list[tuple[str, dict]] = []
         self._fail_create_invocation_times = fail_create_invocation_times
@@ -2596,8 +2677,33 @@ class _StatefulSvc:
     async def list_schedules(self, *, enabled=None):
         return []
 
-    async def update_schedule(self, schedule_id, **fields):
+    def _claims_hold(self, expect_next_fire_at, expect_github_cursor) -> bool:
+        """Decide both claims against the modelled row rather than accepting either.
+
+        Returning True regardless would let a claim-dependent test pass without the claim
+        being checked at all, which is the same as not having written the claim.
+        """
+        return claim_holds(self.schedule_row.get("next_fire_at"), expect_next_fire_at) and (
+            claim_holds(self.schedule_row.get("github_cursor"), expect_github_cursor)
+        )
+
+    async def update_schedule(
+        self,
+        schedule_id,
+        *,
+        guard_cursor_forward=False,
+        expect_next_fire_at=NO_CURSOR_CLAIM,
+        expect_github_cursor=NO_CURSOR_CLAIM,
+        **fields,
+    ):
+        # Mirrors the real signature and return type. Absorbing the claims into **fields
+        # would record them as schedule columns and return None, which the recovery path
+        # reads as a refusal, so a test reusing this fake would model a different interface.
+        if not self._claims_hold(expect_next_fire_at, expect_github_cursor):
+            return False
         self.schedule_updates.append((schedule_id, fields))
+        self.schedule_row.update(fields)
+        return True
 
     async def count_schedule_runs(
         self,
@@ -2619,9 +2725,21 @@ class _StatefulSvc:
     async def create_schedule_run(self, run):
         self.runs[run["id"]] = dict(run)
 
-    async def create_schedule_run_and_advance(self, run, *, schedule_id, schedule_fields):
+    async def create_schedule_run_and_advance(
+        self,
+        run,
+        *,
+        schedule_id,
+        schedule_fields,
+        expect_next_fire_at,
+        expect_github_cursor=NO_CURSOR_CLAIM,
+    ):
+        if not self._claims_hold(expect_next_fire_at, expect_github_cursor):
+            return False
         self.runs[run["id"]] = dict(run)
         self.schedule_updates.append((schedule_id, dict(schedule_fields)))
+        self.schedule_row.update(schedule_fields)
+        return True
 
     async def schedule_run_exists_since(self, schedule_id, since):
         return any(
@@ -2718,9 +2836,11 @@ async def test_max_runs_reservation_released_lets_next_schedule_check_run():
     count (not an over-counted stale claim)."""
     from lionagi.studio.scheduler.engine import SchedulerEngine
 
-    svc = _StatefulSvc()
-    engine = SchedulerEngine(svc)
     schedule = _minimal_schedule(id="sched-multi", max_runs=2)
+    # The fake decides the due-instant claim against this row, so it is the same object the
+    # engine is handed: a fire advances it, and the next fire claims the advanced value.
+    svc = _StatefulSvc(schedule_row=schedule)
+    engine = SchedulerEngine(svc)
 
     with (
         patch(
@@ -2769,8 +2889,8 @@ async def test_max_runs_claim_released_on_pre_run_failure_allows_retry():
     """A max_runs claim must not leak when the fire fails before a terminal
     schedule_run is ever recorded (e.g. create_invocation() raising).
 
-    Reproduces the round-2 finding: reserve the budget, let create_invocation
-    blow up once, confirm the claim is released (not stuck inflight with zero
+    Reserves the budget, lets create_invocation
+    blow up once, confirms the claim is released (not stuck inflight with zero
     terminal runs), then confirm a retry fire succeeds and the schedule
     completes exactly max_runs times total — not zero (stuck) and not more
     than max_runs (double-fired)."""
@@ -2813,22 +2933,13 @@ async def test_max_runs_claim_released_on_pre_run_failure_allows_retry():
 
 @pytest.mark.asyncio
 async def test_max_runs_reservation_snapshots_inflight_before_stale_count_read():
-    """Pins the round-3 finding: a concurrent reserve must not overshoot
-    max_runs by combining a stale persisted count with an already-released
-    in-flight claim.
-
-    Forces the exact interleaving the reviewer's reproducer exploited:
-    fire A holds a claim (in-flight, not yet terminal). Reserve B starts its
-    admission check and its count_schedule_runs() read is suspended
-    mid-flight. While B is suspended, A completes: its terminal run is
-    recorded AND its claim is released — both entirely inside B's await
-    window. B's count() then resumes and returns the count as it was
-    when the read started (stale — before A's write), simulating a real
-    DB read that began before the write landed. If _reserve_max_runs_budget
-    read `inflight` only after this await (the round-2 shape), it would see
-    inflight=0 (already released) + used=0 (stale) and incorrectly admit a
-    second top-level fire for max_runs=1. Reading `inflight` before the
-    await (the round-3 fix) must still see A's claim and refuse B."""
+    """A concurrent reserve must not overshoot max_runs by combining a stale
+    persisted count with an already-released in-flight claim. Forces fire A
+    to complete (recording its run and releasing its claim) entirely inside
+    the window where B's own count_schedule_runs() read is suspended, so B's
+    read comes back stale. See docs/internals/studio.md's
+    scheduler/engine.py section (`_reserve_max_runs_budget`) for why reading
+    `inflight` before that await is what keeps this safe."""
     from lionagi.studio.scheduler.engine import SchedulerEngine
 
     svc = _StatefulSvc()
@@ -2878,9 +2989,7 @@ async def test_max_runs_reservation_snapshots_inflight_before_stale_count_read()
     assert await real_count("sched-once", chain_depth=0) == 1
 
 
-# ---------------------------------------------------------------------------
 # _fire() — action_kind='command'
-# ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
@@ -2914,7 +3023,7 @@ async def test_fire_command_kind_skips_li_resolution():
             new=AsyncMock(return_value=(0, "")),
         ),
     ):
-        await engine._fire(schedule, "run-cmd-001", trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, "run-cmd-001", trigger_context={"scheduled": True})
 
     resolve_mock.assert_not_called()
     svc.create_schedule_run_and_advance.assert_awaited_once()
@@ -2952,7 +3061,7 @@ async def test_fire_command_kind_nonzero_exit_records_failed_status():
             new=AsyncMock(return_value=(1, "command failed")),
         ),
     ):
-        await engine._fire(schedule, "run-cmd-002", trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, "run-cmd-002", trigger_context={"scheduled": True})
 
     failed_calls = [
         c
@@ -2962,9 +3071,7 @@ async def test_fire_command_kind_nonzero_exit_records_failed_status():
     assert failed_calls, "Expected update_status('schedule_run', ..., new_status='failed')"
 
 
-# ---------------------------------------------------------------------------
 # error_detail on the broad-except handler (real StateDB)
-# ---------------------------------------------------------------------------
 
 
 class _DbSvc:
@@ -3044,7 +3151,7 @@ async def test_fire_exception_keeps_the_error_detail_a_prior_finalizer_wrote(sta
             new=AsyncMock(side_effect=_reaper_then_raise),
         ),
     ):
-        await engine._fire(schedule, run_id, trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, run_id, trigger_context={"scheduled": True})
 
     row = await state_db.get_schedule_run(run_id)
     assert row["error_detail"] == "TimeoutError: run exceeded its deadline"
@@ -3091,7 +3198,7 @@ async def test_fire_cancellation_keeps_the_error_detail_a_prior_finalizer_wrote(
         ),
     ):
         with pytest.raises(asyncio.CancelledError):
-            await engine._fire(schedule, run_id, trigger_context={"scheduled": True})
+            await fire_with_claim(engine, schedule, run_id, trigger_context={"scheduled": True})
 
     row = await state_db.get_schedule_run(run_id)
     assert row["status"] == "timed_out"
@@ -3143,7 +3250,7 @@ async def test_fire_completion_keeps_the_outcome_a_prior_finalizer_wrote(state_d
             new=AsyncMock(side_effect=_reaper_then_exit_nonzero),
         ),
     ):
-        await engine._fire(schedule, run_id, trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, run_id, trigger_context={"scheduled": True})
 
     row = await state_db.get_schedule_run(run_id)
     assert row["status"] == "timed_out"
@@ -3184,9 +3291,385 @@ async def test_fire_exception_records_the_real_exception_text_as_error_detail(st
             new=AsyncMock(side_effect=_raise_after_launch),
         ),
     ):
-        await engine._fire(schedule, run_id, trigger_context={"scheduled": True})
+        await fire_with_claim(engine, schedule, run_id, trigger_context={"scheduled": True})
 
     row = await state_db.get_schedule_run(run_id)
     assert row["status"] == "failed"
     assert row["error_detail"] == "ModuleNotFoundError: No module named 'nope'"
     assert row["ended_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_fire_deadline_records_one_timed_out_terminal_and_releases_slot(
+    state_db, monkeypatch
+):
+    """A launcher deadline is a timed-out outcome, not a generic failed exception."""
+    import lionagi.studio.config as studio_config
+    from lionagi.studio.scheduler import subprocess as subprocess_mod
+    from lionagi.studio.scheduler.engine import SchedulerEngine
+
+    monkeypatch.setattr(studio_config, "MAX_SCHEDULED_CONCURRENT", 1)
+    svc = _DbSvc(state_db)
+    engine = SchedulerEngine(svc=svc)
+    schedule = _minimal_schedule()
+    await _seed_schedule(state_db, schedule)
+    run_id = "run-deadline"
+    _, slot_claim = await engine._reserve_global_slot()
+    assert engine._global_inflight == 1
+
+    async def _deadline(*_args, on_launched=None, **_kwargs):
+        if on_launched is not None:
+            await on_launched()
+        raise subprocess_mod.SubprocessDeadlineExceededError(
+            invocation_id="inv-deadline",
+            deadline_seconds=2,
+        )
+
+    with (
+        patch(
+            "lionagi.studio.scheduler.subprocess.build_argv",
+            return_value=(["uv", "run", "li", "agent", "ping"], None),
+        ),
+        patch(
+            "lionagi.studio.scheduler.subprocess.spawn_and_wait",
+            new=AsyncMock(side_effect=_deadline),
+        ),
+    ):
+        await fire_with_claim(
+            engine,
+            schedule,
+            run_id,
+            trigger_context={"scheduled": True},
+            global_slot_claim=slot_claim,
+        )
+
+    run = await state_db.get_schedule_run(run_id)
+    invocation = await state_db.get_invocation(run["invocation_id"])
+    assert run["status"] == "timed_out"
+    assert run["status_reason_code"] == "run.timed_out.deadline"
+    assert invocation["status"] == "timed_out"
+    assert invocation["status_reason_code"] == "run.timed_out.deadline"
+    terminal_events = await state_db.fetch_all(
+        "SELECT entity_id, status FROM status_transitions "
+        "WHERE entity_id IN (?, ?) AND status = 'timed_out'",
+        (run_id, invocation["id"]),
+    )
+    assert sorted(event["entity_id"] for event in terminal_events) == sorted(
+        [run_id, invocation["id"]]
+    )
+    assert engine._global_inflight == 0
+
+
+# Tick-loop supervision
+
+
+async def _until(predicate, timeout: float = 5.0) -> None:
+    """Wait for a condition the loop reaches on its own, rather than sleeping a guess."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError("condition never held")
+
+
+async def _supervised_engine(monkeypatch, ticks: list):
+    from lionagi.studio.scheduler import engine as engine_mod
+
+    monkeypatch.setattr(engine_mod, "_TICK_INTERVAL", 0.005)
+    monkeypatch.setattr(engine_mod, "_TICK_RESTART_BACKOFF", (0.005,))
+    engine = engine_mod.SchedulerEngine(svc=_make_svc())
+
+    async def _tick():
+        ticks.append(time.monotonic())
+
+    monkeypatch.setattr(engine, "_tick", _tick)
+    monkeypatch.setattr(engine, "_backfill_action_cwd", AsyncMock())
+    monkeypatch.setattr(engine, "_stamp_effective_timezones", AsyncMock())
+    monkeypatch.setattr(engine, "_recompute_armed_cron_schedules", AsyncMock())
+    monkeypatch.setattr(engine, "_recover_undispatched_fires", AsyncMock())
+    monkeypatch.setattr(engine, "_reconcile_dispatched_orphans", AsyncMock())
+    monkeypatch.setattr(engine, "_check_missed_fires", AsyncMock())
+    return engine
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_inside_startup_recovery_does_not_cost_the_later_passes(monkeypatch):
+    """Recovery repairs durable state, so abandoning the rest of it leaves half-repairs behind."""
+    ticks: list = []
+    engine = await _supervised_engine(monkeypatch, ticks)
+    ran: list = []
+
+    async def _cancelled_pass():
+        ran.append("first")
+        raise asyncio.CancelledError
+
+    async def _second():
+        ran.append("second")
+
+    async def _third():
+        ran.append("third")
+
+    monkeypatch.setattr(engine, "_recover_undispatched_fires", _cancelled_pass)
+    monkeypatch.setattr(engine, "_reconcile_dispatched_orphans", _second)
+    monkeypatch.setattr(engine, "_check_missed_fires", _third)
+
+    await engine.start()
+    try:
+        await _until(lambda: len(ticks) >= 1)
+        assert ran == ["first", "second", "third"]
+        assert engine._tick_loop_restarts == 0
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_aimed_at_the_loop_lets_the_recovery_pass_in_flight_finish(monkeypatch):
+    """A pass interrupted after it has finalized a run has no successor to finish the job.
+
+    Every later scan selects rows that are still running, which such a row no longer is, so
+    tearing a pass in half leaves durable state nothing repairs. Absorbing the cancel and
+    moving to the next pass is not enough; the pass in flight has to complete.
+    """
+    ticks: list = []
+    engine = await _supervised_engine(monkeypatch, ticks)
+    entered = asyncio.Event()
+    ran: list = []
+
+    async def _slow_first():
+        ran.append("entered")
+        entered.set()
+        await asyncio.sleep(0.05)
+        ran.append("finished")
+
+    monkeypatch.setattr(engine, "_recover_undispatched_fires", _slow_first)
+    monkeypatch.setattr(
+        engine, "_reconcile_dispatched_orphans", AsyncMock(side_effect=lambda: ran.append("second"))
+    )
+    monkeypatch.setattr(
+        engine, "_check_missed_fires", AsyncMock(side_effect=lambda: ran.append("third"))
+    )
+
+    await engine.start()
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        engine._task.cancel()
+        await _until(lambda: len(ticks) >= 1)
+        assert "finished" in ran, f"the interrupted pass was abandoned: {ran}"
+        assert ran == ["entered", "finished", "second", "third"]
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancels_aimed_at_the_loop_still_let_the_recovery_pass_finish(monkeypatch):
+    """One absorbed cancel is not the guarantee; the pass has to survive every one of them.
+
+    Absorbing the first and then awaiting the task directly leaves the second cancel free to
+    interrupt exactly the repair the first was absorbed to protect, so this fires three.
+    """
+    ticks: list = []
+    engine = await _supervised_engine(monkeypatch, ticks)
+    entered = asyncio.Event()
+    ran: list = []
+
+    async def _slow_first():
+        ran.append("entered")
+        entered.set()
+        await asyncio.sleep(0.15)
+        ran.append("finished")
+
+    monkeypatch.setattr(engine, "_recover_undispatched_fires", _slow_first)
+    monkeypatch.setattr(
+        engine, "_reconcile_dispatched_orphans", AsyncMock(side_effect=lambda: ran.append("second"))
+    )
+    monkeypatch.setattr(
+        engine, "_check_missed_fires", AsyncMock(side_effect=lambda: ran.append("third"))
+    )
+
+    await engine.start()
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        for _ in range(3):
+            engine._task.cancel()
+            await asyncio.sleep(0)
+        await _until(lambda: len(ticks) >= 1)
+        assert "finished" in ran, f"a later cancel abandoned the pass: {ran}"
+        assert ran == ["entered", "finished", "second", "third"]
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_stop_during_recovery_does_not_wait_for_the_pass_in_flight(monkeypatch):
+    """Control: a shutdown that cannot interrupt recovery is a shutdown that hangs."""
+    ticks: list = []
+    engine = await _supervised_engine(monkeypatch, ticks)
+    entered = asyncio.Event()
+    ran: list = []
+
+    async def _very_slow_first():
+        entered.set()
+        await asyncio.sleep(30)
+        ran.append("finished")
+
+    monkeypatch.setattr(engine, "_recover_undispatched_fires", _very_slow_first)
+
+    await engine.start()
+    await asyncio.wait_for(entered.wait(), timeout=2)
+    started = time.monotonic()
+    await asyncio.wait_for(engine.stop(), timeout=5)
+    assert time.monotonic() - started < 5
+    assert ran == []
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_during_the_inter_tick_wait_neither_ends_the_loop_nor_skips_the_delay(
+    monkeypatch,
+):
+    """Absorbing a cancel and returning early let a stream of them drive the tick in a tight loop."""
+    from lionagi.studio.scheduler import engine as engine_mod
+
+    ticks: list = []
+    engine = await _supervised_engine(monkeypatch, ticks)
+    monkeypatch.setattr(engine_mod, "_TICK_INTERVAL", 0.2)
+
+    await engine.start()
+    try:
+        await _until(lambda: len(ticks) >= 1)
+        started = time.monotonic()
+        for _ in range(5):
+            engine._task.cancel()
+            await asyncio.sleep(0.01)
+        # The wait is measured against its own deadline, so five cancels cannot buy a sixth tick.
+        assert len(ticks) == 1, ticks
+        assert engine._tick_loop_restarts == 0
+        await _until(lambda: len(ticks) >= 2, timeout=2.0)
+        assert time.monotonic() - started >= 0.15
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.parametrize("death", ("returns", "raises"))
+@pytest.mark.asyncio
+async def test_a_tick_loop_that_ends_while_running_is_replaced(monkeypatch, death):
+    """The process staying up is not the scheduler staying up: any end that is not stop() restarts."""
+    ticks: list = []
+    engine = await _supervised_engine(monkeypatch, ticks)
+    calls: list = []
+
+    async def _short_lived_loop():
+        calls.append(time.monotonic())
+        if len(calls) <= 2:
+            if death == "raises":
+                raise RuntimeError("loop blew up")
+            return
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(engine, "_tick_loop", _short_lived_loop)
+    await engine.start()
+    try:
+        await _until(lambda: len(calls) >= 3)
+        assert engine._tick_loop_restarts >= 2
+        when, reason = engine._last_tick_loop_failure
+        assert when > 0
+        assert ("RuntimeError" in reason) is (death == "raises"), reason
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_an_external_cancel_is_absorbed_rather_than_ending_the_loop(monkeypatch):
+    """Only stop() stops it. A cancel from anywhere else is the failure mode, not the request."""
+    ticks: list = []
+    engine = await _supervised_engine(monkeypatch, ticks)
+    await engine.start()
+    try:
+        await _until(lambda: len(ticks) >= 1)
+        original = engine._task
+        original.cancel()
+
+        advanced = len(ticks)
+        await _until(lambda: len(ticks) > advanced + 1)
+        assert engine._task is original, "absorbed in place, so no restart was needed"
+        assert engine._tick_loop_restarts == 0
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_stray_cancel_inside_a_tick_does_not_end_the_loop(monkeypatch):
+    """A cancel escaping from something the tick awaited is not a shutdown request."""
+    ticks: list = []
+    engine = await _supervised_engine(monkeypatch, ticks)
+    raised = []
+
+    async def _tick():
+        ticks.append(time.monotonic())
+        if not raised:
+            raised.append(True)
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr(engine, "_tick", _tick)
+    await engine.start()
+    try:
+        await _until(lambda: len(ticks) >= 3)
+        assert raised, "the cancelling tick never ran, so this proves nothing"
+        assert engine._tick_loop_restarts == 0, "the loop survived in place, without a restart"
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_failing_startup_recovery_pass_does_not_cost_every_tick(monkeypatch):
+    """Startup recovery is best effort; one bad pass must not take the loop with it."""
+    ticks: list = []
+    engine = await _supervised_engine(monkeypatch, ticks)
+    monkeypatch.setattr(
+        engine, "_reconcile_dispatched_orphans", AsyncMock(side_effect=RuntimeError("db locked"))
+    )
+    await engine.start()
+    try:
+        await _until(lambda: len(ticks) >= 2)
+        engine._check_missed_fires.assert_awaited()
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_a_raising_tick_does_not_end_the_loop(monkeypatch):
+    """The pre-existing guard, pinned so the restructure cannot quietly drop it."""
+    ticks: list = []
+    engine = await _supervised_engine(monkeypatch, ticks)
+
+    async def _tick():
+        ticks.append(time.monotonic())
+        raise RuntimeError("tick blew up")
+
+    monkeypatch.setattr(engine, "_tick", _tick)
+    await engine.start()
+    try:
+        await _until(lambda: len(ticks) >= 3)
+    finally:
+        await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_stop_ends_the_loop_rather_than_restarting_it(monkeypatch):
+    """The control: supervision must not resurrect a deliberate shutdown."""
+    ticks: list = []
+    engine = await _supervised_engine(monkeypatch, ticks)
+    await engine.start()
+    try:
+        await _until(lambda: len(ticks) >= 1)
+        await engine.stop()
+
+        assert engine._task is None
+        settled = len(ticks)
+        await asyncio.sleep(0.05)
+        assert len(ticks) == settled
+        assert engine._tick_loop_restarts == 0
+    finally:
+        # stop() is idempotent, so this only matters when an assertion above never reached it:
+        # a live loop outliving its test runs during every later one.
+        await engine.stop()

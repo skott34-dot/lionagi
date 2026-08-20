@@ -50,6 +50,25 @@ vi.mock("@/components/canvas/WorkerCanvas", () => ({
   ),
 }));
 
+// The control section renders only while some verb has a backing command.
+// Every wrapper below delegates to the real implementation, so a test says
+// nothing by accident; the control tests opt in to a backed registry, because
+// the shown-and-disabled contract they assert is what exists once a command
+// type lands, not what exists today. The run-swap test additionally overrides
+// applyExecutablePath and the two dispatch calls, because the state it is
+// about — a pause the user actually accepted — cannot be reached at all while
+// every verb is refused before it is offered.
+vi.mock("@/lib/runControls", async () => {
+  const actual = await vi.importActual<typeof import("@/lib/runControls")>("@/lib/runControls");
+  return {
+    ...actual,
+    hasAnyExecutablePath: vi.fn(actual.hasAnyExecutablePath),
+    applyExecutablePath: vi.fn(actual.applyExecutablePath),
+    proposeRunControl: vi.fn(actual.proposeRunControl),
+    confirmRunControl: vi.fn(actual.confirmRunControl),
+  };
+});
+
 const HISTORY_DIR = path.resolve(__dirname);
 const mountedCards: Array<{ container: HTMLDivElement; root: Root }> = [];
 
@@ -111,7 +130,7 @@ describe("history/ — no Drawer overlay import (master-detail doctrine §4)", (
   }
 });
 
-// ─── SSE done-refetch stale-write race guard (MAJ-3) ─────────────────────────
+// ─── SSE done-refetch stale-write race guard ────────────────────────────────
 // The 'done' handler refetches status/reason fields after streamSession
 // reports completion. Without a same-session guard, navigating A→B before
 // A's refetch resolves lets A's data clobber B's freshly-fetched state.
@@ -142,11 +161,49 @@ describe("history/RunDetail.tsx — fullPage prop removed", () => {
   });
 });
 
+describe("history/RunDetail.tsx — bounded incremental signal projection", () => {
+  const src = fs.readFileSync(path.join(HISTORY_DIR, "RunDetail.tsx"), "utf-8");
+
+  it("feeds the stream into SignalProjection instead of an ever-growing React array", () => {
+    expect(src).toMatch(/const projection = new SignalProjection\(\)/);
+    expect(src).toMatch(/projection\.append\(sig\)/);
+    expect(src).not.toMatch(/setSignalEvents/);
+    expect(src).not.toMatch(/prev\.some\(\(e\) => e\.id === sig\.id\)/);
+  });
+});
+
 describe("fleet/SessionDetail.tsx — renders RunDetail without fullPage", () => {
+  const sessionDetailSrc = fs.readFileSync(
+    path.resolve(HISTORY_DIR, "../fleet/SessionDetail.tsx"),
+    "utf-8",
+  );
+
   it("passes only id to RunDetail", () => {
-    const src = fs.readFileSync(path.resolve(HISTORY_DIR, "../fleet/SessionDetail.tsx"), "utf-8");
-    expect(src).toMatch(/<RunDetail id={runId} \/>/);
-    expect(src).not.toMatch(/fullPage/);
+    expect(sessionDetailSrc).toMatch(/<RunDetail id={runId} \/>/);
+    expect(sessionDetailSrc).not.toMatch(/fullPage/);
+  });
+
+  it("does not link away to Engine runs from the run-detail header", () => {
+    expect(sessionDetailSrc).not.toMatch(/to="\/engine-runs"/);
+    expect(sessionDetailSrc).not.toMatch(/detail\.engineRuns/);
+  });
+
+  it("keeps Engine runs reachable from the System view", () => {
+    const systemSrc = fs.readFileSync(
+      path.resolve(HISTORY_DIR, "../../routes/system.tsx"),
+      "utf-8",
+    );
+    expect(systemSrc).toMatch(/to="\/engine-runs"/);
+  });
+
+  it("leaves no run-detail-only Engine runs translation behind in any locale", () => {
+    const messagesDir = path.resolve(HISTORY_DIR, "../../messages");
+    for (const filename of fs.readdirSync(messagesDir).filter((name) => name.endsWith(".json"))) {
+      const messages = JSON.parse(fs.readFileSync(path.join(messagesDir, filename), "utf-8")) as {
+        fleet?: { detail?: Record<string, unknown> };
+      };
+      expect(messages.fleet?.detail, filename).not.toHaveProperty("engineRuns");
+    }
   });
 });
 
@@ -529,11 +586,25 @@ describe("history/RunDetail.tsx — shouldRenderAuthoredGraph", () => {
     expect(shouldRenderAuthoredGraph(authoredMissingEdges, opGraphWithEdges)).toBe(false);
   });
 
-  it("a single-node authored graph is never considered edgeless (nothing to draw an edge between)", async () => {
+  // This assertion is inverted from what it first said, on purpose. It read
+  // "a single-node authored graph is never considered edgeless, because there
+  // is nothing to draw an edge between" — which is true of that snapshot on
+  // its own, and the wrong rule for deciding which source to draw from. Held
+  // as authoritative, a one-node snapshot sitting beside a runtime graph that
+  // does have an edge meant the real DAG was never rendered at all.
+  it("a single-node authored graph yields to a runtime graph that has edges", async () => {
     const { shouldRenderAuthoredGraph } = await import("./RunDetail");
     const singleNode = { nodes: [{ id: "a" }], edges: [] };
     const opGraphWithEdges = { edges: [{ source: "op-a", target: "op-b" }] };
-    expect(shouldRenderAuthoredGraph(singleNode, opGraphWithEdges)).toBe(true);
+    expect(shouldRenderAuthoredGraph(singleNode, opGraphWithEdges)).toBe(false);
+  });
+
+  // The other arm, which the inversion must not cost: with nothing to fall
+  // through to, the authored snapshot is still what renders.
+  it("a single-node authored graph still renders when the runtime graph has no edges either", async () => {
+    const { shouldRenderAuthoredGraph } = await import("./RunDetail");
+    const singleNode = { nodes: [{ id: "a" }], edges: [] };
+    expect(shouldRenderAuthoredGraph(singleNode, { edges: [] })).toBe(true);
   });
 
   it("null graph never renders as the authored DAG", async () => {
@@ -551,6 +622,17 @@ describe("history/RunDetail.tsx — shouldRenderAuthoredGraph", () => {
     // resolveGraphEdges handles both concerns: null/undefined edges become []
     // and planner step-number refs are mapped onto node ids.
     expect(src).toMatch(/edges:\s*resolveGraphEdges\(graph\.nodes,\s*graph\.edges\)/);
+  });
+
+  // The progress counters are sentence-case labels ("Total", "Completed"); the
+  // graphNodeStatus* vocabulary is lowercase because it renders inside a node
+  // card ("done", "running"). The escalated counter borrowed the node-status
+  // key, so it rendered as the only lowercase label in the strip. Assert on the
+  // source because the counters carry no other behaviour to observe.
+  it("the escalated counter uses the progress label vocabulary, not the node-status one", () => {
+    const src = fs.readFileSync(path.join(HISTORY_DIR, "RunDetail.tsx"), "utf-8");
+    expect(src).toMatch(/\{t\("progressEscalated"\)\}\s*\{counts\.escalated\}/);
+    expect(src).not.toMatch(/\{t\("graphNodeStatusEscalated"\)\}\s*\{counts\.escalated\}/);
   });
 
   it("omitted edges + no runtime edges renders the authored graph, and normalized edges survive a WorkerCanvas-style map", async () => {
@@ -587,6 +669,23 @@ describe("history/RunDetail.tsx — runFiles seeds from session.message_stats.fi
     const end = src.indexOf(";", src.indexOf("}, [", start));
     const block = src.slice(start, end);
     expect(block).toMatch(/\[steps, session\]/);
+  });
+
+  // A file union the server cut cannot answer "not a file of this run". The
+  // flag reaches the note already; it has to reach resolution too, at every
+  // site, since one unflagged card renders omitted paths as ordinary prose.
+  it("hands every step card the boundedness of the union it hands it", () => {
+    const blocks = src.split("<RunStepCard").slice(1);
+    expect(blocks.length).toBeGreaterThan(1);
+    for (const block of blocks) {
+      const props = block.slice(0, block.indexOf("/>"));
+      if (!/runFiles=/.test(props)) continue;
+      expect(props).toMatch(/runFilesBounded=/);
+    }
+  });
+
+  it("sources that boundedness from the server flag, not from a local guess", () => {
+    expect(src).toMatch(/runFilesBounded=\{session\.message_stats\?\.files_bounded\}/);
   });
 });
 
@@ -656,6 +755,38 @@ describe("history/RunDetail.tsx — persisted branch totals survive message pagi
 
     expect(runStep.result?.duration_sec).toBe(600);
     expect(runStep.result?.message_count).toBe(30_525);
+  });
+
+  it("uses branch lifecycle bounds when a cancelled branch has only one message", async () => {
+    const { branchToRunStep } = await import("./RunDetail");
+    const runStep = branchToRunStep(
+      {
+        id: "branch-cancelled",
+        name: "architect",
+        created_at: 100,
+        started_at: null,
+        ended_at: 178.1,
+        first_message_at: 101,
+        last_message_at: 101,
+        message_total: 1,
+        messages: [
+          {
+            id: "prompt-only",
+            role: "user",
+            content: { instruction: "Investigate" },
+            sender: "user",
+            timestamp: 101,
+            lion_class: "Instruction",
+          },
+        ],
+      },
+      "cancelled",
+    );
+
+    expect(runStep.result?.duration_sec).toBe(78);
+    const { container } = renderRunStepCards([runStep]);
+    expect(container.textContent).toContain("1m 18s");
+    expect(container.textContent).not.toContain("0s");
   });
 });
 
@@ -916,15 +1047,206 @@ describe("history/RunDetail.tsx — overview aggregates are lifetime totals", ()
         },
         { toolCallCount: 2, errorCount: 1 },
       ),
-    ).toEqual({ toolCallCount: 21_741, errorCount: 42 });
+    ).toEqual({ toolCallCount: 21_741, errorCount: 42, countsAreFloors: false });
   });
 
-  it("does not select recent-qualified labels for partial message windows", () => {
-    const src = fs.readFileSync(path.join(HISTORY_DIR, "RunDetail.tsx"), "utf-8");
-    const start = src.indexOf("function OverviewSection");
-    const end = src.indexOf("// ── Branches section", start);
-    const overview = src.slice(start, end);
-    expect(overview).not.toMatch(/statToolCallsRecent|statErrorsRecent/);
+  it("reports the counts as floors when the server says its pass was bounded", async () => {
+    const { resolveOverviewCounts } = await import("./RunDetail");
+    expect(
+      resolveOverviewCounts(
+        {
+          message_count: 30_525,
+          roles: {},
+          tool_call_count: 21_741,
+          error_count: 42,
+          files: [],
+          bounded: true,
+        },
+        { toolCallCount: 2, errorCount: 1 },
+      ),
+    ).toEqual({ toolCallCount: 21_741, errorCount: 42, countsAreFloors: true });
+  });
+
+  async function mountOverview(messageStats: Record<string, unknown>) {
+    const [{ getSession }, { default: RunDetail }] = await Promise.all([
+      import("@/lib/api"),
+      import("./RunDetail"),
+    ]);
+    vi.mocked(getSession).mockResolvedValue({
+      id: "run-overview-labels",
+      name: "run-overview-labels",
+      created_at: 0,
+      updated_at: 0,
+      status: "completed",
+      branches: [],
+      message_stats: messageStats,
+    } as never);
+
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+      root.render(
+        <IntlProvider locale="en" messages={enMessages}>
+          <RunDetail id="run-overview-labels" />
+        </IntlProvider>,
+      );
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    return {
+      container,
+      unmount: () => {
+        act(() => root.unmount());
+        container.remove();
+      },
+    };
+  }
+
+  const FULL_STATS = {
+    message_count: 30_525,
+    roles: {},
+    tool_call_count: 21_741,
+    error_count: 0,
+    files: [],
+  };
+
+  it("labels the count tiles as totals when the server read the whole surface", async () => {
+    const { container, unmount } = await mountOverview(FULL_STATS);
+    try {
+      // Control for the assertion below: the unqualified labels have to be
+      // reachable, or finding the qualified ones proves nothing.
+      expect(container.textContent).toContain("Tool calls");
+      expect(container.textContent).not.toContain("Tool calls (recent)");
+      expect(container.textContent).not.toContain("Errors (recent)");
+    } finally {
+      unmount();
+    }
+  });
+
+  it("qualifies the count tiles as recent when the server's pass was bounded", async () => {
+    const { container, unmount } = await mountOverview({ ...FULL_STATS, bounded: true });
+    try {
+      // The counts came from the newest slice of a long session's action rows,
+      // so they are floors. Under the plain label a floor reads as a total,
+      // and a zero error count reads as a clean run.
+      expect(container.textContent).toContain("Tool calls (recent)");
+      expect(container.textContent).toContain("Errors (recent)");
+    } finally {
+      unmount();
+    }
+  });
+});
+
+// ─── Files section: a cut union says so ───────────────────────────────────────
+// The server stops the run-wide file union at a ceiling and reports that it
+// did. A cut union reaches this section in two shapes -- a short list and an
+// empty one -- and both of them read as a complete answer unless the note is
+// rendered, so each shape gets its own arm and its own control.
+
+describe("history/RunDetail.tsx — the files section discloses a cut union", () => {
+  async function mountFiles(messageStats: Record<string, unknown>) {
+    const [{ getSession }, { default: RunDetail }] = await Promise.all([
+      import("@/lib/api"),
+      import("./RunDetail"),
+    ]);
+    vi.mocked(getSession).mockResolvedValue({
+      id: "run-files-note",
+      name: "run-files-note",
+      created_at: 0,
+      updated_at: 0,
+      status: "completed",
+      branches: [],
+      message_stats: messageStats,
+    } as never);
+
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+      root.render(
+        <IntlProvider locale="en" messages={enMessages}>
+          <RunDetail id="run-files-note" />
+        </IntlProvider>,
+      );
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    return {
+      container,
+      unmount: () => {
+        act(() => root.unmount());
+        container.remove();
+      },
+    };
+  }
+
+  const CUT_NOTE = "this run touched more files than one view collects";
+  const STATS = {
+    message_count: 4,
+    roles: {},
+    tool_call_count: 4,
+    error_count: 0,
+  };
+
+  it("says the list is short when the union was cut with names in it", async () => {
+    const { container, unmount } = await mountFiles({
+      ...STATS,
+      files: ["/run/a.py", "/run/b.py"],
+      files_bounded: true,
+    });
+    try {
+      expect(container.textContent).toContain("/run/b.py");
+      expect(container.textContent).toContain(CUT_NOTE);
+    } finally {
+      unmount();
+    }
+  });
+
+  it("leaves the same list unqualified when the union was complete", async () => {
+    const { container, unmount } = await mountFiles({
+      ...STATS,
+      files: ["/run/a.py", "/run/b.py"],
+      files_bounded: false,
+    });
+    try {
+      expect(container.textContent).toContain("/run/b.py");
+      expect(container.textContent).not.toContain(CUT_NOTE);
+    } finally {
+      unmount();
+    }
+  });
+
+  it("says the same about an empty list, where a complete answer means no files", async () => {
+    const { container, unmount } = await mountFiles({
+      ...STATS,
+      files: [],
+      files_bounded: true,
+    });
+    try {
+      expect(container.textContent).toContain("No file operations detected");
+      expect(container.textContent).toContain(CUT_NOTE);
+    } finally {
+      unmount();
+    }
+  });
+
+  it("leaves an empty list unqualified when the union was complete", async () => {
+    const { container, unmount } = await mountFiles({
+      ...STATS,
+      files: [],
+      files_bounded: false,
+    });
+    try {
+      expect(container.textContent).toContain("No file operations detected");
+      expect(container.textContent).not.toContain(CUT_NOTE);
+    } finally {
+      unmount();
+    }
   });
 });
 
@@ -969,6 +1291,25 @@ describe("history/RunDetail.tsx — badgeForEvent escalation presentation", () =
     expect(failed.label).toBe("failed");
     expect(failed.tone).toMatch(/error/);
     expect(failed.tone).not.toMatch(/warning/);
+  });
+});
+
+describe("history/RunDetail.tsx — cancellation presentation", () => {
+  it("labels NodeCancelled explicitly without the failure tone", async () => {
+    const { badgeForEvent } = await import("./RunDetail");
+    const badge = badgeForEvent({
+      id: "cancel-1",
+      session_id: "session-1",
+      seq: 2,
+      kind: "NodeCancelled",
+      op_id: "op-1",
+      ts: 2,
+      payload: { name: "work" },
+    });
+
+    expect(badge.label).toBe("cancelled");
+    expect(badge.tone).toContain("status-warning");
+    expect(badge.tone).not.toContain("status-error");
   });
 });
 
@@ -1019,7 +1360,7 @@ describe("history/RunDetail.tsx — operation lane escalation presentation", () 
   });
 });
 
-// ─── visibleEventPayloadEntries / summarizeHookEvent — #2862 ─────────────────
+// ─── visibleEventPayloadEntries / summarizeHookEvent ───────────────────────
 // Element/Signal attach created_at/metadata/schema_version to every signal
 // row; the events panel must not dump them into the one-line summary, and a
 // HookSignal row must read as a human summary, not a struct.
@@ -1142,7 +1483,7 @@ describe("history/RunDetail.tsx — summarizeHookEvent", () => {
   });
 });
 
-// ─── deriveGateOutcome — #2863 ────────────────────────────────────────────────
+// ─── deriveGateOutcome ───────────────────────────────────────────────────────
 // A gate/review step's structured verdict is a different population from
 // runtime tool errors; deriveGateOutcome scans the signal stream for it so
 // the page can surface "Gate: approve-with-fixes · 1 major, 5 minor" beside
@@ -1747,9 +2088,14 @@ describe("history/RunDetail.tsx — computeReconciledNodeStatuses / computeProgr
 describe("history/RunDetail.tsx — execution-graph expand/close wiring", () => {
   const src = fs.readFileSync(path.join(HISTORY_DIR, "RunDetail.tsx"), "utf-8");
 
-  it("Escape closes the expanded graph overlay", () => {
-    expect(src).toMatch(/event\.key === "Escape"/);
-    expect(src).toMatch(/setGraphExpanded\(false\)/);
+  // Escape behaviour itself is covered in useOverlayFocus.test.tsx; this asserts the wiring,
+  // since a window-level listener here would fire even while a higher surface owns the keyboard.
+  it("the expanded graph registers on the overlay stack rather than listening on window", () => {
+    expect(src).toMatch(
+      /useOverlayFocus\(\{ description: "ExpandedGraph", dialogRef, onEscape: onClose \}\)/,
+    );
+    expect(src).toMatch(/onClose={\(\) => setGraphExpanded\(false\)}/);
+    expect(src).not.toMatch(/window\.addEventListener\("keydown"/);
   });
 
   it("an explicit close button also closes the overlay", () => {
@@ -1772,7 +2118,7 @@ describe("history/RunDetail.tsx — execution-graph expand/close wiring", () => 
   });
 
   it("the progress summary bar renders from the same progressCounts used by both graph embeds", () => {
-    const occurrences = src.match(/<ProgressSummaryBar counts={progressCounts}/g) ?? [];
+    const occurrences = src.match(/<ProgressSummaryBar[^>]*counts={progressCounts}/g) ?? [];
     expect(occurrences.length).toBe(2);
   });
 });
@@ -1930,5 +2276,1467 @@ describe("history/RunDetail.tsx — the dag panel height policy is floor/grow-on
     const grown = reduce({ id: "run-1", height: DAG_MIN_HEIGHT }, "run-1", 420);
     const nextRun = reduce(grown, "run-2", 150);
     expect(nextRun.height).toBe(DAG_MIN_HEIGHT);
+  });
+});
+
+// ─── ADR-0113 rows 3 & 5: graph/list view — pure resolution logic ──────────
+
+describe("history/RunDetail.tsx — hasResolvableGraph (row 3: what counts as a real canvas)", () => {
+  const node = (id: string) => ({
+    id,
+    label: id,
+    role: "",
+    assignment: "",
+    prompt: "",
+    capacity: 1,
+    timeout: null,
+    inputs: [],
+    outputs: [],
+  });
+
+  it("a graph with edges is resolvable", async () => {
+    const { hasResolvableGraph } = await import("./RunDetail");
+    const graph = {
+      nodes: [node("A"), node("B")],
+      edges: [{ id: "e1", source: "A", target: "B", mode: "simple" as const }],
+    };
+    expect(hasResolvableGraph(graph, { nodes: [], edges: [] })).toBe(true);
+  });
+
+  it("a single node with no edges is NOT resolvable — a canvas with one node and no edges is not a canvas", async () => {
+    const { hasResolvableGraph } = await import("./RunDetail");
+    const graph = { nodes: [node("A")], edges: [] };
+    expect(hasResolvableGraph(graph, { nodes: [], edges: [] })).toBe(false);
+  });
+
+  it("several disconnected nodes with no edges are also not resolvable — same reasoning, not just the one-node case", async () => {
+    const { hasResolvableGraph } = await import("./RunDetail");
+    const graph = { nodes: [node("A"), node("B"), node("C")], edges: [] };
+    expect(hasResolvableGraph(graph, { nodes: [], edges: [] })).toBe(false);
+  });
+
+  it("falls through to a real-edged opGraph when the authored graph is edgeless (mirrors shouldRenderAuthoredGraph)", async () => {
+    const { hasResolvableGraph } = await import("./RunDetail");
+    const authoredEdgeless = { nodes: [node("A"), node("B")], edges: [] };
+    const opGraph = {
+      nodes: [{ id: "A" }, { id: "B" }],
+      edges: [{ id: "e1", source: "A", target: "B" }],
+    };
+    expect(hasResolvableGraph(authoredEdgeless, opGraph)).toBe(true);
+  });
+
+  // The one-node case takes the same fall-through. It used to be excluded,
+  // which meant an authored snapshot of a single node hid a runtime graph
+  // that had two nodes and an edge between them: canRenderGraph came back
+  // false and the run opened on the list with a real DAG sitting unrendered.
+  it("falls through to a real-edged opGraph even when the authored graph has exactly one node", async () => {
+    const { hasResolvableGraph } = await import("./RunDetail");
+    const authoredSingleNode = { nodes: [node("A")], edges: [] };
+    const opGraph = {
+      nodes: [{ id: "A" }, { id: "B" }],
+      edges: [{ id: "e1", source: "A", target: "B" }],
+    };
+    expect(hasResolvableGraph(authoredSingleNode, opGraph)).toBe(true);
+  });
+
+  it("no graph at all is not resolvable", async () => {
+    const { hasResolvableGraph } = await import("./RunDetail");
+    expect(hasResolvableGraph(null, { nodes: [], edges: [] })).toBe(false);
+  });
+});
+
+describe("history/RunDetail.tsx — resolveInitialView (row 5: the precedence rule)", () => {
+  it("defaults to graph when a resolvable graph exists and the reader has made no choice", async () => {
+    const { resolveInitialView } = await import("./RunDetail");
+    expect(
+      resolveInitialView({ urlView: null, storedPreference: null, hasResolvableGraph: true }),
+    ).toBe("graph");
+  });
+
+  it("defaults to list when there is no resolvable graph and the reader has made no choice", async () => {
+    const { resolveInitialView } = await import("./RunDetail");
+    expect(
+      resolveInitialView({ urlView: null, storedPreference: null, hasResolvableGraph: false }),
+    ).toBe("list");
+  });
+
+  // This is the precedence the brief calls out explicitly: "default is
+  // graph" and "preference is persisted" are in tension exactly once — a
+  // graph-having run whose reader has already chosen "list" — and the
+  // reader's choice must win. A regression that makes the default win
+  // again (e.g. checking hasResolvableGraph before storedPreference) fails
+  // this test.
+  it("a stored 'list' preference beats the graph default, even when a resolvable graph exists", () => {
+    return import("./RunDetail").then(({ resolveInitialView }) => {
+      expect(
+        resolveInitialView({
+          urlView: null,
+          storedPreference: "list",
+          hasResolvableGraph: true,
+        }),
+      ).toBe("list");
+    });
+  });
+
+  it("the URL view param outranks the stored preference (a pasted deep link reproduces what was shared)", async () => {
+    const { resolveInitialView } = await import("./RunDetail");
+    expect(
+      resolveInitialView({
+        urlView: "graph",
+        storedPreference: "list",
+        hasResolvableGraph: false,
+      }),
+    ).toBe("graph");
+  });
+});
+
+// ─── ADR-0113 rows 3, 5, 8, 9 — mounted behavior ────────────────────────────
+//
+// Reuses the mount pattern from the hidden-count-badge suite above
+// (getSession/streamSession/streamSignals/ResumeRun/WorkerCanvas mocked at
+// module scope): real RunDetail, real BranchesSection/RunStepCard, a fake
+// WorkerCanvas standing in for ReactFlow.
+
+describe("history/RunDetail.tsx — graph/list view toggle and cross-view selection, mounted", () => {
+  beforeEach(() => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    Element.prototype.scrollIntoView = vi.fn();
+    // localStorage is unavailable in this test runtime (jsdom under Node's
+    // experimental webstorage without a backing file) — RunDetail's own
+    // reads/writes already tolerate that (readStoredView/writeStoredView),
+    // so these tests exercise the URL query param instead, which jsdom does
+    // support. The stored-preference SIDE of the precedence rule is covered
+    // directly against resolveInitialView (pure function, above), which
+    // needs no browser storage at all.
+    window.history.replaceState(null, "", "/");
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const node = (id: string) => ({
+    id,
+    label: id,
+    role: "",
+    assignment: "",
+    prompt: "",
+    capacity: 1,
+    timeout: null,
+    inputs: [],
+    outputs: [],
+  });
+
+  const edgedGraph = {
+    name: "run",
+    description: "",
+    nodes: [node("A"), node("B")],
+    edges: [{ id: "e-ab", source: "A", target: "B", mode: "simple" as const }],
+  };
+
+  const singleNodeGraph = {
+    name: "run",
+    description: "",
+    nodes: [node("A")],
+    edges: [],
+  };
+
+  function sessionWithBranches(graph: unknown, invocationKind: string | null = null) {
+    return {
+      id: "run-mount-view",
+      name: "run-mount-view",
+      created_at: 0,
+      updated_at: 0,
+      status: "completed",
+      invocation_kind: invocationKind,
+      branches: [{ id: "branch-a", name: "A", created_at: 0, messages: [] }],
+      graph,
+    };
+  }
+
+  async function mountRunDetail(session: unknown) {
+    const [{ getSession }, { default: RunDetail }] = await Promise.all([
+      import("@/lib/api"),
+      import("./RunDetail"),
+    ]);
+    vi.mocked(getSession).mockResolvedValue(session as never);
+
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+      root.render(
+        <IntlProvider locale="en" messages={enMessages}>
+          <RunDetail id="run-mount-view" />
+        </IntlProvider>,
+      );
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    return {
+      container,
+      // Re-render the SAME React tree under a different run id, which is what
+      // navigating between runs does: the RunDetail instance is reused rather
+      // than remounted, so per-run state has to be reset rather than dropped.
+      rerenderWithRun: async (nextId: string, nextSession: unknown) => {
+        const { getSession } = await import("@/lib/api");
+        vi.mocked(getSession).mockResolvedValue(nextSession as never);
+        await act(async () => {
+          root.render(
+            <IntlProvider locale="en" messages={enMessages}>
+              <RunDetail id={nextId} />
+            </IntlProvider>,
+          );
+        });
+        await act(async () => {
+          await Promise.resolve();
+          await Promise.resolve();
+        });
+      },
+      unmount: () => {
+        act(() => root.unmount());
+        container.remove();
+      },
+    };
+  }
+
+  async function openExpandedGraph(container: HTMLDivElement) {
+    const expand = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Expand execution graph"]',
+    );
+    expect(expand).not.toBeNull();
+    expand?.focus();
+    await act(async () => {
+      expand?.click();
+    });
+    const dialog = document.body.querySelector<HTMLElement>(
+      '[role="dialog"][aria-label="Execution graph"]',
+    );
+    expect(dialog).not.toBeNull();
+    return { dialog: dialog!, expand: expand! };
+  }
+
+  it("opening the expanded graph moves focus inside and names it", async () => {
+    const { container, unmount } = await mountRunDetail(sessionWithBranches(edgedGraph));
+    try {
+      const { dialog } = await openExpandedGraph(container);
+      expect(dialog.contains(document.activeElement)).toBe(true);
+      expect(dialog.getAttribute("aria-label")).toBe("Execution graph");
+    } finally {
+      unmount();
+    }
+  });
+
+  // Navigating to another run reuses this RunDetail instance, so an overlay flag
+  // that survives the navigation reopens the dialog over the incoming run.
+  it("switching to another run closes the overlay the outgoing run opened", async () => {
+    const { container, rerenderWithRun, unmount } = await mountRunDetail(
+      sessionWithBranches(edgedGraph),
+    );
+    try {
+      await openExpandedGraph(container);
+
+      // The next run also has a resolvable graph, so the section itself stays
+      // rendered. Only the run identity changed.
+      await rerenderWithRun("run-next", {
+        ...(sessionWithBranches(edgedGraph) as Record<string, unknown>),
+        id: "run-next",
+        name: "run-next",
+      });
+
+      expect(
+        document.body.querySelector('[role="dialog"][aria-label="Execution graph"]'),
+      ).toBeNull();
+    } finally {
+      unmount();
+    }
+  });
+
+  // Overdetermined, and deliberately kept as a case rather than a guard: the graph
+  // section unmounts with the graphless run, so this stays green even without the
+  // flag reset that the test above pins.
+  it("moving to a run with no resolvable graph also closes it", async () => {
+    const { container, rerenderWithRun, unmount } = await mountRunDetail(
+      sessionWithBranches(edgedGraph),
+    );
+    try {
+      await openExpandedGraph(container);
+
+      await rerenderWithRun("run-graphless", {
+        ...(sessionWithBranches(null) as Record<string, unknown>),
+        id: "run-graphless",
+        name: "run-graphless",
+      });
+
+      expect(
+        document.body.querySelector('[role="dialog"][aria-label="Execution graph"]'),
+      ).toBeNull();
+    } finally {
+      unmount();
+    }
+  });
+
+  it("traps forward and reverse Tab traversal when focus starts outside the graph dialog", async () => {
+    const { container, unmount } = await mountRunDetail(sessionWithBranches(edgedGraph));
+    const outside = document.createElement("button");
+    document.body.appendChild(outside);
+    try {
+      const { dialog } = await openExpandedGraph(container);
+      const last = document.createElement("button");
+      last.textContent = "Last graph action";
+      dialog.appendChild(last);
+      const first = dialog.querySelector<HTMLButtonElement>("button");
+      expect(first).not.toBeNull();
+
+      outside.focus();
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true }));
+      expect(document.activeElement).toBe(first);
+      expect(dialog.contains(document.activeElement)).toBe(true);
+
+      outside.focus();
+      document.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true }),
+      );
+      expect(document.activeElement).toBe(last);
+      expect(dialog.contains(document.activeElement)).toBe(true);
+
+      last.focus();
+      document.dispatchEvent(new KeyboardEvent("keydown", { key: "Tab", bubbles: true }));
+      expect(document.activeElement).toBe(first);
+
+      first?.focus();
+      document.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Tab", shiftKey: true, bubbles: true }),
+      );
+      expect(document.activeElement).toBe(last);
+    } finally {
+      outside.remove();
+      unmount();
+    }
+  });
+
+  it("Escape closes the expanded graph and restores focus to its launcher", async () => {
+    const { container, unmount } = await mountRunDetail(sessionWithBranches(edgedGraph));
+    try {
+      const { dialog, expand } = await openExpandedGraph(container);
+      dialog.querySelector<HTMLButtonElement>("button")?.focus();
+      await act(async () => {
+        document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      });
+      expect(
+        document.body.querySelector('[role="dialog"][aria-label="Execution graph"]'),
+      ).toBeNull();
+      expect(document.activeElement).toBe(expand);
+    } finally {
+      unmount();
+    }
+  });
+
+  it("the explicit close control restores focus to the Expand graph launcher", async () => {
+    const { container, unmount } = await mountRunDetail(sessionWithBranches(edgedGraph));
+    try {
+      const { dialog, expand } = await openExpandedGraph(container);
+      const close = dialog.querySelector<HTMLButtonElement>(
+        'button[aria-label="Collapse execution graph"]',
+      );
+      expect(close).not.toBeNull();
+      close?.focus();
+      await act(async () => {
+        close?.click();
+      });
+      expect(
+        document.body.querySelector('[role="dialog"][aria-label="Execution graph"]'),
+      ).toBeNull();
+      expect(document.activeElement).toBe(expand);
+    } finally {
+      unmount();
+    }
+  });
+
+  it("closing preserves the selected graph node and the mounted inline canvas viewport", async () => {
+    const { container, unmount } = await mountRunDetail(sessionWithBranches(edgedGraph));
+    try {
+      const inlineCanvas = container.querySelector('[data-testid="worker-canvas"]');
+      const { dialog } = await openExpandedGraph(container);
+      const expandedCanvas = dialog.querySelector('[data-testid="worker-canvas"]');
+      const expandedPanel = expandedCanvas?.parentElement;
+      expect(expandedPanel).not.toBeNull();
+      const fakeNode = document.createElement("div");
+      fakeNode.className = "react-flow__node";
+      fakeNode.dataset.id = "A";
+      expandedPanel?.appendChild(fakeNode);
+      await act(async () => {
+        fakeNode.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+
+      await act(async () => {
+        dialog
+          .querySelector<HTMLButtonElement>('button[aria-label="Collapse execution graph"]')
+          ?.click();
+      });
+
+      expect(container.querySelector('[data-testid="worker-canvas"]')).toBe(inlineCanvas);
+      expect(
+        container.querySelector('[data-testid="run-detail-selected-node"]')?.textContent,
+      ).toContain("A");
+      expect(document.getElementById("step-A")).not.toBeNull();
+    } finally {
+      unmount();
+    }
+  });
+
+  it("row 3: a run with edges opens on the graph", async () => {
+    const { container, unmount } = await mountRunDetail(sessionWithBranches(edgedGraph));
+    try {
+      expect(container.querySelector('[data-testid="worker-canvas"]')).not.toBeNull();
+      expect(container.querySelector("#run-branches")).toBeNull();
+      const graphTab = container.querySelector('[data-testid="run-detail-view-graph"]');
+      expect(graphTab?.getAttribute("aria-selected")).toBe("true");
+    } finally {
+      unmount();
+    }
+  });
+
+  it("row 3: a single-node run with no edges opens on the list, and offers no graph tab to switch to — a graph with no edges is not a canvas worth exposing at all", async () => {
+    const { container, unmount } = await mountRunDetail(sessionWithBranches(singleNodeGraph));
+    try {
+      expect(container.querySelector('[data-testid="worker-canvas"]')).toBeNull();
+      expect(container.querySelector("#run-branches")).not.toBeNull();
+      // No view toggle at all — there is nothing to switch to. Before the
+      // resolved-graph consolidation, canRenderGraph (looser than
+      // hasResolvableGraph) still exposed a clickable Graph tab here, and
+      // selecting it rendered a single disconnected node with no edges.
+      expect(container.querySelector('[data-testid="run-detail-view-graph"]')).toBeNull();
+      expect(container.querySelector('[data-testid="run-detail-view-list"]')).toBeNull();
+    } finally {
+      unmount();
+    }
+  });
+
+  it("row 5: an explicit ?view=list in the URL beats the graph default for a run with edges", async () => {
+    window.history.replaceState(null, "", "/?view=list");
+    const { container, unmount } = await mountRunDetail(sessionWithBranches(edgedGraph));
+    try {
+      expect(container.querySelector('[data-testid="worker-canvas"]')).toBeNull();
+      expect(container.querySelector("#run-branches")).not.toBeNull();
+      const listTab = container.querySelector('[data-testid="run-detail-view-list"]');
+      expect(listTab?.getAttribute("aria-selected")).toBe("true");
+    } finally {
+      unmount();
+    }
+  });
+
+  it("row 5: clicking the List tab switches away from the graph, and Graph switches back", async () => {
+    const { container, unmount } = await mountRunDetail(sessionWithBranches(edgedGraph));
+    try {
+      const listTab = container.querySelector<HTMLButtonElement>(
+        '[data-testid="run-detail-view-list"]',
+      );
+      await act(async () => {
+        listTab?.click();
+      });
+      expect(container.querySelector('[data-testid="worker-canvas"]')).toBeNull();
+      expect(container.querySelector("#run-branches")).not.toBeNull();
+
+      const graphTab = container.querySelector<HTMLButtonElement>(
+        '[data-testid="run-detail-view-graph"]',
+      );
+      await act(async () => {
+        graphTab?.click();
+      });
+      expect(container.querySelector('[data-testid="worker-canvas"]')).not.toBeNull();
+      expect(container.querySelector("#run-branches")).toBeNull();
+    } finally {
+      unmount();
+    }
+  });
+
+  it("row 5: selection survives a view switch — selecting a step in the list, then switching to graph, keeps it as the selected node", async () => {
+    const { container, unmount } = await mountRunDetail(sessionWithBranches(edgedGraph));
+    try {
+      const listTab = container.querySelector<HTMLButtonElement>(
+        '[data-testid="run-detail-view-list"]',
+      );
+      await act(async () => {
+        listTab?.click();
+      });
+      const expandButton = container.querySelector<HTMLButtonElement>(
+        'button[aria-controls="step-A-body"]',
+      );
+      expect(expandButton).not.toBeNull();
+      // A session with this few branches auto-expands every step on load
+      // (see the session-load effect above), so the single step here starts
+      // already expanded — collapsing it first (a plain expand/collapse,
+      // not a selection) and then re-expanding it is what actually exercises
+      // "the reader opened this step," which is the act that selects it.
+      await act(async () => {
+        expandButton?.click();
+      });
+      await act(async () => {
+        expandButton?.click();
+      });
+      const selectedRow = document.getElementById("step-A")?.parentElement;
+      expect(selectedRow?.hasAttribute("data-selected")).toBe(true);
+
+      const graphTab = container.querySelector<HTMLButtonElement>(
+        '[data-testid="run-detail-view-graph"]',
+      );
+      await act(async () => {
+        graphTab?.click();
+      });
+      const indicator = container.querySelector('[data-testid="run-detail-selected-node"]');
+      expect(indicator?.textContent).toContain("A");
+    } finally {
+      unmount();
+    }
+  });
+
+  it("row 3 (runtime path): an opGraph with nodes but no edges falls back to the list, same as an edgeless authored graph", async () => {
+    const { streamSignals } = await import("@/lib/api");
+    vi.mocked(streamSignals).mockImplementationOnce((_id, cb) => {
+      cb(sig({ id: "e1", op_id: "op-a", kind: "NodeStarted", payload: { name: "A" } }));
+      return () => {};
+    });
+    const { container, unmount } = await mountRunDetail(sessionWithBranches(null));
+    try {
+      expect(container.querySelector('[data-testid="op-graph-node"]')).toBeNull();
+      expect(container.querySelector("#run-branches")).not.toBeNull();
+      expect(container.querySelector('[data-testid="run-detail-view-graph"]')).toBeNull();
+    } finally {
+      unmount();
+    }
+  });
+
+  it("row 4 (authored path): selecting a node renders its detail card in place, in the graph view", async () => {
+    const { container, unmount } = await mountRunDetail(sessionWithBranches(edgedGraph));
+    try {
+      // The mocked WorkerCanvas doesn't render ReactFlow's own node markup —
+      // handleDagPanelClick delegates on the raw DOM shape ReactFlow produces
+      // (`.react-flow__node[data-id]`), so a synthetic one exercises the same
+      // delegation the real graph relies on.
+      const canvas = container.querySelector('[data-testid="worker-canvas"]');
+      const panel = canvas?.parentElement;
+      expect(panel).not.toBeNull();
+      const fakeNode = document.createElement("div");
+      fakeNode.className = "react-flow__node";
+      fakeNode.dataset.id = "A";
+      panel!.appendChild(fakeNode);
+      await act(async () => {
+        fakeNode.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      expect(document.getElementById("step-A")).not.toBeNull();
+    } finally {
+      unmount();
+    }
+  });
+
+  it("row 4 (runtime path): OperationGraphSection has a node click handler, and selecting a node renders its detail card in place", async () => {
+    const { streamSignals } = await import("@/lib/api");
+    vi.mocked(streamSignals).mockImplementationOnce((_id, cb) => {
+      cb(sig({ id: "e1", op_id: "op-a", kind: "NodeStarted", payload: { name: "A" } }));
+      cb(
+        sig({
+          id: "e2",
+          op_id: "op-b",
+          kind: "NodeStarted",
+          payload: { name: "B", parent_id: "op-a" },
+        }),
+      );
+      return () => {};
+    });
+    const session = {
+      ...sessionWithBranches(null),
+      branches: [{ id: "branch-b", name: "B", created_at: 0, messages: [] }],
+    };
+    const { container, unmount } = await mountRunDetail(session);
+    try {
+      // An opGraph with a real edge is a resolvable graph, so this defaults
+      // to the graph view without needing to click a tab.
+      const nodeCard = Array.from(
+        container.querySelectorAll<HTMLElement>('[data-testid="op-graph-node"]'),
+      ).find((el) => el.textContent?.includes("B"));
+      expect(nodeCard).toBeTruthy();
+      await act(async () => {
+        nodeCard?.click();
+      });
+      expect(document.getElementById("step-B")).not.toBeNull();
+    } finally {
+      unmount();
+    }
+  });
+
+  it("row 6 (D6 URL-addressability): a URL carrying a selected node restores that selection on load", async () => {
+    window.history.replaceState(null, "", "/?node=A");
+    const { container, unmount } = await mountRunDetail(sessionWithBranches(edgedGraph));
+    try {
+      expect(document.getElementById("step-A")).not.toBeNull();
+      const indicator = container.querySelector('[data-testid="run-detail-selected-node"]');
+      expect(indicator?.textContent).toContain("A");
+    } finally {
+      unmount();
+    }
+  });
+
+  it("coupled minor: changing the run id clears the previous run's selected node", async () => {
+    const [{ getSession }, { default: RunDetail }] = await Promise.all([
+      import("@/lib/api"),
+      import("./RunDetail"),
+    ]);
+    const runOne = sessionWithBranches(edgedGraph);
+    const runTwo = {
+      ...sessionWithBranches(edgedGraph),
+      id: "run-mount-view-2",
+      branches: [{ id: "branch-c", name: "C", created_at: 0, messages: [] }],
+    };
+    vi.mocked(getSession).mockImplementation(
+      async (id: string) => (id === "run-mount-view-2" ? runTwo : runOne) as never,
+    );
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    try {
+      await act(async () => {
+        root.render(
+          <IntlProvider locale="en" messages={enMessages}>
+            <RunDetail id="run-mount-view" />
+          </IntlProvider>,
+        );
+      });
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      const canvas = container.querySelector('[data-testid="worker-canvas"]');
+      const panel = canvas?.parentElement;
+      const fakeNode = document.createElement("div");
+      fakeNode.className = "react-flow__node";
+      fakeNode.dataset.id = "A";
+      panel!.appendChild(fakeNode);
+      await act(async () => {
+        fakeNode.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      });
+      expect(
+        container.querySelector('[data-testid="run-detail-selected-node"]')?.textContent,
+      ).toContain("A");
+
+      await act(async () => {
+        root.render(
+          <IntlProvider locale="en" messages={enMessages}>
+            <RunDetail id="run-mount-view-2" />
+          </IntlProvider>,
+        );
+      });
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(container.querySelector('[data-testid="run-detail-selected-node"]')).toBeNull();
+    } finally {
+      act(() => root.unmount());
+      container.remove();
+    }
+  });
+});
+
+// ─── ADR-0113 rows 8 & 9 — run controls, mounted ────────────────────────────
+
+describe("history/RunDetail.tsx — pause/resume/steer controls, mounted", () => {
+  beforeEach(async () => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    Element.prototype.scrollIntoView = vi.fn();
+    // Everything in this block describes the surface as it behaves once some
+    // verb has a backing command. That is the state in which D4's rule
+    // applies: a verb the engine cannot carry out is shown and disabled with
+    // its reason, never hidden, so a deliberate constraint does not read as a
+    // missing feature. The separate case — no verb backed at all — is covered
+    // below, and is the only reason these need to opt in.
+    const { hasAnyExecutablePath } = await import("@/lib/runControls");
+    vi.mocked(hasAnyExecutablePath).mockReturnValue(true);
+  });
+
+  // Nothing in the vitest config resets mocks between tests, so the three
+  // wrappers the run-swap test overrides are put back to the real
+  // implementations here. Without this, one test's stand-in registry would
+  // silently become every later test's premise.
+  afterEach(async () => {
+    vi.unstubAllGlobals();
+    const actual = await vi.importActual<typeof import("@/lib/runControls")>("@/lib/runControls");
+    const { applyExecutablePath, proposeRunControl, confirmRunControl } =
+      await import("@/lib/runControls");
+    vi.mocked(applyExecutablePath).mockImplementation(actual.applyExecutablePath);
+    vi.mocked(proposeRunControl).mockImplementation(actual.proposeRunControl);
+    vi.mocked(confirmRunControl).mockImplementation(actual.confirmRunControl);
+  });
+
+  const flatGraph = { name: "run", description: "", nodes: [], edges: [] };
+
+  // has_control_consumer mirrors what services/sessions.py projects for every
+  // session: true for flow and play unconditionally, and for an agent run only
+  // when a lionagi runner owns it and declared that it drains controls.
+  function sessionOf(invocationKind: string | null, hasControlConsumer = true) {
+    return {
+      id: "run-mount-controls",
+      name: "run-mount-controls",
+      created_at: 0,
+      updated_at: 0,
+      status: "running",
+      invocation_kind: invocationKind,
+      has_control_consumer: hasControlConsumer,
+      // A control is authorized against the project of the conversation it is
+      // proposed in, which comes from the run. A session without one is its
+      // own case, covered separately below.
+      project: "studio",
+      branches: [],
+      graph: flatGraph,
+    };
+  }
+
+  async function mountRunDetail(session: unknown) {
+    const [{ getSession }, { default: RunDetail }] = await Promise.all([
+      import("@/lib/api"),
+      import("./RunDetail"),
+    ]);
+    vi.mocked(getSession).mockResolvedValue(session as never);
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    await act(async () => {
+      root.render(
+        <IntlProvider locale="en" messages={enMessages}>
+          <RunDetail id="run-mount-controls" />
+        </IntlProvider>,
+      );
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    return {
+      container,
+      unmount: () => {
+        act(() => root.unmount());
+        container.remove();
+      },
+    };
+  }
+
+  it("row 8: pause is shown and DISABLED on an agent run — never hidden", async () => {
+    const { container, unmount } = await mountRunDetail(sessionOf("agent"));
+    try {
+      const pauseButton = container.querySelector<HTMLButtonElement>(
+        '[data-testid="run-controls-pause"]',
+      );
+      expect(pauseButton).not.toBeNull();
+      expect(pauseButton?.disabled).toBe(true);
+      // Resume is not a listed agent capability at all — not offered, not
+      // just disabled.
+      expect(container.querySelector('[data-testid="run-controls-resume"]')).toBeNull();
+    } finally {
+      unmount();
+    }
+  });
+
+  it("enables backed flow controls while keeping resume state-aware", async () => {
+    const { container, unmount } = await mountRunDetail(sessionOf("flow"));
+    try {
+      const pause = container.querySelector<HTMLButtonElement>(
+        '[data-testid="run-controls-pause"]',
+      );
+      const resume = container.querySelector<HTMLButtonElement>(
+        '[data-testid="run-controls-resume"]',
+      );
+      const steer = container.querySelector<HTMLButtonElement>(
+        '[data-testid="run-controls-steer"]',
+      );
+      expect(pause?.disabled).toBe(false);
+      expect(resume?.disabled).toBe(true);
+      expect(steer?.disabled).toBe(false);
+    } finally {
+      unmount();
+    }
+  });
+
+  it("states the run-state refusal in text, not only in a tooltip", async () => {
+    const { container, unmount } = await mountRunDetail(sessionOf("flow"));
+    try {
+      const reason = container.querySelector('[data-testid="run-controls-reason-not-paused"]');
+      expect(reason).not.toBeNull();
+      expect(reason?.textContent).toBe("The run is not paused.");
+    } finally {
+      unmount();
+    }
+  });
+
+  it("offers steering as the supported alternative to pausing an agent turn", async () => {
+    const { container, unmount } = await mountRunDetail(sessionOf("agent"));
+    try {
+      const panel = container.querySelector('[data-testid="run-controls"]');
+      expect(panel?.textContent).toContain("steer instead");
+      expect(
+        container.querySelector<HTMLButtonElement>('[data-testid="run-controls-steer"]')?.disabled,
+      ).toBe(false);
+    } finally {
+      unmount();
+    }
+  });
+
+  it("disables steering for an agent run no runner owns, and says why", async () => {
+    // A mirrored or imported session carries invocation_kind "agent" like a
+    // live one. The server refuses every control queued against it, so an
+    // enabled steer here would be a button that can never queue anything.
+    const { container, unmount } = await mountRunDetail(sessionOf("agent", false));
+    try {
+      const steer = container.querySelector<HTMLButtonElement>(
+        '[data-testid="run-controls-steer"]',
+      );
+      expect(steer).not.toBeNull();
+      expect(steer?.disabled).toBe(true);
+      const reason = container.querySelector(
+        '[data-testid="run-controls-reason-no-live-consumer"]',
+      );
+      expect(reason?.textContent).toBe(
+        "This run is a mirrored or imported session, so no runner would deliver a control.",
+      );
+    } finally {
+      unmount();
+    }
+  });
+
+  it("refuses every control on a completed_empty run, which the server will not admit", async () => {
+    // completed_empty is a valid terminal status the display mapping does not
+    // recognize, so it used to fold into "running" and leave these controls
+    // enabled against a run the server refuses with not_running.
+    const { container, unmount } = await mountRunDetail({
+      ...sessionOf("flow"),
+      status: "completed_empty",
+    });
+    try {
+      expect(
+        container.querySelector<HTMLButtonElement>('[data-testid="run-controls-pause"]')?.disabled,
+      ).toBe(true);
+      expect(
+        container.querySelector<HTMLButtonElement>('[data-testid="run-controls-steer"]')?.disabled,
+      ).toBe(true);
+    } finally {
+      unmount();
+    }
+  });
+
+  it("refuses every control on a run with no project, and says which limit it is", async () => {
+    // A control is authorized against the project of the conversation it is
+    // proposed in, and a run with no project leaves that conversation nothing
+    // to be scoped to. The server rejects it before proposing anything, so an
+    // enabled control here is one that can never succeed.
+    const { project: _omitted, ...withoutProject } = sessionOf("flow");
+    const { container, unmount } = await mountRunDetail(withoutProject);
+    try {
+      expect(
+        container.querySelector<HTMLButtonElement>('[data-testid="run-controls-pause"]')?.disabled,
+      ).toBe(true);
+      expect(
+        container.querySelector<HTMLButtonElement>('[data-testid="run-controls-steer"]')?.disabled,
+      ).toBe(true);
+      const reason = container.querySelector(
+        '[data-testid="run-controls-reason-no-project-scope"]',
+      );
+      expect(reason?.textContent).toBe(
+        "This run has no project, so a control cannot be authorized for it.",
+      );
+    } finally {
+      unmount();
+    }
+  });
+
+  it("a run the server reports as paused offers Resume on a fresh mount", async () => {
+    // The state this closes: pause lived only in component state, so a reload
+    // of a still-paused run came back reading "not paused" — Pause enabled,
+    // Resume refused, and no way left to release the gate.
+    const { container, unmount } = await mountRunDetail({
+      ...sessionOf("flow"),
+      pause_is_held: true,
+    });
+    try {
+      expect(
+        container.querySelector<HTMLButtonElement>('[data-testid="run-controls-resume"]')?.disabled,
+      ).toBe(false);
+      expect(
+        container.querySelector<HTMLButtonElement>('[data-testid="run-controls-pause"]')?.disabled,
+      ).toBe(true);
+    } finally {
+      unmount();
+    }
+  });
+
+  it("a response that never carried the capability field does not enable steering", async () => {
+    // Absent is not evidence of a capability: the strict compare in RunDetail
+    // is what keeps a missing field from reading as permission.
+    const { has_control_consumer: _omitted, ...withoutField } = sessionOf("agent");
+    const { container, unmount } = await mountRunDetail(withoutField);
+    try {
+      expect(
+        container.querySelector<HTMLButtonElement>('[data-testid="run-controls-steer"]')?.disabled,
+      ).toBe(true);
+    } finally {
+      unmount();
+    }
+  });
+
+  it("no control panel renders for a kind the control poller does not drain (e.g. show-play)", async () => {
+    const { container, unmount } = await mountRunDetail(sessionOf("show-play"));
+    try {
+      expect(container.querySelector('[data-testid="run-controls"]')).toBeNull();
+    } finally {
+      unmount();
+    }
+  });
+
+  // The state the surface is actually in today. Every verb above is disabled
+  // for want of a backing command, and a panel in which nothing can ever be
+  // clicked reads as a broken feature rather than an unbuilt one. So while no
+  // verb is backed the section is not rendered at all. This is scoped to that
+  // case and does not weaken the rule above: the moment one command type
+  // exists the section returns, and a verb the engine still cannot carry out
+  // goes back to being shown and disabled with its reason.
+  it("renders no control section at all while no verb has a backing command", async () => {
+    const { hasAnyExecutablePath } = await import("@/lib/runControls");
+    vi.mocked(hasAnyExecutablePath).mockReturnValue(false);
+    const { container, unmount } = await mountRunDetail(sessionOf("flow"));
+    try {
+      expect(container.querySelector('[data-testid="run-controls"]')).toBeNull();
+      // and specifically not the disabled-with-a-reason rendering
+      expect(
+        container.querySelector('[data-testid="run-controls-reason-no-executable-path"]'),
+      ).toBeNull();
+    } finally {
+      unmount();
+    }
+  });
+
+  // The pane is reused across runs: the id-change effect cleared session,
+  // graph, signals, and selection, and left the pause request behind, so run
+  // B derived its control state from a pause only run A had ever received.
+  // Once a command exists to carry the verb out, that is a resume dispatched
+  // against B's id for A's pause. No unit test of the phase function can see
+  // this — what is wrong is which state survives the swap — so the assertion
+  // has to be mounted and has to swap.
+  it("a pause accepted on one run does not carry into the next run shown in the same pane", async () => {
+    const [{ getSession }, { default: RunDetail }, controls] = await Promise.all([
+      import("@/lib/api"),
+      import("./RunDetail"),
+      import("@/lib/runControls"),
+    ]);
+
+    // Stands in for a registry with a backing command. Left real, every verb
+    // is refused before it is offered and the pause this test is about can
+    // never be accepted at all.
+    vi.mocked(controls.applyExecutablePath).mockImplementation((_verb, state) => state);
+    vi.mocked(controls.proposeRunControl).mockResolvedValue({
+      conversationId: "conv-run-swap",
+      proposal: {
+        id: "prop-run-swap",
+        commandType: "pause_run",
+        summary: "Pause the run",
+        commandHash: "hash-run-swap",
+        target: null,
+      },
+    } as never);
+    vi.mocked(controls.confirmRunControl).mockResolvedValue({} as never);
+    vi.mocked(getSession).mockImplementation((async (runId: string) => ({
+      id: runId,
+      name: runId,
+      created_at: 0,
+      updated_at: 0,
+      status: "running",
+      invocation_kind: "flow",
+      project: "studio",
+      branches: [],
+      graph: flatGraph,
+    })) as never);
+
+    const container = document.createElement("div");
+    document.body.appendChild(container);
+    const root = createRoot(container);
+    const show = async (runId: string) => {
+      await act(async () => {
+        root.render(
+          <IntlProvider locale="en" messages={enMessages}>
+            <RunDetail id={runId} />
+          </IntlProvider>,
+        );
+      });
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+    };
+    const pauseLabel = () =>
+      container.querySelector('[data-testid="run-controls-pause"]')?.textContent;
+    const stillPausing = () =>
+      container.querySelector('[data-testid="run-controls-reason-still-pausing"]');
+
+    try {
+      await show("run-swap-a");
+      expect(pauseLabel()).toBe("Pause");
+      expect(stillPausing()).toBeNull();
+
+      // Accept a pause on run A through the surface — propose, then confirm —
+      // rather than by setting the state this test is about.
+      await act(async () => {
+        container.querySelector<HTMLButtonElement>('[data-testid="run-controls-pause"]')?.click();
+      });
+      const confirmYes = container.querySelector<HTMLButtonElement>(
+        '[data-testid="run-controls-confirm"] button',
+      );
+      expect(confirmYes, "no confirm dialog appeared after proposing a pause").not.toBeNull();
+      await act(async () => {
+        confirmYes?.click();
+      });
+      // This run has no authored graph and no signals yet, so nothing can say
+      // how much is still in flight: the phase is "pausing", never "paused".
+      expect(pauseLabel()).toBe("Pausing…");
+      expect(stillPausing()).not.toBeNull();
+
+      // Same pane, next run. Nothing about B was ever paused.
+      await show("run-swap-b");
+      expect(pauseLabel()).toBe("Pause");
+      expect(stillPausing()).toBeNull();
+    } finally {
+      act(() => root.unmount());
+      container.remove();
+    }
+  });
+});
+
+function openConversationTab(container: HTMLElement): void {
+  const tab = container.querySelector<HTMLButtonElement>('[id$="-tab-conversation"]');
+  if (!tab) throw new Error("conversation tab not rendered");
+  act(() => {
+    tab.click();
+  });
+}
+
+describe("history/RunDetail.tsx — a tool result nobody read is not a tool call that worked", () => {
+  // The server withholds a message payload past its per-row size ceiling and
+  // marks the row `content_withheld`. Every consumer here decides success by
+  // reading the output, and a withheld output is an empty string, so without
+  // the flag a call whose result nobody has seen renders with a green check.
+  const withheldBranch = (contentWithheld: boolean) => ({
+    id: "branch-withheld",
+    name: "worker",
+    created_at: 10,
+    message_total: 2,
+    messages: [
+      {
+        id: "req-1",
+        role: "action",
+        content: {
+          function: "Bash",
+          arguments: { command: "ls" },
+          action_response_id: "resp-1",
+        },
+        sender: "worker",
+        timestamp: 11,
+        lion_class: "ActionRequest",
+      },
+      {
+        id: "resp-1",
+        role: "action",
+        content: contentWithheld ? null : { function: "Bash", output: "a.txt" },
+        content_withheld: contentWithheld,
+        sender: "tool",
+        timestamp: 12,
+        lion_class: "ActionResponse",
+      },
+    ],
+  });
+
+  it("marks a paired call whose response payload was withheld", async () => {
+    const { branchToRunStep } = await import("./RunDetail");
+    const step = branchToRunStep(withheldBranch(true) as never, "completed");
+    const [call] = (step.messages ?? []).filter((m) => m.role === "tool_call");
+    expect(call.status).toBe("withheld");
+  });
+
+  it("still reports an ordinary call as ok", async () => {
+    // Control: "withheld" has to be reachable only through the flag, or the
+    // assertion above is satisfied by a status that is always withheld.
+    const { branchToRunStep } = await import("./RunDetail");
+    const step = branchToRunStep(withheldBranch(false) as never, "completed");
+    const [call] = (step.messages ?? []).filter((m) => m.role === "tool_call");
+    expect(call.status).toBe("ok");
+  });
+
+  // A withheld REQUEST is the harder half. Its payload is what carries the
+  // function name, the arguments and the forward link to its response, so a
+  // consumer reading only the response's flag sees an ordinary call with a
+  // blank name, and the response it could no longer point at renders as a
+  // second one. Two green checks, for one call nobody could read.
+  // `error` is omitted rather than set to null when a call succeeds, which is
+  // what the server stores and therefore what the client receives.
+  const withheldRequestBranch = (output = "a.txt", error?: string) => ({
+    id: "branch-withheld-req",
+    name: "worker",
+    created_at: 10,
+    message_total: 2,
+    messages: [
+      {
+        id: "req-1",
+        role: "action",
+        content: null,
+        content_withheld: true,
+        sender: "worker",
+        timestamp: 11,
+        lion_class: "ActionRequest",
+      },
+      {
+        id: "resp-1",
+        role: "action",
+        content: {
+          function: "Bash",
+          output,
+          action_request_id: "req-1",
+          ...(error === undefined ? {} : { error }),
+        },
+        sender: "tool",
+        timestamp: 12,
+        lion_class: "ActionResponse",
+      },
+    ],
+  });
+
+  it("marks a call whose own request payload was withheld", async () => {
+    const { branchToRunStep } = await import("./RunDetail");
+    const step = branchToRunStep(withheldRequestBranch() as never, "completed");
+    const calls = (step.messages ?? []).filter((m) => m.role === "tool_call");
+    expect(calls.map((c) => c.status)).toEqual(["withheld"]);
+  });
+
+  it("reports the failure when a withheld request's response came back and recorded an error", async () => {
+    // The two halves are withheld independently, so the request can be past
+    // the ceiling while the reply is decoded and readable. "not read" is then
+    // the one thing the row is not: somebody did read this, and it failed.
+    // Answering with the badge would hide a failure the response states.
+    const { branchToRunStep } = await import("./RunDetail");
+    const step = branchToRunStep(withheldRequestBranch("", "boom: exit 1") as never, "completed");
+    const calls = (step.messages ?? []).filter((m) => m.role === "tool_call");
+    expect(calls.map((c) => c.status)).toEqual(["error"]);
+  });
+
+  it("keeps the withheld badge when that same response records no error", async () => {
+    // Control, and the reason the fixtures differ by one field: the recorded
+    // error must be what produces "error" above, not the withheld request.
+    // The request is still unread here, which is what the blank function name
+    // on the row needs explained, so the badge stays.
+    const { branchToRunStep } = await import("./RunDetail");
+    const step = branchToRunStep(withheldRequestBranch("a.txt") as never, "completed");
+    const calls = (step.messages ?? []).filter((m) => m.role === "tool_call");
+    expect(calls.map((c) => c.status)).toEqual(["withheld"]);
+  });
+
+  it("does not call a withheld request failed because its output mentions an error", async () => {
+    // Prose is not a statement of outcome. A successful call says "No errors found",
+    // and reading the word out of the text would turn an honest "not read"
+    // into a wrong one -- worse than the vagueness it replaces, because the
+    // reader has no way to see that it is wrong. Only the response's own
+    // error field outranks the badge, and this response records none.
+    const { branchToRunStep } = await import("./RunDetail");
+    const step = branchToRunStep(withheldRequestBranch("No errors found") as never, "completed");
+    const calls = (step.messages ?? []).filter((m) => m.role === "tool_call");
+    expect(calls.map((c) => c.status)).toEqual(["withheld"]);
+  });
+
+  // An ordinary call with nothing withheld, so the text is the only thing left
+  // deciding the outcome. Sessions mirrored from the Codex CLI arrive this way
+  // and carry no error field, which is why the text is read at all.
+  //
+  // Built here rather than derived from the withheld fixture by deleting a
+  // field. These cases are about what the text says, and deriving them would
+  // tie them to the shape of a fixture that exists to test something else.
+  const plainCallBranch = (output: string) => ({
+    id: "branch-plain-call",
+    name: "worker",
+    created_at: 10,
+    message_total: 2,
+    messages: [
+      {
+        id: "req-1",
+        role: "action",
+        content: { function: "Bash", arguments: {}, action_response_id: "resp-1" },
+        sender: "worker",
+        timestamp: 11,
+        lion_class: "ActionRequest",
+      },
+      {
+        id: "resp-1",
+        role: "action",
+        content: { function: "Bash", output, action_request_id: "req-1" },
+        sender: "tool",
+        timestamp: 12,
+        lion_class: "ActionResponse",
+      },
+    ],
+  });
+
+  const statusOf = async (output: string) => {
+    const { branchToRunStep } = await import("./RunDetail");
+    const step = branchToRunStep(plainCallBranch(output) as never, "completed");
+    return (step.messages ?? []).filter((m) => m.role === "tool_call").map((c) => c.status);
+  };
+
+  it("still reads a failure out of the text when nothing was withheld", async () => {
+    // The text is the only signal some tools leave. Demoting it below the badge
+    // must not silently delete it: a failure recorded only in prose still has
+    // to show as one.
+    expect(await statusOf("Error: command not found")).toEqual(["error"]);
+  });
+
+  it.each([
+    ["a sentence mentioning one", "No errors found"],
+    ["a count of them", "Errors: 0"],
+    ["one inside ordinary prose", "Retrying after a transient error was handled"],
+  ])("does not call an ordinary call failed for %s", async (_label, output) => {
+    // The case the badge already covered for withheld rows, on the rows where
+    // nothing was withheld and so nothing outranks the text. Reading the word
+    // anywhere in the output marked every one of these failed, and each is a
+    // successful call: two report zero errors, the third reports handling one.
+    expect(await statusOf(output)).toEqual(["ok"]);
+  });
+
+  it.each([
+    ["one", "Errors: 1"],
+    ["several", "Errors: 12"],
+    ["exceptions instead", "Exceptions: 2"],
+    ["a count after other output", "ran 3 steps\nErrors: 1\n"],
+  ])("reads a nonzero count as the failure it is, for %s", async (_label, output) => {
+    // A count label was excluded wholesale to keep "Errors: 0" from reading as
+    // a failure. That also excluded every nonzero count, so a call reporting
+    // real failures came back ok and rendered a success badge. Zero and
+    // nonzero differ only in the number, so the number is what has to be read.
+    expect(await statusOf(output)).toEqual(["error"]);
+  });
+
+  it("reads a failure announced further down the output", async () => {
+    // Anchoring is per line, not to the start of the payload, or a tool that
+    // prints progress before it fails would come back green.
+    expect(await statusOf("running checks\nTraceback (most recent call last):")).toEqual(["error"]);
+  });
+
+  it("reads an exception class name as the announcement it is", async () => {
+    expect(await statusOf("ValueError: bad input")).toEqual(["error"]);
+  });
+
+  it("pairs a withheld request with its response from the response's own end", async () => {
+    // One row, not two: the response names its request in a payload the
+    // request's withholding cannot reach, so the pairing survives it.
+    const { branchToRunStep } = await import("./RunDetail");
+    const step = branchToRunStep(withheldRequestBranch() as never, "completed");
+    expect((step.messages ?? []).filter((m) => m.role === "tool_call")).toHaveLength(1);
+  });
+
+  it("marks an unpaired response whose own payload was withheld", async () => {
+    const { branchToRunStep } = await import("./RunDetail");
+    const branch = withheldBranch(true) as never as { messages: unknown[] };
+    const step = branchToRunStep(
+      { ...branch, messages: [branch.messages[1]] } as never,
+      "completed",
+    );
+    const [call] = (step.messages ?? []).filter((m) => m.role === "tool_call");
+    expect(call.status).toBe("withheld");
+  });
+
+  it("renders the withheld badge instead of the success check", () => {
+    const withheld = {
+      step: "s1",
+      status: "completed",
+      timestamp: 1,
+      messages: [
+        {
+          role: "tool_call",
+          function: "Bash",
+          summary: "ls",
+          output: "",
+          status: "withheld",
+          timestamp: 1,
+        },
+      ],
+    };
+    const { container } = renderRunStepCards([withheld as never], true);
+    openConversationTab(container);
+    expect(container.textContent).toContain("not read");
+  });
+
+  it("does not render the withheld badge for an ordinary call", () => {
+    // Control for the render: "not read" must be absent when the status is ok,
+    // or its presence above says nothing about the status.
+    const ok = {
+      step: "s1",
+      status: "completed",
+      timestamp: 1,
+      messages: [
+        {
+          role: "tool_call",
+          function: "Bash",
+          summary: "ls",
+          output: "a.txt",
+          status: "ok",
+          timestamp: 1,
+        },
+      ],
+    };
+    const { container } = renderRunStepCards([ok as never], true);
+    openConversationTab(container);
+    // The tool call is on screen -- this is the same panel the assertion above
+    // reads, so its silence is about the status and not about the tab.
+    expect(container.textContent).toContain("ls");
+    expect(container.textContent).not.toContain("not read");
+  });
+});
+
+describe("history/RunDetail.tsx — a withheld row is still a row", () => {
+  // Both halves of one call refused. The request has no function name, no
+  // arguments and no forward link; the response has no back link. Every
+  // pairing the transcript knows about lives in a payload neither of them
+  // still has, so without the ids the server lifts out of the row itself,
+  // one call arrives as two unrelated rows.
+  const bothWithheldBranch = (liftIds: boolean) => ({
+    id: "branch-both-withheld",
+    name: "worker",
+    created_at: 10,
+    message_total: 2,
+    messages: [
+      {
+        id: "req-1",
+        role: "action",
+        content: null,
+        content_withheld: true,
+        ...(liftIds ? { action_response_id: "resp-1" } : {}),
+        sender: "worker",
+        timestamp: 11,
+        lion_class: "ActionRequest",
+      },
+      {
+        id: "resp-1",
+        role: "action",
+        content: null,
+        content_withheld: true,
+        ...(liftIds ? { action_request_id: "req-1" } : {}),
+        sender: "tool",
+        timestamp: 12,
+        lion_class: "ActionResponse",
+      },
+    ],
+  });
+
+  it("renders one row when a call has both halves withheld", async () => {
+    const { branchToRunStep } = await import("./RunDetail");
+    const step = branchToRunStep(bothWithheldBranch(true) as never, "completed");
+    const calls = (step.messages ?? []).filter((m) => m.role === "tool_call");
+    expect(calls).toHaveLength(1);
+    expect(calls[0].status).toBe("withheld");
+  });
+
+  // The two lifted ids are two independent routes to the same pairing, so a
+  // fixture carrying both cannot say whether either one works. These strip one
+  // route each. A row can be withheld on one side and hydrated on the other,
+  // which is why both routes exist rather than one.
+  const oneSidedBranch = (side: "request" | "response") => {
+    const branch = bothWithheldBranch(true);
+    const [request, response] = branch.messages as Record<string, unknown>[];
+    if (side === "request") delete response.action_request_id;
+    else delete request.action_response_id;
+    return branch;
+  };
+
+  it("pairs a both-withheld call from the request's lifted forward link alone", async () => {
+    const { branchToRunStep } = await import("./RunDetail");
+    const step = branchToRunStep(oneSidedBranch("request") as never, "completed");
+    expect((step.messages ?? []).filter((m) => m.role === "tool_call")).toHaveLength(1);
+  });
+
+  it("pairs a both-withheld call from the response's lifted back link alone", async () => {
+    const { branchToRunStep } = await import("./RunDetail");
+    const step = branchToRunStep(oneSidedBranch("response") as never, "completed");
+    expect((step.messages ?? []).filter((m) => m.role === "tool_call")).toHaveLength(1);
+  });
+
+  it("splits the same call into two rows without the lifted ids", async () => {
+    // Control: the single row above has to come from the ids and not from
+    // some other collapse, or the assertion passes for the wrong reason.
+    const { branchToRunStep } = await import("./RunDetail");
+    const step = branchToRunStep(bothWithheldBranch(false) as never, "completed");
+    expect((step.messages ?? []).filter((m) => m.role === "tool_call")).toHaveLength(2);
+  });
+
+  // Withholding is decided by payload size, not by message kind, so a system,
+  // user or assistant message hits it too. Each of the three readers fails
+  // differently on an empty payload and all three fail silently.
+  const nonActionBranch = (withheld: boolean) => ({
+    id: "branch-non-action",
+    name: "worker",
+    created_at: 10,
+    message_total: 3,
+    messages: [
+      {
+        id: "sys-1",
+        role: "system",
+        content: withheld ? null : { system_message: "you are a worker" },
+        content_withheld: withheld,
+        sender: "system",
+        timestamp: 11,
+        lion_class: "System",
+      },
+      {
+        id: "usr-1",
+        role: "user",
+        content: withheld ? null : { instruction: "do the thing" },
+        content_withheld: withheld,
+        sender: "user",
+        timestamp: 12,
+        lion_class: "Instruction",
+      },
+      {
+        id: "asst-1",
+        role: "assistant",
+        content: withheld ? null : { assistant_response: "done" },
+        content_withheld: withheld,
+        sender: "worker",
+        timestamp: 13,
+        lion_class: "AssistantResponse",
+      },
+    ],
+  });
+
+  it("keeps a withheld system, user and assistant message as one marked row each", async () => {
+    const { branchToRunStep } = await import("./RunDetail");
+    const step = branchToRunStep(nonActionBranch(true) as never, "completed");
+    const messages = step.messages ?? [];
+    expect(messages.map((m) => m.role)).toEqual(["system", "user", "assistant"]);
+    expect(messages.every((m) => m.withheld === true)).toBe(true);
+    // The literal "{}" is what a serialized empty payload used to render as.
+    expect(messages.some((m) => m.content === "{}")).toBe(false);
+  });
+
+  it("leaves ordinary system, user and assistant messages unmarked", async () => {
+    const { branchToRunStep } = await import("./RunDetail");
+    const step = branchToRunStep(nonActionBranch(false) as never, "completed");
+    const messages = step.messages ?? [];
+    expect(messages.map((m) => m.content)).toEqual(["you are a worker", "do the thing", "done"]);
+    expect(messages.some((m) => m.withheld)).toBe(false);
+  });
+
+  it("renders a withheld assistant turn as unread rather than as a blank one", () => {
+    const step = {
+      step: "s1",
+      status: "completed",
+      timestamp: 1,
+      messages: [{ role: "assistant", content: "", withheld: true, timestamp: 1 }],
+    };
+    const { container } = renderRunStepCards([step as never], true);
+    openConversationTab(container);
+    expect(container.textContent).toContain("not read");
   });
 });
