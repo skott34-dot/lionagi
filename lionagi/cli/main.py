@@ -299,7 +299,8 @@ def _run(argv: list[str] | None = None) -> int:
     # traceback. The machine path above keeps the interpreter's default SIGPIPE
     # disposition instead, since not every write there belongs to the command
     # (e.g. a DB driver's worker thread signalling a closing event loop).
-    signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    if hasattr(signal, "SIGPIPE"):
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
     # Same pre-argparse scan, so a project-scoped .lionagi/settings.yaml
     # next to a `--cwd DIR` target isn't missed in favor of the shell's cwd.
